@@ -272,10 +272,12 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 # 2) copiamos todos los estilos de la capa original
                 symbol = layer_main.renderer().symbol().clone()
                 if symbol is None:
-                    return
+                    QgsMessageLog.logMessage(f"SYNC_LAYER Capa: {layer_main.name()}-{'LEFT' if self.is_left else 'RIGHT'}. "
+                                             f"NO SE PUEDE interpretar el estilo.", "SWM-3D", Qgis.Error)
+                    continue
                 # 3) Creamos un Geometry Generator inicial inútil, porque la perspectiva y proyeccion no la conocemos aún
                 # Crearemos luego una nueva expresión cuando tengamos la transformación accesible.
-                # Esta es una dummy expression, que pinta la capa en 2D sin transformar (SI PINTA PUNTOS)
+                # Esta es una dummy expression, que pinta la capa en 2D sin transformar (también PINTA los PUNTOS, pero sin Z)
                 symbol_layer = QgsGeometryGeneratorSymbolLayer.create({'geometryModifier': '$geometry'})
                 symbol_layer.setSubSymbol(symbol)
                 # 4) Sustituir el symbol layer (capa 0)
@@ -342,6 +344,9 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 side = 'left' if self.is_left else 'right'
                 expression = (f"perspective_swm_transform($geometry,'{side}','{self.trf_wld2prp.txt_perspective}','{self.trf_wld2prp.txt_projective}')")
                 symbol_layer = layer.renderer().symbol().symbolLayer(0)
+                if not isinstance(symbol_layer, QgsGeometryGeneratorSymbolLayer):
+                    QgsMessageLog.logMessage(f"Tipo SymbolLayer inesperado en capa {layer.name()}: {type(symbol_layer)}", "SWM-3D", Qgis.Warning)
+                    continue
                 symbol_layer.setGeometryExpression(expression)
 
                 QgsMessageLog.logMessage(f"UPDATE_SWM_HEADER Capa: {layer.name()}-{'LEFT' if self.is_left else 'RIGHT'}.", 

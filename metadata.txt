@@ -1,0 +1,13 @@
+[general]
+name=StereoWebMap 3D Plugin
+description=Plugin for managing Sigrid StereoWebMap Wms flight services
+version=1.0
+experimental=false
+deprecated=false
+qgisMinimumVersion=4.0
+category=WMS web service
+tags=WMS stereographic 3D
+homepage=Tragsatec
+author=Conrado Sánchez/Javier Herrero
+email=javier.herrero@gmail.com
+about=Stereo visualization of StereoWebMap photogrammetric WMS service

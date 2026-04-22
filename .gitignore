@@ -12,9 +12,10 @@ venv/
 .env
 
 # IDEs
-.vscode/
+# .vscode/ sí los compartiré
 .idea/
 
 # SO
 .DS_Store
 Thumbs.db
+*.7z

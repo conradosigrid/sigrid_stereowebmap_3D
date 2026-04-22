@@ -111,7 +111,7 @@ class QSgdSwmWindow(QMainWindow):
             "5 Mirror right",
             "6 Mirror up",
         ]
-        stereo_choice, ok = QInputDialog.getItem(self.iface.mainWindow(), "Stereo mode", "Select stereo mode for Sigrid Swm plugin:", stereo_options, 3, False)
+        stereo_choice, ok = QInputDialog.getItem(self.iface.mainWindow(), "Stereo mode", "Select stereo mode for SWM-3D plugin:", stereo_options, 3, False)
         if not ok:
             return("Canceled")
         self.stereo_id = int(stereo_choice.split()[0])    
@@ -211,10 +211,12 @@ class QSgdSwmWindow(QMainWindow):
         3) Pero falta el refresco de todo para que se repinte.
         """
         if self.canvas_left:
+            QgsMessageLog.logMessage(f"[DEBUG] <sync_canvases_repaint> Refrescando canvas IZDO", "SWM-3D", Qgis.Info)
             self.canvas_left.setExtent(self.qgis_main_canvas.extent())
             # self.canvas_left.sync_layers()
             self.canvas_left.refresh()
         if self.canvas_right:
+            QgsMessageLog.logMessage(f"[DEBUG] <sync_canvases_repaint> Refrescando canvas DCHO", "SWM-3D", Qgis.Info)
             self.canvas_right.setExtent(self.qgis_main_canvas.extent())
             # self.canvas_right.sync_layers()
             self.canvas_right.refresh()
@@ -262,17 +264,14 @@ class QSgdSwmWindow(QMainWindow):
         Handler for WMS network replies. Checks if the reply is from a SWM plugin layer by looking for specific headers.
         If it is a SWM reply, reads the projection plane Z and transformation parameters from the headers, 
         updates the canvas state, and triggers a refresh to apply the new transformations.
-        Con self.network_manager.finished.connect(self.network_reply_handle)...
+        A través de self.network_manager.finished.connect(self.network_reply_handle)
         este método se conecta al signal finished() del QgsNetworkAccessManager, que se emite cada vez que:
-          - se recibe una respuesta a una petición de red. 
-          - cada refresh del canvas
-          - cada zoom, pan, resize
-          - aunque la respuesta esté en caché
+        se recibe una respuesta del servidor . 
         """
         if not self.isVisible():
             return
         request_url = reply.request().url().toString()
-        QgsMessageLog.logMessage(f"[DEBUG] <network_reply_handler> Lanzando", "SWM-3D", Qgis.Warning)
+        # QgsMessageLog.logMessage(f"[DEBUG] <network_reply_handler> Lanzando", "SWM-3D", Qgis.Info)
 
         # Vamos a chequear si la respuesta viene de SWM y es correcta
         # La petición que proviene de la pantalla principal de QGIS vienen como PhotoRight o PhotoLeft.

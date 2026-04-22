@@ -39,10 +39,10 @@ handled elsewhere in the plugin.
 
 """
 import math
-from qgis.core import QgsGeometry, QgsPointXY, QgsWkbTypes
+from qgis.core import QgsGeometry, QgsPointXY, QgsWkbTypes, QgsVertexId
 from qgis.utils import qgsfunction
 
-
+from qgis.core import QgsMessageLog, Qgis  # para mensajes de depuración.
 
 # ------------------------------------------------------------------
 # Cache de parseo (clave = texto del header) (para no parsear siempre)
@@ -141,6 +141,12 @@ def perspective_swm_transform(geometry, side, txt_trf_wrl2pht, txt_trf_pht2prp):
     :param txt_trf_wrl2pht: Response header value of a SWM service with world to photo perspective transform.
     :param txt_trf_pht2prp: Response header value of a SWM service with photo to projection plain projective transform .
     :return: Transformed QgsGeometry.
+
+    OJO:
+    Mucho cuidado en estas funciones relacionadas con EXPRESSIONS con los errores, 
+    porque se crean Exceptions silenciosas que el motor de expresiones 
+    de QGIS captura internamente y que no se muestran al usuario, pero que hacen que la función termine abruptamente 
+    y devuelva NULL sin ningún mensaje 
     """
     
     if geometry is None or geometry.isEmpty():
@@ -156,61 +162,53 @@ def perspective_swm_transform(geometry, side, txt_trf_wrl2pht, txt_trf_pht2prp):
         return geometry
 
     gtype = QgsWkbTypes.geometryType(geometry.wkbType())
-
+    is_multi = QgsWkbTypes.isMultiType(geometry.wkbType())
+ 
     # -------------------------------
-    # Punto
+    # Punto, o Multipunto
+    # Será del tipo que sea, pero aquí siempre entran los puntos de la capa uno a uno.
     # -------------------------------
     if gtype == QgsWkbTypes.PointGeometry:
-        # MultiPoint
-        if QgsWkbTypes.isMultiType(geometry.wkbType()):
-            new_points = []
+        # p = geometry.asPoint()  # Con Causa excepciones silenciosas capturadas internamente por el c++
+        it = geometry.vertices()
+        p = next(it, None)
+        if p is None:
+            QgsMessageLog.logMessage("[DEBUG] perspective_swm_transform: POINTZ inválido", "SWM-3D", Qgis.Warning)
+            return geometry
 
-            for p in geometry.asMultiPoint():
-                if not math.isfinite(p.z()):
-                    continue
-
-                res = world_to_photo(p.x(), p.y(), p.z(), x0, y0, z0, df, r)
-                if not res:
-                    continue
-
-                res = photo_to_proj(res[0], res[1], a, b, c)
-                if not res:
-                    continue
-
-                new_points.append(QgsPointXY(res[0], res[1]))
-
-            if not new_points:
+        z = p.z()
+        if not math.isfinite(z):
+            if p.isMeasure() and math.isfinite(p.m()):
+                z = p.m() 
+            else:
+                QgsMessageLog.logMessage("[DEBUG] perspective_swm_transform: POINTZ sin Z", "SWM-3D", Qgis.Warning)
                 return geometry
 
-            return QgsGeometry.fromMultiPointXY(new_points)
+        res = world_to_photo(p.x(), p.y(), z, x0, y0, z0, df, r)
+        if not res:
+            return geometry
 
-        # Single Point
-        else:
-            p = geometry.asPoint()
-            if not math.isfinite(p.z()):
-                return geometry
+        res = photo_to_proj(res[0], res[1], a, b, c)
+        if not res:
+            return geometry
+        # QgsMessageLog.logMessage(f"[DEBUG] expression: Transformed point from ({p.x()}, {p.y()}, {z}) to ({res[0]}, {res[1]})", "SWM-3D", Qgis.Info)
 
-            res = world_to_photo(p.x(), p.y(), p.z(), x0, y0, z0, df, r)
-            if not res:
-                return geometry
+        return QgsGeometry.fromWkt(f"POINT ({res[0]} {res[1]})")
 
-            res = photo_to_proj(res[0], res[1], a, b, c)
-            if not res:
-                return geometry
-
-            return QgsGeometry.fromPointXY(QgsPointXY(*res))
-
-# --------------------------------------------------
-    # LineString
+    # --------------------------------------------------
+    # LineString MultiLineString, ... LineZ, LineM, LineZM, MultiLineZ, MultiLineM, MultiLineZM
+    # El WkbType será cualquiera de los anteriores, pero las límeas de la capa entran a esta función una a una.
+    # Es decir, se llama una vez por línea.
     # --------------------------------------------------
     elif gtype == QgsWkbTypes.LineGeometry:
         new_line = []
 
         for p in geometry.vertices():
-            if not math.isfinite(p.z()):
+            z = p.z()
+            if not math.isfinite(z):
                 continue
 
-            res = world_to_photo(p.x(), p.y(), p.z(), x0, y0, z0, df, r)
+            res = world_to_photo(p.x(), p.y(), z, x0, y0, z0, df, r)
             if not res:
                 continue
 
@@ -224,107 +222,43 @@ def perspective_swm_transform(geometry, side, txt_trf_wrl2pht, txt_trf_pht2prp):
             return geometry
 
         return QgsGeometry.fromPolylineXY(new_line)
-
+        
     # --------------------------------------------------
-    # Polygon
+    # Polygon, Multipolygo PolygonZ, PolygonM, PolygonZM, MultiPolygon, MultiPolygonZ, MultiPolygonZM
+    # El WkbType será cualquiera de los anteriores, pero las polígonos de la capa entran a esta función uno a uno.
     # --------------------------------------------------
     elif gtype == QgsWkbTypes.PolygonGeometry:
-        new_rings = []
+        ring = []
 
-        for ring in geometry.asPolygon():
-            new_ring = []
+        # Recorremos TODOS los vértices del polígonode forma segura
+        for p in geometry.vertices():
+            z = p.z()
+            if not math.isfinite(z):
+                continue
 
-            for p in ring:
-                if not math.isfinite(p.z()):
-                    continue
+            res = world_to_photo(p.x(), p.y(), z, x0, y0, z0, df, r)
+            if not res:
+                continue
 
-                res = world_to_photo(p.x(), p.y(), p.z(), x0, y0, z0, df, r)
-                if not res:
-                    continue
+            res = photo_to_proj(res[0], res[1], a, b, c)
+            if not res:
+                continue
 
-                res = photo_to_proj(res[0], res[1], a, b, c)
-                if not res:
-                    continue
+            ring.append(QgsPointXY(res[0], res[1]))
 
-                new_ring.append(QgsPointXY(res[0], res[1]))
-
-            # Un polígono necesita al menos 4 puntos (cerrado)
-            if len(new_ring) >= 4:
-                new_rings.append(new_ring)
-
-        if not new_rings:
+        # Cerrar último anillo
+        if len(ring) < 3:
             return geometry
+        
+        if ring[0] != ring[-1]:
+            ring.append(ring[0])
 
-        return QgsGeometry.fromPolygonXY(new_rings)
-
-    # --------------------------------------------------
-    # MultiLineString
-    # --------------------------------------------------
-    elif gtype == QgsWkbTypes.MultiLineGeometry:
-        new_lines = []
-
-        for line in geometry.asMultiPolyline():
-            new_line = []
-
-            for p in line:
-                if not math.isfinite(p.z()):
-                    continue
-
-                res = world_to_photo(p.x(), p.y(), p.z(), x0, y0, z0, df, r)
-                if not res:
-                    continue
-
-                res = photo_to_proj(res[0], res[1], a, b, c)
-                if not res:
-                    continue
-
-                new_line.append(QgsPointXY(res[0], res[1]))
-
-            if len(new_line) >= 2:
-                new_lines.append(new_line)
-
-        if not new_lines:
+        if len(ring) < 4:
             return geometry
+        
+        return QgsGeometry.fromPolygonXY([ring])
 
-        return QgsGeometry.fromMultiPolylineXY(new_lines)
-
-    # --------------------------------------------------
-    # MultiPolygon
-    # --------------------------------------------------
-    elif gtype == QgsWkbTypes.MultiPolygonGeometry:
-        new_polygons = []
-
-        for polygon in geometry.asMultiPolygon():
-            new_rings = []
-
-            for ring in polygon:
-                new_ring = []
-
-                for p in ring:
-                    if not math.isfinite(p.z()):
-                        continue
-
-                    res = world_to_photo(p.x(), p.y(), p.z(), x0, y0, z0, df, r)
-                    if not res:
-                        continue
-
-                    res = photo_to_proj(res[0], res[1], a, b, c)
-                    if not res:
-                        continue
-
-                    new_ring.append(QgsPointXY(res[0], res[1]))
-
-                if len(new_ring) >= 4:
-                    new_rings.append(new_ring)
-
-            if new_rings:
-                new_polygons.append(new_rings)
-
-        if not new_polygons:
-            return geometry
-
-        return QgsGeometry.fromMultiPolygonXY(new_polygons)
-
-
-    return geometry
-
+    else:
+        # Geometrías no soportadas
+        QgsMessageLog.logMessage(f"[DEBUG] expression: Unsupported geometry type: {gtype}", "SWM-3D", Qgis.Info)
+        return geometry

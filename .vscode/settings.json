@@ -1,0 +1,6 @@
+{
+  "python.analysis.extraPaths": [
+    "C:/OSGeo4W/apps/qgis/python"
+  ],
+  "python.analysis.typeCheckingMode": "basic"
+}

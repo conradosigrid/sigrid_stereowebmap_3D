@@ -24,6 +24,29 @@ git pull
 *******************************************************
 FLUJO DE TRABAJO
 *******************************************************
+Al empezar una tarea:
+
+1) Descargar la versión actual del repositorio en nuestro local:
+   - Conectar a la rama main
+   - Hacer Pull
+2) Crea nuestra rama de trabajo
+   - Create branch.
+3) Ya trabajar sobre esa rama 
+   - se puede hacer STAGE para cambios pequeños temporales aunque no sea estable
+   - Hacer COMMIT para cambios más definitivos y estables, donde se puede meter explicación
+4) Juntar la rama con el main
+   - Cada pocos commits, a ser posible cada día, fusionamos código
+   - Push de la rama, ya la sube al repositorio
+   - COMPARE & PULL REQUEST. Esto se hace desde la web, botón verde. (no lo he visto desde el local)
+         * Te dice si hay conflictos en el MERGE y te pide arreglarlos
+   - Si todo va bien, MERGE PULL REQUEST ya lo junta con main
+      * adicionalmente se puede borrar la rama en ese momento. 
+
+Y a partir de ese punto, volver a empezar desde 1) IMPORTANTE el PULL para incorporar los cambios del otro.
+
+
+
+
 En forma de comandos para manejar git desde la terminal de VS Code (ctrl+ñ):
 Al empezar una tarea:
 git checkout main

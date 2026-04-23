@@ -44,7 +44,7 @@ from .transform import TrfWldToPrjPln
 from .utils import is_sgd_swm_layer, is_z_layer
 
 
-# Class Sigrid Swm Canvas escalvo (espejo) transformado del canvas principal de QGIS
+# Class Sigrid Swm Canvas esclavo (espejo) transformado del canvas principal de QGIS
 class QgsSgdSwmCanvas(QgsMapCanvas):
     FILTER_NONE = 0
     FILTER_RED = 1
@@ -89,6 +89,10 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         # self.qgis_main_canvas.extentsChanged.connect(self.sync_zoom)
         # self.mapCanvasRefreshed.connect(self.refresh_finnished)
         # self.renderComplete.connect(self.render_complete)
+
+    # ============================================================================
+    # == Cursor en el canvas estéreo, replicando el cursor del canvas principal ==
+    # ============================================================================  
 
     def _init_cursor_marker(self):
         """
@@ -305,8 +309,6 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         else:
             QgsMessageLog.logMessage(f"Unknown cursor marker type: {type(self.cursor_marker)}", "SWM-3D", Qgis.Warning)
 
-    # ==========================================================
-
     def wheelEvent(self, event: QWheelEvent):
         """
         Ignore mouse wheel events on the stereo canvas. Wheel interaction is handled globally by the main window.
@@ -314,7 +316,9 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         event.accept()   # consumir el evento
         return           # no llamar a super()
 
-    # ==========================================================
+    # ============================================================================
+    # == Fin del cursor en el canvas estéreo ==
+    # ============================================================================
 
     def paintEvent(self, event):
 
@@ -460,9 +464,9 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             elif is_z_layer(layer_main):
                 # Layer has Z values. Must apply Geometry Generator
                 # Copy layer_main to apply Geometry Generator. Ensure the CRS and other properties are the same
-                # 1) Crear una vista lógica independiente perfecta para en canvas secundario.
+                # 1) Crear una vista lógica independiente, perfecta para el canvas secundario.
                 layer_copy = QgsVectorLayer(layer_main.source(), layer_main.name(), layer_main.providerType())
-                # Update (only once: is_left)
+                # Update (only once: is_left). No sé si es ecesario. Desactivado de momento
                 # if self.is_left:
                 #     layer_main.rendererChanged.connect(lambda: self.parent.trigger_sync_renderer_layerz(layer_copy.name()))
                 # 2) copiamos todos los estilos de la capa original
@@ -496,8 +500,9 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 layers_self.append(layer_main)
 
         self.setLayers(layers_self)
-        # self.refresh()  # ¿Necesario?
+        # self.refresh()  # Parece innecesario
 
+    # Lo desactivo porque no sé si es necesario
     # def sync_renderer_layerz_changed(self, layer_name):
     #     """Synchronize the renderer when symbology of layer with Z changes."""
     #     layer_self = next((layer for layer in self.layers() if layer.name() == layer_name), None) 
@@ -517,6 +522,10 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         Update photogrammetric transformation parameters from a SWM WMS reply
         and store them as layer custom properties so they can be consumed
         by Geometry Generator expressions.
+        Esta función es fundamental porque es la que deja el Geometry Generator de las capas con Z 
+        preparado para aplicar la transformación fotogramétrica.
+        IMPORTANTE: si se llama a sync_layers sin pasar luego por aquí, El GEometry Generator se 
+        queda con la transformación vacía y no pintará nada en el canvas secundario estereoscópico.
         """
         # TODO: Get rotation from the reply headers
         # Init transformation

@@ -1,7 +1,8 @@
-
-import debugpy
-
-
+"""
+Este módulo se encarga de configurar y activar el modo debug para el desarrollo local.
+Como la librería debugpy no es un requisito para el funcionamiento normal del plugin, se maneja de forma opcional y segura, 
+sin afectar a los usuarios finales aunque no tengan instalado debugpy.
+"""
 DEBUG = False  
 # se podría leer de una variable de entorno, pero esto es más directo para el desarrollo local
 # import os

@@ -96,6 +96,9 @@ Si la instalación es correcta:
 ### 2.4 Observaciones importantes
 
 - El plugin **no debe copiarse** en el directorio global de instalación de QGIS, sino **únicamente en el perfil de usuario**.
+
+  ´´´C:\Users\fherl\AppData\Roaming\QGIS\QGIS4\profiles\QGIS_4_DEV\python\plugins\SWM_3D´´´
+  
 - Tras actualizar el código:
 - Desactivar y volver a activar el plugin, **o**
 - Usar la opción “Recargar complemento” para que QGIS lea los cambios.
@@ -148,4 +151,3 @@ Los desarrollos más inmediatos a partir de esta versión básica son:
 
 **End of readme.md**
 
-C:\Users\fherl\AppData\Roaming\QGIS\QGIS4\profiles\QGIS_4_DEV\python\plugins\SWM_3D

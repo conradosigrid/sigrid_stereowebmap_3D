@@ -524,7 +524,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         by Geometry Generator expressions.
         Esta función es fundamental porque es la que deja el Geometry Generator de las capas con Z 
         preparado para aplicar la transformación fotogramétrica.
-        IMPORTANTE: si se llama a sync_layers sin pasar luego por aquí, El GEometry Generator se 
+        IMPORTANTE: si se llama a sync_layers sin pasar luego por aquí, El Geometry Generator se 
         queda con la transformación vacía y no pintará nada en el canvas secundario estereoscópico.
         """
         # TODO: Get rotation from the reply headers

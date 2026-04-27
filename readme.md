@@ -70,6 +70,7 @@ SWM_3D/
 ├── canvas.py
 ├── transform.py
 ├── utils.py
+├── debug.py
 ├── metadata.txt
 └── expressions/
     └── perspective_swm_transform.py

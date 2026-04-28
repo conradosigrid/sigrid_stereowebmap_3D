@@ -32,8 +32,9 @@ from qgis.core import QgsMessageLog, Qgis  # para mensajes de depuración.
 from qgis.gui import QgsMapCanvas, QgsVertexMarker, QgsRubberBand
 from qgis.core import QgsWkbTypes, QgsGeometry, QgsRasterLayer, QgsVectorLayer, QgsPoint
 from qgis.core import QgsSymbol, QgsSingleSymbolRenderer, QgsGeometryGeneratorSymbolLayer
-from qgis.PyQt.QtGui import QColor, QWheelEvent
+from qgis.PyQt.QtGui import QColor, QWheelEvent, QImage, QPainter
 from qgis.PyQt.QtCore import QEvent, Qt, QObject
+from typing import Optional, Any
 
 import re
 import numpy as np
@@ -50,7 +51,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
     FILTER_EVEN = 3
     FILTER_ODD = 4
 
-    def __init__(self, is_left, qgis_main_canvas, filter=FILTER_NONE, parent=None):
+    def __init__(self, is_left: bool, qgis_main_canvas, filter: int = FILTER_NONE, parent: Optional[Any] = None):
         super(QgsSgdSwmCanvas, self).__init__(parent)
  
         self.parent = parent
@@ -108,7 +109,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
 
         # Get cursor position in main canvas coordinates and current Z
         pos = self.qgis_main_canvas.mouseLastXY()
-        z = self.parent.z_cursor
+        z = self.parent.z_cursor if self.parent else 0
         point_xy = self.qgis_main_canvas.getCoordinateTransform().toMapCoordinates(pos)
         
         # Calculate projected position
@@ -123,7 +124,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         self.cursor_marker.setCenter(point_xy)
         self.cursor_marker.show()
 
-    def wheelEvent(self, event: QWheelEvent):
+    def wheelEvent(self, event: QWheelEvent):  # type: ignore[override]
         """
         Ignore mouse wheel events on the stereo canvas. Wheel interaction is handled globally by the main window.
         """
@@ -134,10 +135,10 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
     # == Fin del cursor en el canvas estéreo ==
     # ============================================================================
 
-    def paintEvent(self, event):
+    def paintEvent(self, e):
 
         if self.filter == self.FILTER_NONE:  # ver_0.5:  or self.filtered_image is None:
-            super().paintEvent(event)
+            super().paintEvent(e)
         else:
             # VER_0.5
             # painter = QPainter(self.viewport())
@@ -152,7 +153,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             super().render(QPainter(buffer))
             filtered = self.apply_filter(buffer)  # Apply filter to the buffer
             painter = QPainter(self.viewport())  # Paint viewport
-            if self.parent.stereo_id < 3 and self.is_left:  
+            if self.parent and self.parent.stereo_id < 3 and self.is_left:  
                 # Overlayer stereoscopic mode and right canvas. Add pixels filteres images
                 # left always last?
                 # &&&& painter.setCompositionMode(QPainter.CompositionMode_Plus)
@@ -205,7 +206,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
     def refresh_finnished(self):
         # Draws a rectangle corresponding to the main canvas extent in this canvas
         # TODO: Fails. Rubber band?
-        if not self.parent.isVisible():
+        if self.parent and not self.parent.isVisible():
             return
         # print("refresh_finnished", self.is_left)
 
@@ -213,7 +214,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         # Draws a rectangle corresponding to the main canvas extent in this canvas
         # TODO: Fails. Rubber band?
 
-        if not self.parent.isVisible():
+        if self.parent and not self.parent.isVisible():
             return
 
         extent = self.qgis_main_canvas.extent()  # Get the extent of the main canvas
@@ -293,9 +294,13 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 # Crearemos luego una nueva expresión cuando tengamos la transformación accesible.
                 # Esta es una dummy expression, que pinta la capa en 2D sin transformar (también PINTA los PUNTOS, pero sin Z)
                 symbol_layer = QgsGeometryGeneratorSymbolLayer.create({'geometryModifier': '$geometry'})
+                if symbol_layer is None:
+                    continue
                 symbol_layer.setSubSymbol(symbol)
                 # 4) Sustituir el symbol layer (capa 0)
                 final_symbol = QgsSymbol.defaultSymbol(layer_main.geometryType())
+                if final_symbol is None:
+                    continue
                 final_symbol.changeSymbolLayer(0, symbol_layer) 
                 # 5) Asignar el renderer
                 renderer = QgsSingleSymbolRenderer(final_symbol)

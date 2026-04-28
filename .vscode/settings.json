@@ -1,6 +1,21 @@
 {
   "python.analysis.extraPaths": [
-    "C:/OSGeo4W/apps/qgis/python"
+    "C:/OSGeo4W/apps/qgis/python",
+    "C:/OSGeo4W64/apps/qgis/python", 
+    "C:/Program Files/QGIS 3.34/apps/qgis/python",
+    "C:/Program Files/QGIS 3.32/apps/qgis/python",
+    "C:/Program Files/QGIS 3.30/apps/qgis/python",
+    "C:/OSGeo4W/apps/Python39/Lib/site-packages",
+    "C:/OSGeo4W64/apps/Python39/Lib/site-packages"
   ],
-  "python.analysis.typeCheckingMode": "basic"
+  "python.analysis.typeCheckingMode": "basic",
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportAttributeAccessIssue": "none",
+    "reportUnknownMemberType": "none",
+    "reportUnknownArgumentType": "none",
+    "reportUnknownVariableType": "none",
+    "reportMissingImports": "warning"
+  },
+  "python.analysis.autoImportCompletions": true,
+  "python.analysis.useLibraryCodeForTypes": true
 }

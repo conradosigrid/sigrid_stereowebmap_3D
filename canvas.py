@@ -28,14 +28,12 @@ QgsSgdSwmCanvas (plugin)
   ├── cursor proyectado
   └── render
 """
-from qgis.core import QgsMessageLog, Qgis, QgsSymbol  # para mensajes de depuración.
+from qgis.core import QgsMessageLog, Qgis  # para mensajes de depuración.
 from qgis.gui import QgsMapCanvas, QgsVertexMarker, QgsRubberBand
 from qgis.core import QgsWkbTypes, QgsGeometry, QgsRasterLayer, QgsVectorLayer, QgsPoint
 from qgis.core import QgsSymbol, QgsSingleSymbolRenderer, QgsGeometryGeneratorSymbolLayer
-from qgis.PyQt.QtGui import QPixmap, QPainter, QCursor, QBitmap, QImage, QColor, QWheelEvent
-from qgis.PyQt.QtCore import QEvent, QPoint
-from qgis.PyQt.QtCore import Qt
-from qgis.PyQt.QtWidgets import QGraphicsPixmapItem
+from qgis.PyQt.QtGui import QColor, QWheelEvent
+from qgis.PyQt.QtCore import QEvent, Qt, QObject
 
 import re
 import numpy as np
@@ -67,12 +65,19 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         # VER_1.0
         # nada
 
-        # Cursor marker - synchronized with main canvas using actual cursor bitmap
-        self.cursor_marker = None  # Will be created dynamically
-        self.cursor_pixmap_item = None  # QGraphicsPixmapItem for custom cursor
-        self.current_cursor_shape = None  # Cache current cursor
-        self._init_cursor_marker()
-        
+        # Cursor marker
+        self.cursor_marker = QgsVertexMarker(self)
+        self.cursor_marker.setColor(QColor(Qt.GlobalColor.black))
+        self.cursor_marker.setIconSize(10)
+        self.cursor_marker.setIconType(QgsVertexMarker.ICON_CROSS)
+        self.cursor_marker.setPenWidth(3)
+        # Pruebas con cursor bitmap. 
+        # # Cursor marker - synchronized with main canvas using actual cursor bitmap
+        # self.cursor_marker = None  # Will be created dynamically
+        # self.cursor_pixmap_item = None  # QGraphicsPixmapItem for custom cursor
+        # self.current_cursor_shape = None  # Cache current cursor
+        # self._init_cursor_marker()
+
         self.layer_swm = None
         self.layers_z = []
         self.limits = None
@@ -83,7 +88,8 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         # self.qgis_main_canvas.layersChanged.connect(self.force_repaint)
         
         # Synchronize events
-        self.qgis_main_canvas.mapToolSet.connect(self.sync_cursor_style)
+        # Para cursor bitmap. 
+        # self.qgis_main_canvas.mapToolSet.connect(self.sync_cursor_style)
         # self.qgis_main_canvas.xyCoordinates.connect(self.sync_cursor) en window.py ahora
         # self.qgis_main_canvas.layersChanged.connect(self.sync_layers) 
         # self.qgis_main_canvas.extentsChanged.connect(self.sync_zoom)
@@ -91,188 +97,13 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         # self.renderComplete.connect(self.render_complete)
 
     # ============================================================================
-    # == Cursor en el canvas estéreo, replicando el cursor del canvas principal ==
-    # ============================================================================  
-
-    def _init_cursor_marker(self):
-        """
-        Initialize the cursor marker with fallback to default marker.
-        """
-        try:
-            # Try to sync with main canvas cursor first
-            if self._sync_cursor_from_main_canvas():
-                return
-        except Exception as e:
-            QgsMessageLog.logMessage(f"Could not sync cursor from main canvas: {e}", "SWM-3D", Qgis.Warning)
-            
-        # Fallback to default QgsVertexMarker
-        self._create_default_cursor_marker()
-
-    def _create_default_cursor_marker(self):
-        """
-        Create a default QgsVertexMarker as fallback.
-        """
-        if self.cursor_marker:
-            try:
-                self.scene().removeItem(self.cursor_marker)
-            except:
-                pass
-        
-        self.cursor_marker = QgsVertexMarker(self)
-        self.cursor_marker.setColor(QColor(Qt.GlobalColor.black))
-        self.cursor_marker.setIconSize(10)
-        self.cursor_marker.setIconType(QgsVertexMarker.ICON_CROSS)
-        self.cursor_marker.setPenWidth(2)
-
-    def _sync_cursor_from_main_canvas(self):
-        """
-        Try to copy the actual cursor bitmap from the main canvas.
-        Returns True if successful, False if fallback is needed.
-        """
-        try:
-            # Get the current cursor from the main canvas
-            main_cursor = self.qgis_main_canvas.cursor()
-            cursor_shape = main_cursor.shape()
-            
-            # If cursor hasn't changed, don't recreate
-            if self.current_cursor_shape == cursor_shape and self.cursor_pixmap_item:
-                return True
-                
-            self.current_cursor_shape = cursor_shape
-            
-            # Get cursor pixmap
-            cursor_pixmap = main_cursor.pixmap()
-            
-            if cursor_pixmap.isNull():
-                # Try to create pixmap from shape
-                cursor_pixmap = self._create_cursor_pixmap_from_shape(cursor_shape)
-            
-            if not cursor_pixmap.isNull():
-                # Remove old cursor if exists
-                if self.cursor_marker:
-                    try:
-                        self.scene().removeItem(self.cursor_marker)
-                    except:
-                        pass
-                    self.cursor_marker = None
-                    
-                if self.cursor_pixmap_item:
-                    try:
-                        self.scene().removeItem(self.cursor_pixmap_item)
-                    except:
-                        pass
-                
-                # Create new pixmap item
-                self.cursor_pixmap_item = QGraphicsPixmapItem(cursor_pixmap)
-                self.scene().addItem(self.cursor_pixmap_item)
-                self.cursor_marker = self.cursor_pixmap_item  # Use as marker reference
-                
-                QgsMessageLog.logMessage(f"Cursor bitmap synchronized for {'LEFT' if self.is_left else 'RIGHT'} canvas. Shape: {cursor_shape}", 
-                                       "SWM-3D", Qgis.Info)
-                return True
-                
-        except Exception as e:
-            QgsMessageLog.logMessage(f"Error syncing cursor bitmap: {e}", "SWM-3D", Qgis.Warning)
-            
-        return False
-
-    def _create_cursor_pixmap_from_shape(self, cursor_shape):
-        """
-        Create a pixmap representation of standard cursor shapes.
-        """
-        pixmap = QPixmap(24, 24)
-        pixmap.fill(Qt.GlobalColor.transparent)
-        
-        painter = QPainter(pixmap)
-        painter.setPen(QColor(Qt.GlobalColor.black))
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
-        center_x, center_y = 12, 12
-        
-        if cursor_shape == Qt.CursorShape.CrossCursor:
-            painter.drawLine(center_x, 2, center_x, 22)
-            painter.drawLine(2, center_y, 22, center_y)
-        elif cursor_shape == Qt.CursorShape.ArrowCursor:
-            # Draw arrow shape
-            painter.setBrush(QColor(Qt.GlobalColor.black))
-            points = [(2, 2), (2, 16), (8, 10), (14, 16), (10, 12), (16, 6)]
-            painter.drawPolygon([Qt.Point(x, y) for x, y in points])
-        elif cursor_shape == Qt.CursorShape.PointingHandCursor:
-            painter.setBrush(QColor(Qt.GlobalColor.black))
-            painter.drawEllipse(8, 8, 8, 8)
-        elif cursor_shape == Qt.CursorShape.SizeAllCursor:
-            # Four arrows pointing out
-            painter.drawLine(center_x, 4, center_x, 20)
-            painter.drawLine(4, center_y, 20, center_y)
-            # Arrow heads
-            painter.drawLine(center_x-2, 6, center_x, 4)
-            painter.drawLine(center_x+2, 6, center_x, 4)
-            painter.drawLine(center_x-2, 18, center_x, 20)
-            painter.drawLine(center_x+2, 18, center_x, 20)
-        else:
-            # Default cross for unknown cursors
-            painter.drawLine(center_x, 4, center_x, 20)
-            painter.drawLine(4, center_y, 20, center_y)
-            
-        painter.end()
-        return pixmap
-
-    def _sync_cursor_properties(self):
-        """
-        Synchronize cursor properties with the main canvas.
-        Now tries to use actual cursor bitmap.
-        """
-        # Try to sync actual cursor first
-        if not self._sync_cursor_from_main_canvas():
-            # Fallback to default marker if bitmap sync fails
-            self._create_default_cursor_marker()
-
-    def force_cursor_sync(self):
-        """
-        Force a complete cursor synchronization.
-        """
-        self.current_cursor_shape = None  # Reset cache
-        self.sync_cursor_style()
-        QgsMessageLog.logMessage(f"Forced cursor sync for {'LEFT' if self.is_left else 'RIGHT'} canvas", 
-                               "SWM-3D", Qgis.Info)
-
-    def sync_cursor_style(self):
-        """
-        Update cursor style when the main canvas map tool changes.
-        This is called when the map tool changes to update the visual appearance.
-        """
-        self._sync_cursor_properties()
-        # If cursor is currently visible, update its appearance and position
-        if self.cursor_marker and hasattr(self.cursor_marker, 'isVisible'):
-            if self.cursor_marker.isVisible():
-                self.update_cursor()
-        elif self.cursor_marker:  # QGraphicsPixmapItem doesn't have isVisible method the same way
-            self.update_cursor()
-
-    def cleanup_cursor(self):
-        """
-        Clean up cursor resources when canvas is destroyed.
-        """
-        try:
-            if self.cursor_marker:
-                if isinstance(self.cursor_marker, QGraphicsPixmapItem):
-                    self.scene().removeItem(self.cursor_marker)
-                self.cursor_marker = None
-            if self.cursor_pixmap_item:
-                try:
-                    self.scene().removeItem(self.cursor_pixmap_item)
-                except:
-                    pass
-                self.cursor_pixmap_item = None
-        except Exception as e:
-            QgsMessageLog.logMessage(f"Error cleaning up cursor: {e}", "SWM-3D", Qgis.Warning)
-
+    # == Cursor en el canvas estéreo ==
+    # ============================================================================
     def update_cursor(self):
         """
         Reprojects cursor using current XYZ value and updates its position.
-        Works with both QgsVertexMarker and QGraphicsPixmapItem cursors.
         """
-        if not self.isVisible() or not self.cursor_marker:
+        if not self.isVisible():
             return
 
         # Get cursor position in main canvas coordinates and current Z
@@ -281,33 +112,16 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         point_xy = self.qgis_main_canvas.getCoordinateTransform().toMapCoordinates(pos)
         
         # Calculate projected position
-        final_pos = point_xy
         if self.trf_wld2prp:
             pnt_wrl = QgsPoint(point_xy.x(), point_xy.y(), z)
             pnt_prj = self.trf_wld2prp.execute_wrl2prp(pnt_wrl)
             if pnt_prj:
-                final_pos = pnt_prj
+                self.cursor_marker.setCenter(pnt_prj)
+                self.cursor_marker.show()
+                return
 
-        # Update cursor position based on type
-        if isinstance(self.cursor_marker, QGraphicsPixmapItem):
-            # For QGraphicsPixmapItem (bitmap cursor)
-            # Convert map coordinates to pixel coordinates, then to scene coordinates
-            pixel_pos = self.getCoordinateTransform().transform(final_pos)
-            # Convert QgsPointXY to QPoint manually
-            qt_point = QPoint(int(pixel_pos.x()), int(pixel_pos.y()))
-            scene_pos = self.mapToScene(qt_point)
-            # Adjust position to center the cursor
-            pixmap = self.cursor_marker.pixmap()
-            offset_x = pixmap.width() / 2
-            offset_y = pixmap.height() / 2
-            self.cursor_marker.setPos(scene_pos.x() - offset_x, scene_pos.y() - offset_y)
-            self.cursor_marker.show()
-        elif hasattr(self.cursor_marker, 'setCenter'):
-            # For QgsVertexMarker (fallback)
-            self.cursor_marker.setCenter(final_pos)
-            self.cursor_marker.show()
-        else:
-            QgsMessageLog.logMessage(f"Unknown cursor marker type: {type(self.cursor_marker)}", "SWM-3D", Qgis.Warning)
+        self.cursor_marker.setCenter(point_xy)
+        self.cursor_marker.show()
 
     def wheelEvent(self, event: QWheelEvent):
         """

@@ -29,12 +29,12 @@ QgsSgdSwmCanvas (plugin)
   └── render
 """
 from qgis.core import QgsMessageLog, Qgis  # para mensajes de depuración.
-from qgis.gui import QgsMapCanvas, QgsVertexMarker, QgsRubberBand
+from qgis.gui import QgsMapCanvas, QgsVertexMarker, QgsRubberBand, QgsMapCanvasItem
 from qgis.core import QgsWkbTypes, QgsGeometry, QgsRasterLayer, QgsVectorLayer, QgsPoint
 from qgis.core import QgsSymbol, QgsSingleSymbolRenderer, QgsGeometryGeneratorSymbolLayer
 from qgis.PyQt.QtGui import QColor, QWheelEvent, QImage, QPainter
-from qgis.PyQt.QtCore import QEvent, Qt, QObject
-from typing import Optional, Any
+from qgis.PyQt.QtCore import QEvent, Qt, QObject, QTimer
+from typing import Optional, Any, Dict, List
 
 import re
 import numpy as np
@@ -61,23 +61,20 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
 
         # Transformation world to projection plane
         self.trf_wld2prp = None
-        # VER_0.5
-        # self.filtered_image = None  # Aquí guardaremos la imagen filtrada
-        # VER_1.0
-        # nada
 
-        # Cursor marker
+        # Cursor marker (debe crearse antes de la sincronización de items)
         self.cursor_marker = QgsVertexMarker(self)
         self.cursor_marker.setColor(QColor(Qt.GlobalColor.black))
         self.cursor_marker.setIconSize(10)
         self.cursor_marker.setIconType(QgsVertexMarker.ICON_CROSS)
         self.cursor_marker.setPenWidth(3)
-        # Pruebas con cursor bitmap. 
-        # # Cursor marker - synchronized with main canvas using actual cursor bitmap
-        # self.cursor_marker = None  # Will be created dynamically
-        # self.cursor_pixmap_item = None  # QGraphicsPixmapItem for custom cursor
-        # self.current_cursor_shape = None  # Cache current cursor
-        # self._init_cursor_marker()
+
+        # Map canvas items synchronization (después de crear cursor_marker)
+        self.synced_items: Dict[QgsMapCanvasItem, QgsMapCanvasItem] = {}  # main_item -> synced_item
+        self.sync_timer = QTimer()
+        self.sync_timer.timeout.connect(self._sync_canvas_items)
+        self.sync_timer.setSingleShot(True)
+        self._setup_canvas_items_sync()
 
         self.layer_swm = None
         self.layers_z = []
@@ -123,6 +120,356 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
 
         self.cursor_marker.setCenter(point_xy)
         self.cursor_marker.show()
+
+    # ============================================================================
+    # == Sincronización de Map Canvas Items ==
+    # ============================================================================
+
+    def _setup_canvas_items_sync(self):
+        """
+        Configura la sincronización automática de map canvas items del canvas principal.
+        """
+        # Realizar sincronización inicial
+        self._sync_canvas_items()
+        
+        # Programar sincronización periódica (cada 500ms cuando no hay cambios activos)
+        self.sync_timer.start(500)
+
+    def _sync_canvas_items(self):
+        """
+        Sincroniza todos los map canvas items del canvas principal con este canvas.
+        """
+        try:
+            if not self.qgis_main_canvas:
+                return
+                
+            main_items = self._get_canvas_items(self.qgis_main_canvas)
+            current_main_items = set(main_items)
+            synced_main_items = set(self.synced_items.keys())
+            
+            # Eliminar items que ya no existen en el canvas principal
+            items_to_remove = synced_main_items - current_main_items
+            for main_item in items_to_remove:
+                if main_item in self.synced_items:
+                    synced_item = self.synced_items[main_item]
+                    if hasattr(synced_item, 'hide'):
+                        synced_item.hide()
+                    # Eliminar del canvas de forma segura
+                    self._safe_remove_item(synced_item)
+                    del self.synced_items[main_item]
+            
+            # Añadir o actualizar items existentes
+            for main_item in main_items:
+                if main_item not in self.synced_items:
+                    # Crear nuevo item sincronizado
+                    synced_item = self._create_synced_item(main_item)
+                    if synced_item:
+                        self.synced_items[main_item] = synced_item
+                else:
+                    # Actualizar item existente
+                    self._update_synced_item(main_item, self.synced_items[main_item])
+                    
+        except Exception as e:
+            QgsMessageLog.logMessage(f"Error sincronizando map canvas items: {str(e)}", 
+                                   "SWM-3D", Qgis.Warning)
+        finally:
+            # Reprogramar próxima sincronización
+            if not self.sync_timer.isActive():
+                self.sync_timer.start(500)
+
+    def _get_canvas_items(self, canvas) -> List[QgsMapCanvasItem]:
+        """
+        Obtiene todos los map canvas items de un canvas.
+        """
+        items = []
+        try:
+            if hasattr(canvas, 'scene') and canvas.scene():
+                for item in canvas.scene().items():
+                    # Verificar que sea un QgsMapCanvasItem y excluir nuestro cursor marker si existe
+                    if isinstance(item, QgsMapCanvasItem):
+                        # Excluir nuestro propio cursor marker para evitar recursión
+                        if hasattr(self, 'cursor_marker') and item == self.cursor_marker:
+                            continue
+                        items.append(item)
+        except Exception as e:
+            QgsMessageLog.logMessage(f"Error obteniendo canvas items: {str(e)}", 
+                                   "SWM-3D", Qgis.Warning)
+        return items
+
+    def _create_synced_item(self, main_item: QgsMapCanvasItem) -> Optional[QgsMapCanvasItem]:
+        """
+        Crea una copia sincronizada de un map canvas item del canvas principal.
+        """
+        try:
+            synced_item = None
+            
+            if isinstance(main_item, QgsVertexMarker):
+                synced_item = QgsVertexMarker(self)
+                self._sync_vertex_marker_properties(main_item, synced_item)
+                
+            elif isinstance(main_item, QgsRubberBand):
+                # Obtener tipo de geometría del rubber band original
+                geom_type = QgsWkbTypes.PolygonGeometry
+                if hasattr(main_item, 'geometryType'):
+                    geom_type = main_item.geometryType()
+                    
+                synced_item = QgsRubberBand(self, geom_type)
+                self._sync_rubber_band_properties(main_item, synced_item)
+            
+            # Añadir más tipos de items según necesidades
+            # elif isinstance(main_item, OtherMapCanvasItemType):
+            #     synced_item = self._create_other_item_type(main_item)
+                
+            if synced_item:
+                synced_item.show()
+                
+            return synced_item
+            
+        except Exception as e:
+            QgsMessageLog.logMessage(f"Error creando item sincronizado: {str(e)}", 
+                                   "SWM-3D", Qgis.Warning)
+            return None
+
+    def _update_synced_item(self, main_item: QgsMapCanvasItem, synced_item: QgsMapCanvasItem):
+        """
+        Actualiza las propiedades de un item sincronizado basándose en el item principal.
+        """
+        try:
+            if isinstance(main_item, QgsVertexMarker) and isinstance(synced_item, QgsVertexMarker):
+                self._sync_vertex_marker_properties(main_item, synced_item)
+                
+            elif isinstance(main_item, QgsRubberBand) and isinstance(synced_item, QgsRubberBand):
+                self._sync_rubber_band_properties(main_item, synced_item)
+                
+            # Actualizar visibilidad
+            if hasattr(main_item, 'isVisible') and hasattr(synced_item, 'setVisible'):
+                synced_item.setVisible(main_item.isVisible())
+                
+        except Exception as e:
+            QgsMessageLog.logMessage(f"Error actualizando item sincronizado: {str(e)}", 
+                                   "SWM-3D", Qgis.Warning)
+
+    def _sync_vertex_marker_properties(self, source: QgsVertexMarker, target: QgsVertexMarker):
+        """
+        Sincroniza las propiedades de un QgsVertexMarker.
+        """
+        try:
+            # Copiar propiedades básicas de forma segura
+            # Verificar existencia de métodos getter antes de usarlos
+            if hasattr(source, 'color'):
+                target.setColor(source.color())
+            
+            # Para iconSize, iconType y penWidth, algunos getters podrían no estar disponibles
+            # En caso de no poder obtener el valor, usar valores por defecto razonables
+            try:
+                if hasattr(source, 'iconSize'):
+                    target.setIconSize(source.iconSize())
+                else:
+                    target.setIconSize(10)  # Valor por defecto
+            except AttributeError:
+                target.setIconSize(10)
+                
+            try:
+                if hasattr(source, 'iconType'):
+                    target.setIconType(source.iconType())
+                else:
+                    target.setIconType(QgsVertexMarker.ICON_CROSS)  # Valor por defecto
+            except AttributeError:
+                target.setIconType(QgsVertexMarker.ICON_CROSS)
+                
+            try:
+                if hasattr(source, 'penWidth'):
+                    target.setPenWidth(source.penWidth())
+                else:
+                    target.setPenWidth(3)  # Valor por defecto
+            except AttributeError:
+                target.setPenWidth(3)
+            
+            # Copiar y transformar posición
+            center = source.center()
+            if center and self.trf_wld2prp:
+                # Aplicar transformación 3D si está disponible
+                z = self.parent.z_cursor if self.parent else 0
+                pnt_wrl = QgsPoint(center.x(), center.y(), z)
+                pnt_prj = self.trf_wld2prp.execute_wrl2prp(pnt_wrl)
+                if pnt_prj:
+                    target.setCenter(pnt_prj)
+                else:
+                    target.setCenter(center)
+            else:
+                target.setCenter(center)
+                
+        except Exception as e:
+            QgsMessageLog.logMessage(f"Error sincronizando vertex marker: {str(e)}", 
+                                   "SWM-3D", Qgis.Warning)
+
+    def _sync_rubber_band_properties(self, source: QgsRubberBand, target: QgsRubberBand):
+        """
+        Sincroniza las propiedades de un QgsRubberBand.
+        """
+        try:
+            # Copiar propiedades de estilo
+            # Usar strokeColor() en lugar de color() para QgsRubberBand
+            if hasattr(source, 'strokeColor'):
+                target.setColor(source.strokeColor())
+            elif hasattr(source, 'color'):
+                target.setColor(source.color())
+                
+            if hasattr(source, 'fillColor'):
+                target.setFillColor(source.fillColor())
+                
+            if hasattr(source, 'width'):
+                target.setWidth(source.width())
+            
+            # Copiar geometría
+            geom = source.asGeometry()
+            if geom and not geom.isEmpty():
+                if self.trf_wld2prp:
+                    # Aplicar transformación 3D a la geometría si está disponible
+                    transformed_geom = self._transform_geometry(geom)
+                    if transformed_geom:
+                        target.setToGeometry(transformed_geom, None)
+                    else:
+                        target.setToGeometry(geom, None)
+                else:
+                    target.setToGeometry(geom, None)
+            
+        except Exception as e:
+            QgsMessageLog.logMessage(f"Error sincronizando rubber band: {str(e)}", 
+                                   "SWM-3D", Qgis.Warning)
+
+    def _transform_geometry(self, geom: QgsGeometry) -> Optional[QgsGeometry]:
+        """
+        Transforma una geometría aplicando la proyección 3D actual.
+        """
+        try:
+            if not self.trf_wld2prp or not geom:
+                return geom
+                
+            # Para simplificar, aplicamos Z=0 a todos los puntos
+            # En una implementación más compleja, podrías obtener Z de otras fuentes
+            z = self.parent.z_cursor if self.parent else 0
+            
+            # Transformar todos los vértices de la geometría
+            vertices = []
+            if geom.type() == QgsWkbTypes.PointGeometry:
+                point = geom.asPoint()
+                pnt_wrl = QgsPoint(point.x(), point.y(), z)
+                pnt_prj = self.trf_wld2prp.execute_wrl2prp(pnt_wrl)
+                if pnt_prj:
+                    return QgsGeometry.fromPointXY(pnt_prj)
+                    
+            elif geom.type() in [QgsWkbTypes.LineGeometry, QgsWkbTypes.PolygonGeometry]:
+                # Para líneas y polígonos, transformar todos los puntos
+                geom_collection = geom.asGeometryCollection() if geom.isMultipart() else [geom]
+                
+                for single_geom in geom_collection:
+                    if single_geom.type() == QgsWkbTypes.LineGeometry:
+                        polyline = single_geom.asPolyline()
+                        transformed_points = []
+                        for point in polyline:
+                            pnt_wrl = QgsPoint(point.x(), point.y(), z)
+                            pnt_prj = self.trf_wld2prp.execute_wrl2prp(pnt_wrl)
+                            if pnt_prj:
+                                transformed_points.append(pnt_prj)
+                            else:
+                                transformed_points.append(point)
+                        if transformed_points:
+                            return QgsGeometry.fromPolylineXY(transformed_points)
+                            
+                    elif single_geom.type() == QgsWkbTypes.PolygonGeometry:
+                        polygon = single_geom.asPolygon()
+                        if polygon:
+                            transformed_rings = []
+                            for ring in polygon:
+                                transformed_ring = []
+                                for point in ring:
+                                    pnt_wrl = QgsPoint(point.x(), point.y(), z)
+                                    pnt_prj = self.trf_wld2prp.execute_wrl2prp(pnt_wrl)
+                                    if pnt_prj:
+                                        transformed_ring.append(pnt_prj)
+                                    else:
+                                        transformed_ring.append(point)
+                                if transformed_ring:
+                                    transformed_rings.append(transformed_ring)
+                            if transformed_rings:
+                                return QgsGeometry.fromPolygonXY(transformed_rings)
+            
+            return geom
+            
+        except Exception as e:
+            QgsMessageLog.logMessage(f"Error transformando geometría: {str(e)}", 
+                                   "SWM-3D", Qgis.Warning)
+            return geom
+
+    def force_sync_canvas_items(self):
+        """
+        Fuerza una sincronización inmediata de todos los map canvas items.
+        Método público para ser llamado desde el exterior cuando sea necesario.
+        """
+        self.sync_timer.stop()
+        self._sync_canvas_items()
+
+    def set_canvas_items_sync_enabled(self, enabled: bool):
+        """
+        Habilita o deshabilita la sincronización automática de map canvas items.
+        """
+        if enabled:
+            if not self.sync_timer.isActive():
+                self.sync_timer.start(500)
+        else:
+            self.sync_timer.stop()
+
+    def cleanup_canvas_items_sync(self):
+        """
+        Limpia todos los recursos relacionados con la sincronización de canvas items.
+        Debe ser llamado al cerrar o destruir el canvas.
+        """
+        self.sync_timer.stop()
+        
+        # Limpiar todos los items sincronizados
+        for synced_item in self.synced_items.values():
+            try:
+                if hasattr(synced_item, 'hide'):
+                    synced_item.hide()
+                self._safe_remove_item(synced_item)
+            except Exception:
+                pass  # Ignorar errores durante la limpieza
+        
+        self.synced_items.clear()
+
+    def _safe_remove_item(self, item):
+        """
+        Remueve un item del canvas de forma segura, evitando errores de Qt.
+        """
+        try:
+            # Verificar que el item existe y tiene una scene válida
+            if not item:
+                return
+                
+            item_scene = None
+            if hasattr(item, 'scene'):
+                item_scene = item.scene()
+            
+            # Si el item no tiene scene, no hay nada que remover
+            if not item_scene:
+                return
+                
+            # Verificar que la scene del item coincide con nuestra scene
+            canvas_scene = self.scene() if hasattr(self, 'scene') else None
+            if canvas_scene and item_scene == canvas_scene:
+                canvas_scene.removeItem(item)
+            elif item_scene:
+                # Si las scenes son diferentes, remover del item's scene
+                item_scene.removeItem(item)
+                
+        except Exception as e:
+            # Silenciar errores de Qt relacionados con scene management
+            pass
+
+    # ============================================================================
+    # == Fin de sincronización de Map Canvas Items ==
+    # ============================================================================
 
     def wheelEvent(self, event: QWheelEvent):  # type: ignore[override]
         """
@@ -320,6 +667,9 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
 
         self.setLayers(layers_self)
         # self.refresh()  # Parece innecesario
+        
+        # Forzar sincronización de map canvas items después de cambiar capas
+        self.force_sync_canvas_items()
 
     # Lo desactivo porque no sé si es necesario
     # def sync_renderer_layerz_changed(self, layer_name):

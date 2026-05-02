@@ -26,6 +26,7 @@ from qgis.PyQt.QtGui import QTransform, QGuiApplication
 from qgis.PyQt.QtCore import Qt, QEvent, QTimer
 
 import re
+
 # librerías SWM
 from .canvas import QgsSgdSwmCanvas
 
@@ -72,12 +73,19 @@ class QSgdSwmWindow(QMainWindow):
         self.iface.mapCanvas().xyCoordinates.connect(self._sync_canvases_cursor)      # ratón
         self.iface.mapCanvas().layersChanged.connect(self._sync_canvases_layers)      # nuevas capas
         self.iface.mapCanvas().extentsChanged.connect(self._sync_canvases_repaint)    # zoom y desplazamiento
+        
+        # Timer para monitorear cambios en map canvas items
+        self.canvas_items_timer = QTimer()
+        self.canvas_items_timer.timeout.connect(self._check_canvas_items_changes)
+        self.canvas_items_timer.start(200)  # Verificar cada 200ms
+        self._last_canvas_items_count = 0
 
         # Network Manager WMS
         # https://chat.deepseek.com/a/chat/s/5dc872fa-208d-458c-836b-9199dcc3a37c
         # self.network_manager = QNetworkAccessManager()
         self.network_manager = QgsNetworkAccessManager.instance()      
-        self.network_manager.finished.connect(self.network_reply_handle)
+        if self.network_manager:
+            self.network_manager.finished.connect(self.network_reply_handle)
 
     def showEvent(self, event):
         """
@@ -98,6 +106,16 @@ class QSgdSwmWindow(QMainWindow):
             self.canvas_right.refresh()
 
     def closeEvent(self, event):
+        # Limpiar timer de monitoreo de canvas items
+        if hasattr(self, 'canvas_items_timer'):
+            self.canvas_items_timer.stop()
+            
+        # Limpiar sincronización en los canvas secundarios
+        if self.canvas_left:
+            self.canvas_left.cleanup_canvas_items_sync()
+        if self.canvas_right:
+            self.canvas_right.cleanup_canvas_items_sync()
+            
         self.iface.mainWindow().statusBar().removeWidget(self.z_label)
         super().closeEvent(event)
 
@@ -230,6 +248,65 @@ class QSgdSwmWindow(QMainWindow):
         if self.canvas_right:
             self.canvas_right.sync_layers()
 
+    def _check_canvas_items_changes(self):
+        """
+        Verifica cambios en los map canvas items del canvas principal y 
+        fuerza la sincronización en los canvas secundarios.
+        """
+        try:
+            if not self.iface or not self.iface.mapCanvas():
+                return
+                
+            # Contar items actuales en el canvas principal
+            current_count = 0
+            main_canvas = self.iface.mapCanvas()
+            if hasattr(main_canvas, 'scene') and main_canvas.scene():
+                for item in main_canvas.scene().items():
+                    if hasattr(item, '__class__') and 'MapCanvasItem' in str(item.__class__):
+                        current_count += 1
+            
+            # Si hay cambios, forzar sincronización
+            if current_count != self._last_canvas_items_count:
+                self._last_canvas_items_count = current_count
+                self._sync_canvases_items()
+                
+        except Exception as e:
+            QgsMessageLog.logMessage(f"Error verificando cambios en canvas items: {str(e)}", 
+                                   "SWM-3D", Qgis.Warning)
+
+    def _sync_canvases_items(self):
+        """
+        Fuerza la sincronización de map canvas items en los canvas secundarios.
+        """
+        if self.canvas_left:
+            self.canvas_left.force_sync_canvas_items()
+        if self.canvas_right:
+            self.canvas_right.force_sync_canvas_items()
+
+    def set_canvas_items_sync_enabled(self, enabled: bool):
+        """
+        Habilita o deshabilita la sincronización automática de map canvas items.
+        Método público para controlar la funcionalidad desde el exterior.
+        """
+        if enabled:
+            # Reactivar el timer de monitoreo
+            if hasattr(self, 'canvas_items_timer'):
+                self.canvas_items_timer.start(200)
+            # Habilitar sincronización en los canvas
+            if self.canvas_left:
+                self.canvas_left.set_canvas_items_sync_enabled(True)
+            if self.canvas_right:
+                self.canvas_right.set_canvas_items_sync_enabled(True)
+        else:
+            # Detener el timer de monitoreo
+            if hasattr(self, 'canvas_items_timer'):
+                self.canvas_items_timer.stop()
+            # Deshabilitar sincronización en los canvas
+            if self.canvas_left:
+                self.canvas_left.set_canvas_items_sync_enabled(False)
+            if self.canvas_right:
+                self.canvas_right.set_canvas_items_sync_enabled(False)
+
     def eventFilter(self, obj, event):
         # Capture wheel events globally
         if event.type() == QEvent.Type.Wheel:
@@ -298,13 +375,15 @@ class QSgdSwmWindow(QMainWindow):
                 return
 
             self._set_projection_plane_z(z_proj_plane)
-            self.canvas_left.update_data_from_wms_header(reply)
+            if self.canvas_left:
+                self.canvas_left.update_data_from_wms_header(reply)
             if not self._has_received_swm_reply:
                 self._has_received_swm_reply = True
                 # Este Timer espera al siguiente ciclo del bucle de eventos Qt
                 QTimer.singleShot(0, self.showFullScreen)  # Se minimiza con ESC en keyPressEvent
         else:
-            self.canvas_right.update_data_from_wms_header(reply)
+            if self.canvas_right:
+                self.canvas_right.update_data_from_wms_header(reply)
 
     def keyPressEvent(self, event):
         """

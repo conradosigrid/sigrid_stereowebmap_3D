@@ -82,7 +82,6 @@ class QSgdSwmWindow(QMainWindow):
 
         # Network Manager WMS
         # https://chat.deepseek.com/a/chat/s/5dc872fa-208d-458c-836b-9199dcc3a37c
-        # self.network_manager = QNetworkAccessManager()
         self.network_manager = QgsNetworkAccessManager.instance()      
         if self.network_manager:
             self.network_manager.finished.connect(self.network_reply_handle)
@@ -162,10 +161,7 @@ class QSgdSwmWindow(QMainWindow):
         if self.stereo_id <= 3:
             # Overlayed canvas
             layout = QStackedLayout()
-            layout.setStackingMode(QStackedLayout.StackAll) # Stacked layout to overlay canvases    
-            # VER_0.5
-            # nada
-            # VER_1.0
+            layout.setStackingMode(QStackedLayout.StackAll)
             layout.setCurrentIndex(1)  # Asegura que el derecho esté arriba
         elif self.stereo_id <= 5:
             # Horizontally disposed canvas
@@ -175,11 +171,8 @@ class QSgdSwmWindow(QMainWindow):
         elif self.stereo_id == 6:
             # Vertically disposed canvas
             layout = QVBoxLayout()
-            # VER_0.5
-            # self.canvas_right.setTransform(QTransform().scale(1, -1))  # Mirror right canvas vertically
-            # VER1.0
             self.canvas_right.setTransform(QTransform().scale(-1, 1))  # Mirror right canvas vertically        
-        central_widget.setLayout(layout)  # ¿quitado en VER_1.0?
+        central_widget.setLayout(layout)
 
         layout.addWidget(self.canvas_left)
         layout.addWidget(self.canvas_right)
@@ -322,19 +315,18 @@ class QSgdSwmWindow(QMainWindow):
             elif modifiers & Qt.KeyboardModifier.ShiftModifier:
                 delta *= 10.    # Increment Z by wheel step 10 m.
             self.z_cursor += delta  # Adjust Z value
-            # QgsMessageLog.logMessage(f"[DEBUG] New Z value: {self.z_cursor}", "SWM_3D", Qgis.Info)
 
-            # Notificar a TODOS los canvases Ya lo hace el @z_cursor.setter
-            # self.canvas_left.update_cursor()
-            # self.canvas_right.update_cursor()
-            # self._update_z_label()
             return True  # Event handled, prevent further propagation
         return False
 
     def _update_z_label(self):
         """ Para reproducir en StatusBar los cambios en Z (que está en el canvas) """
         self.z_label.setText(f"Zbase={self._z_proj_plane:.1f} Zcurs={self._z_cursor:.1f}")
-        # self.z_label.setText(f"Z={z: .1f}")
+        # Actualizar texto en canvas
+        if self.canvas_left:
+            self.canvas_left.update_z_text(self._z_cursor)
+        if self.canvas_right:
+            self.canvas_right.update_z_text(self._z_cursor)
 
     def network_reply_handle(self, reply):
         """
@@ -348,7 +340,6 @@ class QSgdSwmWindow(QMainWindow):
         if not self.isVisible():
             return
         request_url = reply.request().url().toString()
-        # QgsMessageLog.logMessage(f"[DEBUG] <network_reply_handler> Lanzando", "SWM-3D", Qgis.Info)
 
         # Vamos a chequear si la respuesta viene de SWM y es correcta
         # La petición que proviene de la pantalla principal de QGIS vienen como PhotoRight o PhotoLeft.
@@ -434,8 +425,3 @@ class QSgdSwmWindow(QMainWindow):
             return "Error: Selected screen not found."
 
         return None
-
-    # def trigger_sync_renderer_layerz(self, layer_name):
-    #     """Trigger the sync_layers function when a layer's renderer changes."""
-    #     self.canvas_left.sync_renderer_layerz_changed(layer_name)
-    #     self.canvas_right.sync_renderer_layerz_changed(layer_name)

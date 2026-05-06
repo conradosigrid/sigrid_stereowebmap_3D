@@ -191,7 +191,6 @@ def perspective_swm_transform(geometry, side, txt_trf_wrl2pht, txt_trf_pht2prp):
         res = photo_to_proj(res[0], res[1], a, b, c)
         if not res:
             return geometry
-        # QgsMessageLog.logMessage(f"[DEBUG] expression: Transformed point from ({p.x()}, {p.y()}, {z}) to ({res[0]}, {res[1]})", "SWM-3D", Qgis.Info)
 
         return QgsGeometry.fromWkt(f"POINT ({res[0]} {res[1]})")
 

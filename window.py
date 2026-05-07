@@ -24,11 +24,11 @@ from qgis.PyQt.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, 
 from qgis.PyQt.QtWidgets import QInputDialog, QMessageBox, QLabel, QApplication
 from qgis.PyQt.QtGui import QTransform, QGuiApplication
 from qgis.PyQt.QtCore import Qt, QEvent, QTimer
-
 import re
 
 # librerías SWM
 from .canvas import QgsSgdSwmCanvas
+from .utils import is_z_layer
 
 
 # Class Sigrid Swm Window
@@ -66,19 +66,13 @@ class QSgdSwmWindow(QMainWindow):
         # Z global compartido siempre asignar con @z_cursor.setter para actualizar todo
         self._z_proj_plane = 0.0
         self.z_cursor = 0.0
-        # Instalar filtro de eventos GLOBAL
+        # Instalar filtro de eventos solo para control Z con rueda
         QApplication.instance().installEventFilter(self)
 
         # Capturar eventos del canvas principal qgis
         self.iface.mapCanvas().xyCoordinates.connect(self._sync_canvases_cursor)      # ratón
         self.iface.mapCanvas().layersChanged.connect(self._sync_canvases_layers)      # nuevas capas
         self.iface.mapCanvas().extentsChanged.connect(self._sync_canvases_repaint)    # zoom y desplazamiento
-        
-        # Timer para monitorear cambios en map canvas items
-        self.canvas_items_timer = QTimer()
-        self.canvas_items_timer.timeout.connect(self._check_canvas_items_changes)
-        self.canvas_items_timer.start(200)  # Verificar cada 200ms
-        self._last_canvas_items_count = 0
 
         # Network Manager WMS
         # https://chat.deepseek.com/a/chat/s/5dc872fa-208d-458c-836b-9199dcc3a37c
@@ -105,17 +99,25 @@ class QSgdSwmWindow(QMainWindow):
             self.canvas_right.refresh()
 
     def closeEvent(self, event):
-        # Limpiar timer de monitoreo de canvas items
-        if hasattr(self, 'canvas_items_timer'):
-            self.canvas_items_timer.stop()
+        try:
+            # Limpiar event filter
+            QApplication.instance().removeEventFilter(self)
             
-        # Limpiar sincronización en los canvas secundarios
-        if self.canvas_left:
-            self.canvas_left.cleanup_canvas_items_sync()
-        if self.canvas_right:
-            self.canvas_right.cleanup_canvas_items_sync()
+            # Limpiar sincronización en los canvas secundarios
+            if self.canvas_left:
+                self.canvas_left.cleanup_canvas_items_sync()
+            if self.canvas_right:
+                self.canvas_right.cleanup_canvas_items_sync()
             
-        self.iface.mainWindow().statusBar().removeWidget(self.z_label)
+            # Remover Z label del status bar
+            try:
+                self.iface.mainWindow().statusBar().removeWidget(self.z_label)
+            except:
+                pass
+                
+        except Exception as e:
+            QgsMessageLog.logMessage(f"Error durante limpieza: {str(e)}", "SWM-3D", QgsMessageLog.MessageType.Critical)
+        
         super().closeEvent(event)
 
     def configure_canvases(self):
@@ -177,10 +179,6 @@ class QSgdSwmWindow(QMainWindow):
         layout.addWidget(self.canvas_left)
         layout.addWidget(self.canvas_right)
 
-        # Para conectar el canvas con el StatusBar
-        self.canvas_left.z_changed_callback = self._update_z_label
-        self.canvas_right.z_changed_callback = self._update_z_label
-
         return None
 
     # La Z, cambios con la rueda del ratón
@@ -195,7 +193,16 @@ class QSgdSwmWindow(QMainWindow):
             self.canvas_left.update_cursor()
         if self.canvas_right:
             self.canvas_right.update_cursor()
-        self._update_z_label()
+        self._update_z_label()  # Actualizar texto Z en canvas estéreo
+
+    def _update_z_label(self):
+        """ Para reproducir en StatusBar los cambios en Z (que está en el canvas) """
+        self.z_label.setText(f"Zbase={self._z_proj_plane:.1f} Zcurs={self._z_cursor:.1f}")
+        # Actualizar texto en canvas
+        if self.canvas_left:
+            self.canvas_left.update_z_text(self._z_cursor)
+        if self.canvas_right:
+            self.canvas_right.update_z_text(self._z_cursor)
 
     def _set_projection_plane_z(self, z):
         """
@@ -222,12 +229,12 @@ class QSgdSwmWindow(QMainWindow):
         3) Pero falta el refresco de todo para que se repinte.
         """
         if self.canvas_left:
-            QgsMessageLog.logMessage(f"[DEBUG] <sync_canvases_repaint> Refrescando canvas IZDO", "SWM-3D", Qgis.Info)
+            # QgsMessageLog.logMessage(f"[DEBUG] <sync_canvases_repaint> Refrescando canvas IZDO", "SWM-3D", Qgis.Info)
             self.canvas_left.setExtent(self.qgis_main_canvas.extent())
             # self.canvas_left.sync_layers()
             self.canvas_left.refresh()
         if self.canvas_right:
-            QgsMessageLog.logMessage(f"[DEBUG] <sync_canvases_repaint> Refrescando canvas DCHO", "SWM-3D", Qgis.Info)
+            # QgsMessageLog.logMessage(f"[DEBUG] <sync_canvases_repaint> Refrescando canvas DCHO", "SWM-3D", Qgis.Info)
             self.canvas_right.setExtent(self.qgis_main_canvas.extent())
             # self.canvas_right.sync_layers()
             self.canvas_right.refresh()
@@ -241,92 +248,30 @@ class QSgdSwmWindow(QMainWindow):
         if self.canvas_right:
             self.canvas_right.sync_layers()
 
-    def _check_canvas_items_changes(self):
-        """
-        Verifica cambios en los map canvas items del canvas principal y 
-        fuerza la sincronización en los canvas secundarios.
-        """
-        try:
-            if not self.iface or not self.iface.mapCanvas():
-                return
-                
-            # Contar items actuales en el canvas principal
-            current_count = 0
-            main_canvas = self.iface.mapCanvas()
-            if hasattr(main_canvas, 'scene') and main_canvas.scene():
-                for item in main_canvas.scene().items():
-                    if hasattr(item, '__class__') and 'MapCanvasItem' in str(item.__class__):
-                        current_count += 1
-            
-            # Si hay cambios, forzar sincronización
-            if current_count != self._last_canvas_items_count:
-                self._last_canvas_items_count = current_count
-                self._sync_canvases_items()
-                
-        except Exception as e:
-            QgsMessageLog.logMessage(f"Error verificando cambios en canvas items: {str(e)}", 
-                                   "SWM-3D", Qgis.Warning)
-
-    def _sync_canvases_items(self):
-        """
-        Fuerza la sincronización de map canvas items en los canvas secundarios.
-        """
-        if self.canvas_left:
-            self.canvas_left.force_sync_canvas_items()
-        if self.canvas_right:
-            self.canvas_right.force_sync_canvas_items()
-
-    def set_canvas_items_sync_enabled(self, enabled: bool):
-        """
-        Habilita o deshabilita la sincronización automática de map canvas items.
-        Método público para controlar la funcionalidad desde el exterior.
-        """
-        if enabled:
-            # Reactivar el timer de monitoreo
-            if hasattr(self, 'canvas_items_timer'):
-                self.canvas_items_timer.start(200)
-            # Habilitar sincronización en los canvas
-            if self.canvas_left:
-                self.canvas_left.set_canvas_items_sync_enabled(True)
-            if self.canvas_right:
-                self.canvas_right.set_canvas_items_sync_enabled(True)
-        else:
-            # Detener el timer de monitoreo
-            if hasattr(self, 'canvas_items_timer'):
-                self.canvas_items_timer.stop()
-            # Deshabilitar sincronización en los canvas
-            if self.canvas_left:
-                self.canvas_left.set_canvas_items_sync_enabled(False)
-            if self.canvas_right:
-                self.canvas_right.set_canvas_items_sync_enabled(False)
-
     def eventFilter(self, obj, event):
-        # Capture wheel events globally
-        if event.type() == QEvent.Type.Wheel:
-            # Check if the Alt key is pressed using the keyboard state
-            modifiers = QApplication.keyboardModifiers()
-            # Use ALT + wheel to control Z
-            if not (modifiers & Qt.KeyboardModifier.AltModifier):
-                return False
-            delta = -event.angleDelta().x() / 120.  # Increment Z by wheel step 1 m. ¿Debería ser y()??
-            # Modifiers for precision
-            if modifiers & Qt.KeyboardModifier.ControlModifier:
-                delta /= 10.    # Increment Z by wheel step 0.1 m.
-            elif modifiers & Qt.KeyboardModifier.ShiftModifier:
-                delta *= 10.    # Increment Z by wheel step 10 m.
-            self.z_cursor += delta  # Adjust Z value
-
-            return True  # Event handled, prevent further propagation
-        return False
-
-    def _update_z_label(self):
-        """ Para reproducir en StatusBar los cambios en Z (que está en el canvas) """
-        self.z_label.setText(f"Zbase={self._z_proj_plane:.1f} Zcurs={self._z_cursor:.1f}")
-        # Actualizar texto en canvas
-        if self.canvas_left:
-            self.canvas_left.update_z_text(self._z_cursor)
-        if self.canvas_right:
-            self.canvas_right.update_z_text(self._z_cursor)
+        """Control Z con rueda del ratón (ALT + rueda)."""
+        try:
+            # Control Z con rueda
+            if event.type() == QEvent.Type.Wheel:
+                modifiers = QApplication.keyboardModifiers()
+                if not (modifiers & Qt.KeyboardModifier.AltModifier):
+                    return False
+                    
+                delta = -event.angleDelta().x() / 120.
+                if modifiers & Qt.KeyboardModifier.ControlModifier:
+                    delta /= 10.
+                elif modifiers & Qt.KeyboardModifier.ShiftModifier:
+                    delta *= 10.
+                    
+                old_z = self.z_cursor
+                self.z_cursor = round(self.z_cursor + delta, 1)
+                
+                QgsMessageLog.logMessage(f"Z cambiada: {old_z} → {self._z_cursor}", "SWM-3D", Qgis.Info)
+                return True
+                
+            return False
+        except:
+            return False
 
     def network_reply_handle(self, reply):
         """
@@ -377,9 +322,7 @@ class QSgdSwmWindow(QMainWindow):
                 self.canvas_right.update_data_from_wms_header(reply)
 
     def keyPressEvent(self, event):
-        """
-        Sólo para poder salir del modo FullScreen
-        """
+        """Sólo para poder salir del modo FullScreen"""
         if event.key() == Qt.Key.Key_Escape and self.isFullScreen():
             self.showNormal()
             event.accept()

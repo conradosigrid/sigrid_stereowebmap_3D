@@ -30,10 +30,10 @@ QgsSgdSwmCanvas (plugin)
 """
 from qgis.core import QgsMessageLog, Qgis  # para mensajes de depuración.
 from qgis.gui import QgsMapCanvas, QgsVertexMarker, QgsRubberBand, QgsMapCanvasItem
-from qgis.core import QgsWkbTypes, QgsGeometry, QgsRasterLayer, QgsVectorLayer, QgsPoint
+from qgis.core import QgsWkbTypes, QgsGeometry, QgsRasterLayer, QgsVectorLayer, QgsPoint, QgsPointXY
 from qgis.core import QgsSymbol, QgsSingleSymbolRenderer, QgsGeometryGeneratorSymbolLayer
 from qgis.PyQt.QtGui import QColor, QWheelEvent, QImage, QPainter
-from qgis.PyQt.QtCore import QEvent, Qt, QObject, QTimer
+from qgis.PyQt.QtCore import Qt
 from typing import Optional, Any, Dict, List
 
 import re
@@ -71,10 +71,12 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
 
         # Map canvas items synchronization (después de crear cursor_marker)
         self.synced_items: Dict[QgsMapCanvasItem, QgsMapCanvasItem] = {}  # main_item -> synced_item
-        self.vertex_z_cache: Dict[QgsMapCanvasItem, Dict[str, float]] = {}  # rubber_band -> {xy_key: z_value}
-        self.sync_timer = QTimer()
-        self.sync_timer.timeout.connect(self._sync_canvas_items)
-        self.sync_timer.setSingleShot(True)
+        self.geometry_cache: Dict[QgsMapCanvasItem, str] = {}  # rubber_band -> geometry_wkt para evitar duplicados
+        self.sync_in_progress = False  # Para evitar sincronizaciones concurrentes
+        
+        # Sistema de tracking Z paralelo - "objeto gemelo" para captura Z incremental
+        self.rubber_band_z_tracker: Dict[QgsRubberBand, List[float]] = {}  # rubber_band -> [z1, z2, z3, ...]
+        
         self._setup_canvas_items_sync()
 
         self.layer_swm = None
@@ -122,13 +124,37 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         # Realizar sincronización inicial
         self._sync_canvas_items()
         
-        # Programar sincronización periódica (cada 500ms cuando no hay cambios activos)
-        self.sync_timer.start(500)
+        # Conectar a señales del canvas principal para sincronización reactiva
+        if hasattr(self.qgis_main_canvas, 'mapCanvasRefreshed'):
+            self.qgis_main_canvas.mapCanvasRefreshed.connect(self._sync_canvas_items)
+        
+        # Conectar a señales de la escena para detectar cambios en items
+        if hasattr(self.qgis_main_canvas, 'scene') and self.qgis_main_canvas.scene():
+            scene = self.qgis_main_canvas.scene()
+            if hasattr(scene, 'changed'):
+                scene.changed.connect(self._on_scene_changed)
+        
+        QgsMessageLog.logMessage(f"SYNC: Configuración de sincronización por señales completada para canvas {'LEFT' if self.is_left else 'RIGHT'}", "SWM-3D", Qgis.Info)
 
+    def _on_scene_changed(self, regions):
+        """
+        Maneja cambios en la escena del canvas principal.
+        """
+        # Solo sincronizar si hay cambios significativos
+        if regions:  # Si hay regiones cambiadas
+            self._sync_canvas_items()
+    
     def _sync_canvas_items(self):
         """
         Sincroniza todos los map canvas items del canvas principal con este canvas.
         """
+        # Evitar sincronización concurrente
+        if self.sync_in_progress:
+            return
+            
+        self.sync_in_progress = True
+        
+        # QgsMessageLog.logMessage("SYNC: Iniciando sincronización de canvas items", "SWM-3D", Qgis.Info)
         try:
             if not self.qgis_main_canvas:
                 return
@@ -148,9 +174,18 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                     self._safe_remove_item(synced_item)
                     del self.synced_items[main_item]
                     
-                    # Limpiar cache de Z para rubber bands removidos
-                    if main_item in self.vertex_z_cache:
-                        del self.vertex_z_cache[main_item]
+                    # Limpiar cache de geometría para rubber bands removidos
+                    if main_item in self.geometry_cache:
+                        del self.geometry_cache[main_item]
+                        
+                    # Limpiar Z tracker para rubber bands removidos
+                    if isinstance(main_item, QgsRubberBand) and main_item in self.rubber_band_z_tracker:
+                        tracked_z_count = len(self.rubber_band_z_tracker[main_item])
+                        del self.rubber_band_z_tracker[main_item]
+                        QgsMessageLog.logMessage(
+                            f"Z-TRACKER: Rubber band removido → limpiadas {tracked_z_count} Z's", 
+                            "SWM-3D", Qgis.Info
+                        )
             
             # Añadir o actualizar items existentes
             for main_item in main_items:
@@ -161,15 +196,14 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                         self.synced_items[main_item] = synced_item
                 else:
                     # Actualizar item existente
+                    # QgsMessageLog.logMessage(f"SYNC: Actualizando item existente: {type(main_item).__name__}", "SWM-3D", Qgis.Info)
                     self._update_synced_item(main_item, self.synced_items[main_item])
                     
         except Exception as e:
             QgsMessageLog.logMessage(f"Error sincronizando map canvas items: {str(e)}", 
                                    "SWM-3D", Qgis.Warning)
         finally:
-            # Reprogramar próxima sincronización
-            if not self.sync_timer.isActive():
-                self.sync_timer.start(500)
+            self.sync_in_progress = False
 
     def _get_canvas_items(self, canvas) -> List[QgsMapCanvasItem]:
         """
@@ -234,6 +268,11 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 
             elif isinstance(main_item, QgsRubberBand) and isinstance(synced_item, QgsRubberBand):
                 self._sync_rubber_band_properties(main_item, synced_item)
+
+            else:
+                # Para otros tipos de items, podríamos implementar lógica de actualización específica
+                QgsMessageLog.logMessage(f"Unmannaged item type for synchronization: {type(main_item)}", 
+                        "SWM-3D", Qgis.Warning)    
                 
             # Actualizar visibilidad
             if hasattr(main_item, 'isVisible') and hasattr(synced_item, 'setVisible'):
@@ -299,11 +338,11 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
 
     def _sync_rubber_band_properties(self, source: QgsRubberBand, target: QgsRubberBand):
         """
-        Sincroniza las propiedades de un QgsRubberBand.
+        Sincroniza las propiedades de un QgsRubberBand con sistema de tracking Z paralelo.
+        Captura Z incremental del cursor y la almacena en "objeto gemelo".
         """
         try:
             # Copiar propiedades de estilo
-            # Usar strokeColor() en lugar de color() para QgsRubberBand
             if hasattr(source, 'strokeColor'):
                 target.setColor(source.strokeColor())
             elif hasattr(source, 'color'):
@@ -315,22 +354,166 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             if hasattr(source, 'width'):
                 target.setWidth(source.width())
             
-            # Copiar geometría con manejo inteligente de Z
+            # Copiar geometría con tracking Z paralelo
             geom = source.asGeometry()
             if geom and not geom.isEmpty():
+                # SISTEMA TRACKING Z: Detectar cambios y capturar Z del cursor
+                self._track_rubber_band_z_changes(source, geom)
+                
+                # Aplicar Z del tracker para visualización en canvas estéreo
+                geom_with_tracked_z = self._apply_tracked_z_to_geometry(geom, source)
+                
                 if self.trf_wld2prp:
-                    # Aplicar transformación 3D con Z individuales por vértice
-                    transformed_geom = self._transform_geometry_with_vertex_z(geom, source)
+                    # Aplicar transformación 3D con Z del tracker
+                    transformed_geom = self._transform_geometry_with_vertex_z(geom_with_tracked_z, source)
                     if transformed_geom:
                         target.setToGeometry(transformed_geom, None)
                     else:
-                        target.setToGeometry(geom, None)
+                        target.setToGeometry(geom_with_tracked_z, None)
                 else:
-                    target.setToGeometry(geom, None)
+                    target.setToGeometry(geom_with_tracked_z, None)
             
         except Exception as e:
             QgsMessageLog.logMessage(f"Error sincronizando rubber band: {str(e)}", 
                                    "SWM-3D", Qgis.Warning)
+
+    def _track_rubber_band_z_changes(self, rubber_band: QgsRubberBand, current_geom: QgsGeometry):
+        """
+        Sistema de tracking Z paralelo - "objeto gemelo" para captura incremental.
+        Detecta cambios en rubber band y captura Z del cursor por vértice.
+        """
+        try:
+            if not self.parent:
+                return
+                
+            # Obtener número de vértices actual
+            const_geom = current_geom.constGet()
+            if not const_geom:
+                return
+                
+            current_vertex_count = const_geom.vertexCount()
+            
+            # Obtener Z del cursor actual
+            cursor_z = getattr(self.parent, 'z_cursor', 0.0)
+            
+            # Inicializar tracker si es nuevo rubber band
+            if rubber_band not in self.rubber_band_z_tracker:
+                self.rubber_band_z_tracker[rubber_band] = []
+                QgsMessageLog.logMessage(
+                    f"Z-TRACKER: Nuevo rubber band detectado (Z cursor: {cursor_z})", 
+                    "SWM-3D", Qgis.Info
+                )
+            
+            # Obtener Z's almacenadas para este rubber band
+            tracked_z_list = self.rubber_band_z_tracker[rubber_band]
+            
+            # Si hay más vértices que Z's almacenadas → nuevos vértices añadidos
+            if current_vertex_count > len(tracked_z_list):
+                new_vertices_count = current_vertex_count - len(tracked_z_list)
+                
+                # Capturar Z actual del cursor para los nuevos vértices
+                for i in range(new_vertices_count):
+                    tracked_z_list.append(cursor_z)
+                
+                QgsMessageLog.logMessage(
+                    f"Z-TRACKER: {new_vertices_count} nuevos vértices → Z={cursor_z} "
+                    f"(total: {len(tracked_z_list)} Z's)", 
+                    "SWM-3D", Qgis.Warning
+                )
+                
+            # Si hay menos vértices → rubber band reducido (undo, etc.)
+            elif current_vertex_count < len(tracked_z_list):
+                # Recortar lista de Z's para coincidir con vértices actuales
+                tracked_z_list[:] = tracked_z_list[:current_vertex_count]
+                
+                QgsMessageLog.logMessage(
+                    f"Z-TRACKER: Rubber band reducido a {current_vertex_count} vértices "
+                    f"(Z's: {len(tracked_z_list)})", 
+                    "SWM-3D", Qgis.Info
+                )
+                
+        except Exception as e:
+            QgsMessageLog.logMessage(f"Error tracking Z changes: {str(e)}", "SWM-3D", Qgis.Warning)
+
+    def _apply_tracked_z_to_geometry(self, geom: QgsGeometry, rubber_band: QgsRubberBand) -> QgsGeometry:
+        """
+        Aplica las Z's del tracker paralelo a la geometría para visualización.
+        Usa las Z capturadas incrementalmente, no la Z cursor actual.
+        """
+        try:
+            # Si no hay Z's trackeadas para este rubber band, retornar sin cambios
+            if rubber_band not in self.rubber_band_z_tracker:
+                return geom
+                
+            tracked_z_list = self.rubber_band_z_tracker[rubber_band]
+            if not tracked_z_list:
+                return geom
+            
+            # Crear nueva geometría con Z's del tracker
+            new_geom = QgsGeometry(geom)
+            const_geom = new_geom.constGet()
+            if not const_geom:
+                return geom
+            
+            vertex_count = const_geom.vertexCount()
+            applied_count = 0
+            
+            # Aplicar Z's del tracker a cada vértice
+            for i in range(vertex_count):
+                if i < len(tracked_z_list):
+                    vertex = new_geom.vertexAt(i)
+                    tracked_z = tracked_z_list[i]
+                    
+                    if vertex.z() != tracked_z:
+                        vertex.setZ(tracked_z)
+                        new_geom.moveVertex(vertex, i)
+                        applied_count += 1
+            
+            if applied_count > 0:
+                z_summary = ", ".join([f"{z:.1f}" for z in tracked_z_list[:3]])  # Primeras 3 Z's
+                if len(tracked_z_list) > 3:
+                    z_summary += "..."
+                    
+                QgsMessageLog.logMessage(
+                    f"Z-TRACKER: ✅ Aplicadas Z's trackeadas [{z_summary}] a {applied_count} vértices", 
+                    "SWM-3D", Qgis.Info
+                )
+            
+            return new_geom
+            
+        except Exception as e:
+            QgsMessageLog.logMessage(f"Error aplicando Z's trackeadas: {str(e)}", "SWM-3D", Qgis.Warning)
+            return geom
+
+    def get_rubber_band_tracked_z(self, rubber_band: QgsRubberBand) -> List[float]:
+        """
+        Método público para obtener las Z's capturadas de un rubber band específico.
+        Útil para aplicar Z's al finalizar digitalización en capa vectorial.
+        
+        Returns:
+            List[float]: Lista de Z's capturadas por vértice, o lista vacía si no hay tracking
+        """
+        if rubber_band in self.rubber_band_z_tracker:
+            return self.rubber_band_z_tracker[rubber_band].copy()  # Retornar copia para seguridad
+        return []
+    
+    def clear_rubber_band_tracked_z(self, rubber_band: QgsRubberBand) -> bool:
+        """
+        Limpia las Z's trackeadas de un rubber band específico.
+        Útil después de aplicar las Z's a la geometría final.
+        
+        Returns:
+            bool: True si se encontró y limpió el tracker, False si no existía
+        """
+        if rubber_band in self.rubber_band_z_tracker:
+            z_count = len(self.rubber_band_z_tracker[rubber_band])
+            del self.rubber_band_z_tracker[rubber_band]
+            QgsMessageLog.logMessage(
+                f"Z-TRACKER: Limpiado manualmente tracker con {z_count} Z's", 
+                "SWM-3D", Qgis.Info
+            )
+            return True
+        return False
 
     def _transform_geometry_with_vertex_z(self, geom: QgsGeometry, source_rubber_band: QgsRubberBand) -> Optional[QgsGeometry]:
         """
@@ -341,97 +524,110 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             if not self.trf_wld2prp or not geom:
                 return geom
             
-            # Obtener o inicializar cache de Z para este rubber band
-            if source_rubber_band not in self.vertex_z_cache:
-                self.vertex_z_cache[source_rubber_band] = {}
+            # Verificar si la geometría ha cambiado para evitar procesamientos duplicados
+            current_geom_wkt = geom.asWkt()
+            if source_rubber_band in self.geometry_cache:
+                if self.geometry_cache[source_rubber_band] == current_geom_wkt:
+                    # Solo logear ocasionalmente para evitar spam
+                    # QgsMessageLog.logMessage(f"SYNC: Geometría sin cambios, omitiendo procesamiento duplicado", "SWM-3D", Qgis.Info)
+                    return geom  # No ha cambiado, usar transformación anterior
             
-            z_cache = self.vertex_z_cache[source_rubber_band]
-            current_z = self.parent.z_cursor if self.parent else 0
+            # Actualizar cache de geometría
+            self.geometry_cache[source_rubber_band] = current_geom_wkt
             
-            def get_vertex_key(point) -> str:
-                """Genera una clave única para un vértice basada en sus coordenadas XY"""
-                return f"{point.x():.6f},{point.y():.6f}"
+            QgsMessageLog.logMessage(f"SYNC: Procesando nueva geometría: {geom.type()}", "SWM-3D", Qgis.Info)
             
             # Transformar según tipo de geometría
             if geom.type() == QgsWkbTypes.PointGeometry:
-                point = geom.asPoint()
-                vertex_key = get_vertex_key(point)
-                # Si el punto está en cache, usar esa Z; si no, usar Z actual y guardarlo
-                if vertex_key in z_cache:
-                    vertex_z = z_cache[vertex_key]
-                else:
-                    vertex_z = current_z
-                    z_cache[vertex_key] = vertex_z  # Capturar Z
-                
-                pnt_wrl = QgsPoint(point.x(), point.y(), vertex_z)
-                pnt_prj = self.trf_wld2prp.execute_wrl2prp(pnt_wrl)
-                if pnt_prj:
-                    return QgsGeometry.fromPointXY(pnt_prj)
+                # Acceder a vértices preservando Z 
+                if geom.wkbType() in [QgsWkbTypes.Point, QgsWkbTypes.Point25D, QgsWkbTypes.PointZ, QgsWkbTypes.PointM, QgsWkbTypes.PointZM]:
+                    # Point simple - usar vertexAt para preservar Z
+                    vertex = geom.vertexAt(0)  # QgsPoint con X,Y,Z original
                     
-            elif geom.type() in [QgsWkbTypes.LineGeometry, QgsWkbTypes.PolygonGeometry]:
-                if geom.type() == QgsWkbTypes.LineGeometry:
-                    polyline = geom.asPolyline()
-                    
-                    # Limpiar cache de vértices que ya no existen
-                    current_keys = set(get_vertex_key(point) for point in polyline)
-                    cached_keys = set(z_cache.keys())
-                    for old_key in cached_keys - current_keys:
-                        del z_cache[old_key]
-                    
-                    # Transformar cada punto
+                    pnt_wrl = QgsPoint(vertex.x(), vertex.y(), vertex.z())
+                    pnt_prj = self.trf_wld2prp.execute_wrl2prp(pnt_wrl)
+                    if pnt_prj:
+                        return QgsGeometry.fromPointXY(pnt_prj)
+                        
+                elif geom.wkbType() in [QgsWkbTypes.MultiPoint, QgsWkbTypes.MultiPoint25D, QgsWkbTypes.MultiPointZ, QgsWkbTypes.MultiPointM, QgsWkbTypes.MultiPointZM]:
+                    # MultiPoint - acceder a vértices preservando Z
+                    const_geom = geom.constGet()
+                    if const_geom is None:
+                        return geom
+                        
                     transformed_points = []
-                    for i, point in enumerate(polyline):
-                        vertex_key = get_vertex_key(point)
+                    for i in range(const_geom.vertexCount()):
+                        vertex = geom.vertexAt(i)  # QgsPoint con X,Y,Z original
                         
-                        if vertex_key in z_cache:
-                            # Vértice ya capturado: usar Z del cache
-                            vertex_z = z_cache[vertex_key]
-                        else:
-                            # Vértice nuevo/temporal: usar Z actual del cursor
-                            # Solo guardar en cache si no es el último vértice (que puede ser temporal)
-                            vertex_z = current_z
-                            if i < len(polyline) - 1:  # No es el último vértice
-                                z_cache[vertex_key] = vertex_z
-                        
-                        pnt_wrl = QgsPoint(point.x(), point.y(), vertex_z)
+                        pnt_wrl = QgsPoint(vertex.x(), vertex.y(), vertex.z())
                         pnt_prj = self.trf_wld2prp.execute_wrl2prp(pnt_wrl)
                         if pnt_prj:
                             transformed_points.append(pnt_prj)
                         else:
-                            transformed_points.append(point)
+                            transformed_points.append(QgsPointXY(vertex.x(), vertex.y()))
+                    
+                    if transformed_points:
+                        return QgsGeometry.fromMultiPointXY(transformed_points)
+                else:
+                    # Tipo de Point no reconocido, devolver geometría original
+                    QgsMessageLog.logMessage(f"Tipo de geometría Point no reconocido: {geom.wkbType()}", 
+                                           "SWM-3D", Qgis.Warning)
+                    return geom
+                    
+            elif geom.type() in [QgsWkbTypes.LineGeometry, QgsWkbTypes.PolygonGeometry]:
+                if geom.type() == QgsWkbTypes.LineGeometry:
+                    # Acceder a vértices preservando Z
+                    const_geom = geom.constGet()
+                    if const_geom is None:
+                        return geom
+                        
+                    # Transformar cada punto manteniendo Z original
+                    transformed_points = []
+                    for i in range(const_geom.vertexCount()):
+                        vertex = geom.vertexAt(i)  # QgsPoint con X,Y,Z original
+                        
+                        # Usar Z original de la geometría (no cursor Z ni cache)
+                        pnt_wrl = QgsPoint(vertex.x(), vertex.y(), vertex.z())
+                        pnt_prj = self.trf_wld2prp.execute_wrl2prp(pnt_wrl)
+                        if pnt_prj:
+                            transformed_points.append(pnt_prj)
+                        else:
+                            transformed_points.append(QgsPointXY(vertex.x(), vertex.y()))
                     
                     if transformed_points:
                         return QgsGeometry.fromPolylineXY(transformed_points)
                         
                 elif geom.type() == QgsWkbTypes.PolygonGeometry:
-                    polygon = geom.asPolygon()
-                    if polygon:
-                        transformed_rings = []
+                    # Acceder a vértices preservando Z sin usar cache
+                    const_geom = geom.constGet()
+                    if const_geom is None:
+                        return geom
                         
-                        for ring in polygon:
-                            transformed_ring = []
-                            for i, point in enumerate(ring):
-                                vertex_key = get_vertex_key(point)
-                                
-                                if vertex_key in z_cache:
-                                    vertex_z = z_cache[vertex_key]
-                                else:
-                                    vertex_z = current_z
-                                    # Guardar en cache (los polígonos son menos propensos a tener vértices temporales)
-                                    z_cache[vertex_key] = vertex_z
-                                
-                                pnt_wrl = QgsPoint(point.x(), point.y(), vertex_z)
-                                pnt_prj = self.trf_wld2prp.execute_wrl2prp(pnt_wrl)
-                                if pnt_prj:
-                                    transformed_ring.append(pnt_prj)
-                                else:
-                                    transformed_ring.append(point)
-                            
-                            if transformed_ring:
-                                transformed_rings.append(transformed_ring)
+                    # Transformar cada punto manteniendo Z original
+                    transformed_points = []
+                    for i in range(const_geom.vertexCount()):
+                        vertex = geom.vertexAt(i)  # QgsPoint con X,Y,Z original
                         
-                        if transformed_rings:
-                            return QgsGeometry.fromPolygonXY(transformed_rings)
+                        # Usar Z original de la geometría (no cursor Z ni cache)
+                        pnt_wrl = QgsPoint(vertex.x(), vertex.y(), vertex.z())
+                        pnt_prj = self.trf_wld2prp.execute_wrl2prp(pnt_wrl)
+                        if pnt_prj:
+                            transformed_points.append(pnt_prj)
+                        else:
+                            transformed_points.append(QgsPointXY(vertex.x(), vertex.y()))
+                    
+                    # Reconstruir geometría según el tipo
+                    if transformed_points:
+                        if geom.wkbType() in [QgsWkbTypes.MultiPolygon, QgsWkbTypes.MultiPolygon25D, QgsWkbTypes.MultiPolygonZ, QgsWkbTypes.MultiPolygonM, QgsWkbTypes.MultiPolygonZM]:
+                            # Para MultiPolygon, necesitamos reconstruir la estructura de anillos
+                            # Usar la estructura original para mantener la topología
+                            return self._reconstruct_multipolygon_geometry(geom, transformed_points)
+                        else:
+                            # Para Polygon simple, reconstruir usando la estructura original
+                            return self._reconstruct_polygon_geometry(geom, transformed_points)
+                else:
+                    QgsMessageLog.logMessage(f"Unrecognized geometry type: {str(geom.type())}", 
+                                   "SWM-3D", Qgis.Warning)
             
             return geom
             
@@ -440,12 +636,83 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                                    "SWM-3D", Qgis.Warning)
             return geom
 
+    def _reconstruct_polygon_geometry(self, original_geom: QgsGeometry, transformed_points: List) -> QgsGeometry:
+        """
+        Reconstruye un polígono simple preservando la estructura de anillos.
+        """
+        try:
+            polygon = original_geom.asPolygon()
+            if not polygon:
+                return original_geom
+                
+            point_index = 0
+            transformed_rings = []
+            
+            for ring in polygon:
+                transformed_ring = []
+                for _ in range(len(ring)):
+                    if point_index < len(transformed_points):
+                        transformed_ring.append(transformed_points[point_index])
+                        point_index += 1
+                
+                if transformed_ring:
+                    transformed_rings.append(transformed_ring)
+            
+            if transformed_rings:
+                return QgsGeometry.fromPolygonXY(transformed_rings)
+                
+        except Exception as e:
+            QgsMessageLog.logMessage(f"Error reconstruyendo polígono: {str(e)}", "SWM-3D", Qgis.Warning)
+            
+        return original_geom
+
+    def _reconstruct_multipolygon_geometry(self, original_geom: QgsGeometry, transformed_points: List) -> QgsGeometry:
+        """
+        Reconstruye un multipolígono preservando la estructura de polígonos y anillos.
+        """
+        try:
+            multipolygon = original_geom.asMultiPolygon()
+            if not multipolygon:
+                return original_geom
+                
+            point_index = 0
+            transformed_polygons = []
+            
+            for polygon in multipolygon:
+                transformed_rings = []
+                
+                for ring in polygon:
+                    transformed_ring = []
+                    for _ in range(len(ring)):
+                        if point_index < len(transformed_points):
+                            transformed_ring.append(transformed_points[point_index])
+                            point_index += 1
+                    
+                    if transformed_ring:
+                        transformed_rings.append(transformed_ring)
+                
+                if transformed_rings:
+                    transformed_polygons.append(transformed_rings)
+            
+            if transformed_polygons:
+                return QgsGeometry.fromMultiPolygonXY(transformed_polygons)
+                
+        except Exception as e:
+            QgsMessageLog.logMessage(f"Error reconstruyendo multipolígono: {str(e)}", "SWM-3D", Qgis.Warning)
+            
+        return original_geom
+
     def force_sync_canvas_items(self):
         """
         Fuerza una sincronización inmediata de todos los map canvas items.
         Método público para ser llamado desde el exterior cuando sea necesario.
         """
-        self.sync_timer.stop()
+        # Evitar múltiples llamadas rápidas desde sync_layers
+        if self.sync_in_progress:
+            QgsMessageLog.logMessage(f"SYNC: Omitiendo fuerza sync (en progreso) - Canvas {'LEFT' if self.is_left else 'RIGHT'}", "SWM-3D", Qgis.Info)
+            return
+            
+        QgsMessageLog.logMessage(f"SYNC: Forzando sincronización inmediata - Canvas {'LEFT' if self.is_left else 'RIGHT'}", "SWM-3D", Qgis.Warning)
         self._sync_canvas_items()
 
     def set_canvas_items_sync_enabled(self, enabled: bool):
@@ -453,17 +720,37 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         Habilita o deshabilita la sincronización automática de map canvas items.
         """
         if enabled:
-            if not self.sync_timer.isActive():
-                self.sync_timer.start(500)
+            # Reconectar señales si es necesario
+            self._setup_canvas_items_sync()
         else:
-            self.sync_timer.stop()
+            # Desconectar señales para deshabilitar la sincronización
+            try:
+                if hasattr(self.qgis_main_canvas, 'mapCanvasRefreshed'):
+                    self.qgis_main_canvas.mapCanvasRefreshed.disconnect(self._sync_canvas_items)
+                
+                if hasattr(self.qgis_main_canvas, 'scene') and self.qgis_main_canvas.scene():
+                    scene = self.qgis_main_canvas.scene()
+                    if hasattr(scene, 'changed'):
+                        scene.changed.disconnect(self._on_scene_changed)
+            except RuntimeError:
+                pass  # Las señales pueden no estar conectadas
 
     def cleanup_canvas_items_sync(self):
         """
         Limpia todos los recursos relacionados con la sincronización de canvas items.
         Debe ser llamado al cerrar o destruir el canvas.
         """
-        self.sync_timer.stop()
+        # Desconectar señales
+        try:
+            if hasattr(self.qgis_main_canvas, 'mapCanvasRefreshed'):
+                self.qgis_main_canvas.mapCanvasRefreshed.disconnect(self._sync_canvas_items)
+            
+            if hasattr(self.qgis_main_canvas, 'scene') and self.qgis_main_canvas.scene():
+                scene = self.qgis_main_canvas.scene()
+                if hasattr(scene, 'changed'):
+                    scene.changed.disconnect(self._on_scene_changed)
+        except RuntimeError:
+            pass  # Las señales pueden no estar conectadas
         
         # Limpiar todos los items sincronizados
         for synced_item in self.synced_items.values():
@@ -475,7 +762,18 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 pass  # Ignorar errores durante la limpieza
         
         self.synced_items.clear()
-        self.vertex_z_cache.clear()
+        self.geometry_cache.clear()
+        
+        # Limpiar sistema de tracking Z paralelo
+        tracked_rubber_bands_count = len(self.rubber_band_z_tracker)
+        self.rubber_band_z_tracker.clear()
+        if tracked_rubber_bands_count > 0:
+            QgsMessageLog.logMessage(
+                f"Z-TRACKER: Limpiados {tracked_rubber_bands_count} rubber band trackers", 
+                "SWM-3D", Qgis.Info
+            )
+        
+        self.sync_in_progress = False
 
     def _safe_remove_item(self, item):
         """
@@ -549,17 +847,8 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             painter.setPen(QColor(255, 255, 255))
             painter.drawText(int(self.width()/2 - painter.fontMetrics().horizontalAdvance(self.z_text)/2), int(self.height() * 3 / 4), self.z_text)
             painter.end()
-            
 
-    def force_repaint(self):
-        """
-        Force a lightweight repaint of the viewport.
-        Used only for visual filters (stereo, anaglyph, interlaced),
-        without triggering a full map refresh.
-        """
-        if self.filter != self.FILTER_NONE:
-            self.viewport().update()
-    
+
     def update_z_text(self, z_value):
         """Actualiza el texto Z mostrado en el canvas"""
         self.z_text = f"Z={z_value:.1f}"
@@ -570,10 +859,6 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         if self.filter == self.FILTER_NONE:
             return image
 
-        # Convert to ARGB32 (ensures alpha channel even if the source is RGB32)
-        # image = image.convertToFormat(QImage.Format_ARGB32)
-        result = QImage(image.size(), QImage.Format_ARGB32)
-        
         # Direct access to bits (fast)
         ptr = image.bits()
         ptr.setsize(image.byteCount())
@@ -597,12 +882,6 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         result = QImage(arr.data, image.width(), image.height(), image.bytesPerLine(), QImage.Format_ARGB32)
         return result.copy()  # Important: .copy() to avoid memory issues 
     
-    def refresh_finnished(self):
-        # Draws a rectangle corresponding to the main canvas extent in this canvas
-        # TODO: Fails. Rubber band?
-        if self.parent and not self.parent.isVisible():
-            return
-
     def render_complete(self):
         # Draws a rectangle corresponding to the main canvas extent in this canvas
         # TODO: Fails. Rubber band?
@@ -690,8 +969,8 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                     layer_copy.setMaximumScale(layer_main.maximumScale())
                 self.layers_z.append(layer_copy)
                 layers_self.append(layer_copy) 
-                QgsMessageLog.logMessage(f"SYNC_LAYER Capa: {layer_main.name()}-{'LEFT' if self.is_left else 'RIGHT'}.", 
-                                         "SWM-3D", Qgis.Info)
+                # QgsMessageLog.logMessage(f"SYNC_LAYER Capa: {layer_main.name()}-{'LEFT' if self.is_left else 'RIGHT'}.", 
+                #                          "SWM-3D", Qgis.Info)
             else:
                 # ¿Qué hacemos con otra capa que no es SWM ni tiene Z?
                 layers_self.append(layer_main)
@@ -738,6 +1017,6 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                     continue
                 symbol_layer.setGeometryExpression(expression)
 
-                QgsMessageLog.logMessage(f"UPDATE_SWM_HEADER Capa: {layer.name()}-{'LEFT' if self.is_left else 'RIGHT'}.", 
-                                         "SWM-3D", Qgis.Info)   
+                # QgsMessageLog.logMessage(f"UPDATE_SWM_HEADER Capa: {layer.name()}-{'LEFT' if self.is_left else 'RIGHT'}.", 
+                #                          "SWM-3D", Qgis.Info)   
         self.render_complete()

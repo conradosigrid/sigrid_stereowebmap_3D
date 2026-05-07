@@ -39,7 +39,7 @@ handled elsewhere in the plugin.
 
 """
 import math
-from qgis.core import QgsGeometry, QgsPointXY, QgsWkbTypes, QgsVertexId
+from qgis.core import QgsGeometry, QgsPointXY, QgsWkbTypes
 from qgis.utils import qgsfunction
 
 from qgis.core import QgsMessageLog, Qgis  # para mensajes de depuración.
@@ -162,8 +162,7 @@ def perspective_swm_transform(geometry, side, txt_trf_wrl2pht, txt_trf_pht2prp):
         return geometry
 
     gtype = QgsWkbTypes.geometryType(geometry.wkbType())
-    is_multi = QgsWkbTypes.isMultiType(geometry.wkbType())
- 
+
     # -------------------------------
     # Punto, o Multipunto
     # Será del tipo que sea, pero aquí siempre entran los puntos de la capa uno a uno.

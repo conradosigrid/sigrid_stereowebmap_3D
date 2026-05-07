@@ -14,7 +14,6 @@ import re
 from qgis.core import QgsMapLayer, QgsWkbTypes
 
 
-
 # Function to extract metadata using regular expressions
 def extract_metadata(html, tag):
     if not html:

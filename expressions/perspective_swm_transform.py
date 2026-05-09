@@ -23,7 +23,7 @@ In the current design, those functions have been:
   `@qgsfunction` decorator
 
 This makes the plugin fully self-contained and removes any dependency on
-external user profile files. Todo está dentro del directorio plugins/SWM_3D
+external user profile files. Everything is inside plugins/SWM_3D
 
 Design notes
 ------------
@@ -42,17 +42,17 @@ import math
 from qgis.core import QgsGeometry, QgsPointXY, QgsWkbTypes
 from qgis.utils import qgsfunction
 
-from qgis.core import QgsMessageLog, Qgis  # para mensajes de depuración.
+from qgis.core import QgsMessageLog, Qgis  # for debug messages.
 
 # ------------------------------------------------------------------
-# Cache de parseo (clave = texto del header) (para no parsear siempre)
+# Parsing cache (key = header text) to avoid reparsing each time
 # ------------------------------------------------------------------
 _PERSPECTIVE_CACHE = {}
 _PROJECTIVE_CACHE = {}
 
 
 # ------------------------------------------------------------------
-# Helpers de módulo
+# Module helpers
 # ------------------------------------------------------------------
 def read_perspective(txt):
     cached = _PERSPECTIVE_CACHE.get(txt)
@@ -96,7 +96,7 @@ def read_projective(txt):
 
 
 # ------------------------------------------------------------------
-# Transformaciones elementales
+# Elementary transformations
 # ------------------------------------------------------------------
 
 def world_to_photo(x, y, z, x0, y0, z0, df, r):
@@ -137,16 +137,16 @@ def perspective_swm_transform(geometry, side, txt_trf_wrl2pht, txt_trf_pht2prp):
     Later point is projected to projection plain.
 
     :param geometry: QgsGeometry to transform.
-    :param side: str 'left' o 'right'
+    :param side: str 'left' or 'right'
     :param txt_trf_wrl2pht: Response header value of a SWM service with world to photo perspective transform.
     :param txt_trf_pht2prp: Response header value of a SWM service with photo to projection plain projective transform .
     :return: Transformed QgsGeometry.
 
-    OJO:
-    Mucho cuidado en estas funciones relacionadas con EXPRESSIONS con los errores, 
-    porque se crean Exceptions silenciosas que el motor de expresiones 
-    de QGIS captura internamente y que no se muestran al usuario, pero que hacen que la función termine abruptamente 
-    y devuelva NULL sin ningún mensaje 
+    NOTE:
+    Be very careful with errors in functions used by QGIS EXPRESSIONS,
+    because silent exceptions can be raised and captured internally by
+    the QGIS expression engine. They are not shown to the user, but can
+    abruptly terminate the function and return NULL with no message.
     """
     
     if geometry is None or geometry.isEmpty():
@@ -164,15 +164,15 @@ def perspective_swm_transform(geometry, side, txt_trf_wrl2pht, txt_trf_pht2prp):
     gtype = QgsWkbTypes.geometryType(geometry.wkbType())
 
     # -------------------------------
-    # Punto, o Multipunto
-    # Será del tipo que sea, pero aquí siempre entran los puntos de la capa uno a uno.
+    # Point or multipoint
+    # Regardless of original type, layer points arrive here one by one.
     # -------------------------------
     if gtype == QgsWkbTypes.PointGeometry:
-        # p = geometry.asPoint()  # Con Causa excepciones silenciosas capturadas internamente por el c++
+        # p = geometry.asPoint()  # Causes silent exceptions captured internally by C++
         it = geometry.vertices()
         p = next(it, None)
         if p is None:
-            QgsMessageLog.logMessage("[DEBUG] perspective_swm_transform: POINTZ inválido", "SWM-3D", Qgis.Warning)
+            QgsMessageLog.logMessage("[DEBUG] perspective_swm_transform: invalid POINTZ", "SWM-3D", Qgis.Warning)
             return geometry
 
         z = p.z()
@@ -180,7 +180,7 @@ def perspective_swm_transform(geometry, side, txt_trf_wrl2pht, txt_trf_pht2prp):
             if p.isMeasure() and math.isfinite(p.m()):
                 z = p.m() 
             else:
-                QgsMessageLog.logMessage("[DEBUG] perspective_swm_transform: POINTZ sin Z", "SWM-3D", Qgis.Warning)
+                QgsMessageLog.logMessage("[DEBUG] perspective_swm_transform: POINTZ without Z", "SWM-3D", Qgis.Warning)
                 return geometry
 
         res = world_to_photo(p.x(), p.y(), z, x0, y0, z0, df, r)
@@ -195,8 +195,8 @@ def perspective_swm_transform(geometry, side, txt_trf_wrl2pht, txt_trf_pht2prp):
 
     # --------------------------------------------------
     # LineString MultiLineString, ... LineZ, LineM, LineZM, MultiLineZ, MultiLineM, MultiLineZM
-    # El WkbType será cualquiera de los anteriores, pero las límeas de la capa entran a esta función una a una.
-    # Es decir, se llama una vez por línea.
+    # WkbType can be any of the previous ones, but line features are processed one by one.
+    # In other words, this is called once per line.
     # --------------------------------------------------
     elif gtype == QgsWkbTypes.LineGeometry:
         new_line = []
@@ -223,12 +223,12 @@ def perspective_swm_transform(geometry, side, txt_trf_wrl2pht, txt_trf_pht2prp):
         
     # --------------------------------------------------
     # Polygon, Multipolygo PolygonZ, PolygonM, PolygonZM, MultiPolygon, MultiPolygonZ, MultiPolygonZM
-    # El WkbType será cualquiera de los anteriores, pero las polígonos de la capa entran a esta función uno a uno.
+    # WkbType can be any of the previous ones, but polygon features are processed one by one.
     # --------------------------------------------------
     elif gtype == QgsWkbTypes.PolygonGeometry:
         ring = []
 
-        # Recorremos TODOS los vértices del polígonode forma segura
+        # Iterate all polygon vertices safely
         for p in geometry.vertices():
             z = p.z()
             if not math.isfinite(z):
@@ -244,7 +244,7 @@ def perspective_swm_transform(geometry, side, txt_trf_wrl2pht, txt_trf_pht2prp):
 
             ring.append(QgsPointXY(res[0], res[1]))
 
-        # Cerrar último anillo
+        # Close last ring
         if len(ring) < 3:
             return geometry
         
@@ -257,6 +257,6 @@ def perspective_swm_transform(geometry, side, txt_trf_wrl2pht, txt_trf_pht2prp):
         return QgsGeometry.fromPolygonXY([ring])
 
     else:
-        # Geometrías no soportadas
+        # Unsupported geometries
         QgsMessageLog.logMessage(f"[DEBUG] expression: Unsupported geometry type: {gtype}", "SWM-3D", Qgis.Info)
         return geometry

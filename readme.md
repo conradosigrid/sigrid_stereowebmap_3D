@@ -1,154 +1,197 @@
-***
-# SWM-3D – Plugin QGIS - Nueva versión 1.0
+﻿***
+# SIGRID_SWM_3D - QGIS Plugin - Version 0.5.1
 
-## 1. Estado actual
+![Version](https://img.shields.io/badge/version-0.5.1-blue)
+![QGIS](https://img.shields.io/badge/QGIS-4.x-green)
+![OS](https://img.shields.io/badge/OS-Windows-0078D6)
 
 
-La presente versión del plugin **SWM-3D** se instala sobre **QGIS 4** y permite conectarse al nuevo servicio WMS dado de alta en un servidor interno de TRAGSATEC.  
+**Status:** Active development  
+**Scope:** Stereoscopic visualization of SWM photogrammetric flight WMS services in QGIS 4.x  
+**Documentation language:** English ([readme.md](readme.md))
 
-El plugin procesa el par estereoscópico enviado por el servicio WMS y lo muestra en una **ventana secundaria** dependiente de la ventana principal de QGIS.
+## Table of Contents
 
-El movimiento de zoom se realiza siempre sobre la ventana principal de QGIS y se refleja automáticamente en la secundaria de manera estereoscópica.  
-La **rueda del ratón + tecla ALT**, actuando sobre la ventana principal, permite modificar la **Z del cursor**, que se refleja dinámicamente en la visualización estereoscópica.
+1. [Description](#1-description)
+2. [Requirements](#2-requirements)
+3. [Installation and/or updating](#3-installation-andor-updating)
+4. [Quick Start](#4-quick-start)
+5. [Changes](#5-changes)
+6. [Troubleshooting](#6-troubleshooting)
+7. [Known Issues](#7-known-issues)
+8. [Future work](#8-future-work)
+9. [Compatibility Matrix](#9-compatibility-matrix)
+10. [Visual Walkthrough](#10-visual-walkthrough)
+
+## 1. Description
+
+**SIGRID_SWM_3D** is a QGIS plugin for visualizing **StereowebMap® photogrammetric flight WMS** content in stereoscopic mode.
+
+The plugin renders the stereoscopic pair in a secondary window synchronized with the main QGIS canvas. All navigation and tools are controlled from the main window and reflected in the stereo view in real time.
+
+Use **ALT + mouse wheel** in the main window to adjust the **cursor Z** value, which is immediately reflected in the stereoscopic visualization. Each mouse-wheel step moves the cursor up or down by 1 meter. To move the cursor by 10 meters, press and hold **ALT + SHIFT + mouse wheel**. To move the cursor by 0.1 meters, press and hold **ALT + CTRL + mouse wheel**.
 
 
 ---
 
-## 2. Instalación
+## 2. Requirements
 
-### 2.1 Requisitos
+### 2.1 Mandatory
+- **QGIS 4.x** (based on Qt 6).  
+- **Windows** operating system.
+- **Two or more monitors**.
 
-- **QGIS 4.x** (basado en Qt 6). 
-  El desarrollo actual se ha efectuado con Windows Offline (Standalone) installer para 4.0.1 Norrköping, porque la instalación desde OSGEO4W más reciente no deja una versión DEV del QGIS4 que se pueda ejecutar automáticamente. Se explica en más detalle en el archivo `documentos/20260420 Instalación de QGIS4 y SWM-3D.docx`
-
-```
-https://www.qgis.org/resources/installation-guide/
-```
-
-Posiblemente esto cambiará en breve y la instalación desde OSGE4W volvería a ser la más recomendable:
-
-```
-https://trac.osgeo.org/osgeo4w/
-```
-
-- Sistema operativo **Windows**  
-- Perfil de QGIS activo (por ejemplo `QGIS_4_DEV`)
-- Acceso al servicio WMS fotogramétrico SWM desde:
-
-```
-https://fenix3d-des.tragsatec.es:8083/  -> pruebas
-https://fenix3d-des.tragsatec.es:8084/  -> desarrollo
-```
-
----
-
-### 2.2 Instalación manual del plugin (modo desarrollo)
-
-Actualmente el plugin se distribuye como **código fuente**, por lo que la instalación se realiza copiando el directorio del plugin al perfil de usuario de QGIS.
-
-1. Localizar el directorio de plugins del perfil de QGIS.  
-   Por defecto en Windows:
-   
-```
-C:\Users\USUARIO\AppData\Roaming\QGIS\QGIS4\profiles\QGIS_4_DEV\python\plugins
-```
-
-2. Copiar el directorio completo del plugin en dicha ruta, de forma que quede:
+### 2.2 Recommended
+- One of the monitors should support stereoscopic display.
+- Access to the SWM photogrammetric WMS service. Currently available endpoints:
+  - https://fenix3d-des.tragsatec.es:8083/ (testing)
+  - https://fenix3d-des.tragsatec.es:8084/ (development)
+- If you are working on an intranet, change https:// to http://.
 
 
-```
-C:\Users\USUARIO\AppData\Roaming\QGIS\QGIS4\profiles\QGIS_4_DEV\python\plugins\SWM_3D
-```
+## 3. Installation and/or updating
+- Menu path: Plugins -> Manage and Install Plugins -> Install from ZIP -> ZIP file.
+- Use the ZIP package of the latest plugin version: *sigrid_stereowebmap_3D_x_x_x.zip*.
 
-3. Verificar que el directorio `SWM_3D` contiene al menos los siguientes ficheros y carpetas:
+## 4. Quick Start
 
-```
-SWM_3D/
-├── init.py
-├── plugin.py
-├── window.py
-├── canvas.py
-├── transform.py
-├── utils.py
-├── debug.py
-├── metadata.txt
-└── expressions/
-    └── perspective_swm_transform.py
-```
+1. Install the plugin from ZIP in QGIS.
+2. Open a project with access to a StereowebMap photogrammetric flight WMS endpoint.
+3. Load the required layers into the main window. One of them must be a **StereowebMap® photogrammetric flight WMS** service. Example: https://fenix3d-des.tragsatec.es:8083/
+4. Launch the plugin and open the stereo window on a second monitor.
+4.1 If you have more than two monitors, it will ask you which one to open the photogrammetry window on. 
+4.2 If you only have two, it will open it directly on the monitor where QGIS is not open.
+5. Select stereo mode
+5.1
+5.2
 
----
+5. Navigate in the main QGIS canvas (pan, zoom, tools).
+6. Adjust cursor depth with **ALT + mouse wheel**.
 
-### 2.3 Activación en QGIS
+Expected behavior:
+- Main canvas and stereo window remain synchronized.
+- Depth adjustments are shown dynamically in the stereo view.
 
-1. Iniciar **QGIS 4**.
-2. Ir a:
 
-Complementos → Administrar e instalar complementos
+## 5. Changes
 
-3. En la pestaña **Instalados**, localizar **SWM-3D**.
-4. Activar el complemento.
+### Version 0.5.1
+- Prevent the cursor from entering the photogrammetric window.
+- Translate all code comments into English.
+- Improve this README document.
 
-Si la instalación es correcta:
-- El plugin aparecerá en el menú de complementos.
-- Al activarlo se abrirá la ventana secundaria estereoscópica.
+### Version 0.5.0
+- Reorganization of existing classes into a file structure that better reflects the script architecture, with clearer separation of components and responsibilities.  
+  Guiding principles:
+  - Consistency
+  - Robustness
+  - Scalability
+  - *QGIS-native* approach
+  - Long-term maintainability
+
+- Code adapted to **Qt 6**, the new standard in **QGIS 4**.  
+  Although this is not the current LTR release, **SWM-3D** development targets this version,
+  which is expected to become LTR in the future. The improvements introduced in the Qt 6
+  libraries justify this decision.
+
+- Introduction of additional error handling to prevent unexpected *crashes* and  
+  ensure that failures are reported explicitly and in a controlled manner.
 
 ---
 
-### 2.4 Observaciones importantes
+## 6. Troubleshooting
 
-- El plugin **no debe copiarse** en el directorio global de instalación de QGIS, sino **únicamente en el perfil de usuario**.
+### Plugin does not appear in QGIS
+- Verify you are using **QGIS 4.x**.
+- Reinstall from the latest plugin ZIP package.
+- Check that plugin installation is enabled in QGIS Plugin Manager.
 
-```C:\Users\fherl\AppData\Roaming\QGIS\QGIS4\profiles\QGIS_4_DEV\python\plugins\SWM_3D```
-  
-- Tras actualizar el código:
-- Desactivar y volver a activar el plugin, **o**
-- Usar la opción “Recargar complemento” para que QGIS lea los cambios.
-- En caso de error durante la carga, revisar el panel:
+### Stereo window does not update
+- Confirm all interaction is performed in the main QGIS window.
+- Ensure the secondary monitor is active and visible to the OS.
+- Check that the selected WMS service is reachable.
 
-```
-Ver → Paneles → Registro de mensajes
-```
+### No stereoscopic effect is visible
+- Verify your display hardware supports stereoscopic output.
+- Confirm your monitor or display pipeline is configured for stereo mode.
 
-especialmente la pestaña **SWM-3D**.
-
----
-
-## 3. Cambios
-
-Los principales cambios de esta versión son los siguientes:
-
-* Organización de las clases ya existentes en un sistema de ficheros que recoge mejor la arquitectura del script, donde se separan más claramente componentes y responsabilidades.  
-  La filosofía seguida se basa en:
-  * Coherencia
-  * Robustez
-  * Escalabilidad
-  * Enfoque *QGIS-native*
-  * Mantenimiento a largo plazo
-
-  La explicación detallada de la nueva arquitectura y de los roles de cada clase y componente  
-  se recoge en el archivo `./documentos/ARCHITECTURE.md`.
-
-* Código adaptado a **Qt 6**, el nuevo estándar en **QGIS 4**.  
-  Aunque no sea la versión LTR actual, el desarrollo de **SWM-3D** se orienta a esta versión,  
-  que previsiblemente será LTR en el futuro. Las mejoras introducidas en las librerías Qt 6  
-  justifican esta decisión.
-
-* Introducción de control de errores adicional para evitar *crashes* inesperados y  
-  garantizar que los fallos se reporten de forma explícita y controlada.
+### Cursor Z changes are not reflected
+- Use **ALT + mouse wheel** over the main canvas.
+- Ensure the stereo window is open and synchronized.
 
 ---
 
-## 4. Líneas futuras
+## 7. Known Issues
 
-Los desarrollos más inmediatos a partir de esta versión básica son:
+### Overlay Stereo Modes Not Working
+- Currently, stereo modes based on overlaying the two images (left and right) with transparency are not working: anaglyph and interlaced stereo.
 
-*   Comprobar si los bugs detectados por Conrado y por Andrea/Ada en versiones anteriores se mantienen en esta versión y arquitectura. Corregir si procede.
-*   Testear y afinar la representación estereoscópica sobre distintos hardwares, especialmente la doble pantalla con espejo a 45º
-*   Incorporar visualizaciones con sistemas de **anaglifo** y líneas horizontales **interlazadas**
-*   Empezar a incluir herramientas de delineación trabajando directamente sobre las vistas estereoscópicas
+### Vector Layer Overlay with Z
+- This functionality has not yet been fully implemented and debugged.
+- PointZ and MultiPointZ entities are causing problems.
+- For linear and polygonal entities, it sometimes fails when the first model is loaded. After that, it seems to work correctly.
+
+### Duplication of map canvas items from the main canvas to stereoscopic canvases
+- This duplication is experiencing problems.
+- Sometimes excessive delay is observed.
+- In map canvas items with a Z value per vertex, items are often not replicated and captured correctly.
+
+### Stereoscopy is less clear for flights that are not east-west passes
+- Because the images are rotated, stereoscopy is not clearly visible in these cases.
+- The ability to rotate images horizontally must be implemented to overcome this limitation.
+
+---
+
+## 8. Future work
+
+The most immediate developments from this baseline version are:
+
+- Check whether bugs previously detected by Conrado and Andrea/Ada in earlier versions persist in this version and architecture. Fix as needed.
+- Test and refine the stereoscopic rendering on different hardware setups, especially the dual-screen with a 45-degree mirror.
+- Add visualization support for **anaglyph** and **interlaced horizontal lines** systems.
+- Begin incorporating delineation tools that work directly on the stereoscopic views.
+
+---
+
+## 9. Compatibility Matrix
+
+| Component | Supported | Notes |
+|---|---|---|
+| QGIS | 4.x | Based on Qt 6 |
+| Operating system | Windows | Primary target platform |
+| Monitor setup | 2+ monitors | One monitor can be stereo-capable |
+| Stereo hardware | Recommended | Required for full stereoscopic experience |
+| SWM WMS endpoints | Required | Testing and development endpoints listed above |
+
+---
+
+## 10. Visual Walkthrough
+
+Add screenshots or GIFs in this section to help users understand setup and operation.
+
+> Note: The current image and GIF files are temporary placeholders and should be replaced with real captures from the plugin workflow.
+
+Suggested assets:
+- Main QGIS canvas with plugin enabled.
+- Stereo window on second monitor.
+- ALT + mouse wheel depth adjustment demo.
+- Side-by-side synchronization example during pan/zoom.
+
+Template:
+
+### 10.1 Main Window
+![Main QGIS window with SWM-3D enabled](docs/images/main-window.png)
+
+### 10.2 Stereo Window
+![Stereo window on secondary monitor](docs/images/stereo-window.png)
+
+### 10.3 Depth Adjustment (GIF)
+![Cursor Z adjustment using ALT + mouse wheel](docs/images/depth-adjustment.gif)
+
+### 10.4 Canvas Synchronization (GIF)
+![Main canvas and stereo window synchronized](docs/images/canvas-sync.gif)
 
 
 ***
 
 **End of readme.md**
-

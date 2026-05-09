@@ -17,26 +17,28 @@ mathematical transformations. It only manages the plugin lifecycle
 and delegates all functionality to the window, canvas, and expression
 modules.
 
-Arquitectura de los modulos incluidos en este plugin:
+Architecture of the modules included in this plugin:
 
 sigrid_swm/
 ├── __init__.py        # classFactory
-├── plugin.py          # DEBUG + ciclo de vida
-├── window.py          # orquestación
-├── canvas.py          # render
-├                      # incluye control Z
-├── transform.py       # modelo matemático
+├── plugin.py          # DEBUG + lifecycle
+├── window.py          # orchestration
+├── canvas.py          # rendering
+├                      # includes Z control
+├── transform.py       # mathematical model
 ├── utils.py           # extract_metadata, is_*_layer
 └── expressions/
     ├── __init__.py
     └── perspective_swm_transform.py
 """
 from qgis.PyQt.QtWidgets import QAction
-# librerías SWM
+# SWM libraries
 from .window import QSgdSwmWindow
-from .debug import attach_debugger
-
-attach_debugger()
+try:
+    from .debug import attach_debugger
+    attach_debugger()
+except ImportError:
+    pass
 
 class SgdSwmPlugin:
 
@@ -47,7 +49,7 @@ class SgdSwmPlugin:
         self._debug_waited = False
 
     def initGui(self):
-        # Registro automático de expresiones
+        # Automatic registration of expressions
         self._register_expressions()
         # Create the action for the plugin
         self.action = QAction("Open SWM-3D", self.iface.mainWindow())
@@ -57,14 +59,14 @@ class SgdSwmPlugin:
         self.iface.addToolBarIcon(self.action)
 
     def _register_expressions(self):
-        # Basta con importar el módulo = registrar (@qgsfunction)
+        # Importing the module is enough to register functions (@qgsfunction)
         from .expressions import perspective_swm_transform
 
     def run(self):
         if self.window is None:
             self.window = QSgdSwmWindow(self.iface)
             if self.window.init_error:
-                # pluging no debe dar diálogos. La interacción se hace en window.py
+                # The plugin should not show dialogs. User interaction is handled in window.py
                 # QMessageBox.critical(self.iface.mainWindow(), "Error", self.window.init_error)
                 # Log for developers / advanced users
                 from qgis.core import QgsMessageLog, Qgis

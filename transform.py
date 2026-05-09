@@ -15,11 +15,11 @@ handled separately by QGIS expression functions.
 This module does not handle rendering, network communication, or
 geometry iteration.
 
-Es "la representación Python del modelo fotogramétrico activo"
+It is "the Python representation of the active photogrammetric model"
 
 """
 from qgis.core import QgsPointXY, QgsPoint
-from qgis.core import QgsMessageLog, Qgis  # para mensajes de depuración.
+from qgis.core import QgsMessageLog, Qgis  # for debug messages.
 
 
 # Class to transform coordinate world to projection plane
@@ -97,7 +97,7 @@ class TrfWldToPrjPln:
         self.txt_perspective = txt
         fields = txt.split(';')
         if len(fields) < 6:
-            QgsMessageLog.logMessage(f"[DEBUG] <read_perspective> fields ({fields}). Tamaño incorrecto (<6)",
+            QgsMessageLog.logMessage(f"[DEBUG] <read_perspective> fields ({fields}). Invalid size (<6)",
                                      "SWM_3D", Qgis.Info)
             return
         self.x0 = float(fields[2])
@@ -119,7 +119,7 @@ class TrfWldToPrjPln:
         fields = txt.split(';')
 
         if len(fields) < 10:
-            QgsMessageLog.logMessage(f"[DEBUG] <read_projective> fields ({fields}). Tamaño incorrecto (<10)",
+            QgsMessageLog.logMessage(f"[DEBUG] <read_projective> fields ({fields}). Invalid size (<10)",
                                      "SWM_3D", Qgis.Info)
             return
         self.a[0] = float(fields[2])

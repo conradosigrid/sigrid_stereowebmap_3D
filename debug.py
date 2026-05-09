@@ -1,15 +1,15 @@
 """
-Este módulo se encarga de configurar y activar el modo debug para el desarrollo local.
-Como la librería debugpy no es un requisito para el funcionamiento normal del plugin, se maneja de forma opcional y segura, 
-sin afectar a los usuarios finales aunque no tengan instalado debugpy.
+This module configures and enables debug mode for local development.
+Because debugpy is not required for normal plugin usage, it is handled
+optionally and safely, without affecting end users who do not have it installed.
 """
-DEBUG = True  
-# se podría leer de una variable de entorno, pero esto es más directo para el desarrollo local
+DEBUG = False  
+# This could be read from an environment variable, but this is simpler for local development
 # import os
 # DEBUG = os.environ.get("SWM3D_DEBUG", "0") == "1"
-# y lanzando QGIS con
-# set SWM3D_DEBUG=1  # con debug
-# set SWM3D_DEBUG=0  # sin debug
+# and launching QGIS with
+# set SWM3D_DEBUG=1  # with debug
+# set SWM3D_DEBUG=0  # without debug
 
 
 def attach_debugger():
@@ -29,5 +29,5 @@ def attach_debugger():
             print("[SWM-3D] Debugger already attached")
 
     except Exception as e:
-        # NUNCA rompas la carga del plugin
+        # NEVER break plugin loading
         print(f"[SWM-3D] Debug skipped: {e}")

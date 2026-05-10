@@ -168,7 +168,7 @@ The most immediate developments from this baseline version are:
 ## 10. Visual Walkthrough
 
 ### Configure StereoWebMap Service Connection
-![Configure StereoWebMap Service Connection](010-configure-stereoWebMap-service-connection.png)
+![Configure StereoWebMap Service Connection](docs/images/010-configure-stereoWebMap-service-connection.png)
 
 ### Add WMS StereoWebMap Layer
 ![Add WMS StereoWebMap Layer](docs/images/020-add-wms-stereowebmap-layer.png)

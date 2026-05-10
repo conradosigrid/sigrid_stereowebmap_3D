@@ -5,16 +5,17 @@ set "REPO_DIR=%~dp0"
 pushd "%REPO_DIR%"
 
 set "GIT_EXE="
-for /f "delims=" %%I in ('where git.exe 2^>nul') do (
-    if not defined GIT_EXE set "GIT_EXE=%%I"
-)
 
-if not defined GIT_EXE (
-    if exist "%ProgramFiles%\Git\bin\git.exe" set "GIT_EXE=%ProgramFiles%\Git\bin\git.exe"
-)
+if exist "%ProgramFiles%\Git\bin\git.exe" set "GIT_EXE=%ProgramFiles%\Git\bin\git.exe"
 
 if not defined GIT_EXE (
     if exist "%ProgramFiles(x86)%\Git\bin\git.exe" set "GIT_EXE=%ProgramFiles(x86)%\Git\bin\git.exe"
+)
+
+if not defined GIT_EXE (
+    for /f "delims=" %%I in ('where git.exe 2^>nul') do (
+        if not defined GIT_EXE set "GIT_EXE=%%I"
+    )
 )
 
 if not defined GIT_EXE (
@@ -32,10 +33,22 @@ if "%~1"=="" (
     set "COMMIT_MSG=%*"
 )
 
-"%GIT_EXE%" add -A
-"%GIT_EXE%" diff --cached --quiet
-if not errorlevel 1 (
-    echo No staged changes to commit.
+"%GIT_EXE%" add --all .
+if errorlevel 1 (
+    echo Git add failed.
+    popd
+    exit /b 1
+)
+
+set "HAS_STAGED="
+for /f "delims=" %%S in ('"%GIT_EXE%" status --porcelain') do (
+    set "LINE=%%S"
+    if not "!LINE:~0,1!"==" " if not "!LINE:~0,1!"=="?" set "HAS_STAGED=1"
+)
+
+if not defined HAS_STAGED (
+    echo No staged changes to commit. Make sure files are saved before running this script.
+    "%GIT_EXE%" status --short
     popd
     exit /b 0
 )

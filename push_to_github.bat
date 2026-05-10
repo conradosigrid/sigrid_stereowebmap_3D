@@ -31,11 +31,12 @@ if "%~1"=="" (
     set "COMMIT_MSG=Update plugin files !STAMP!"
 ) else (
     set "COMMIT_MSG=%~1"
-    :rebuild_msg
     shift
+    :rebuild_loop
     if not "%~1"=="" (
         set "COMMIT_MSG=!COMMIT_MSG! %~1"
-        goto rebuild_msg
+        shift
+        goto rebuild_loop
     )
 )
 

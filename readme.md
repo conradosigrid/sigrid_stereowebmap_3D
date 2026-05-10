@@ -1,5 +1,4 @@
-﻿***
-# SIGRID_SWM_3D - QGIS Plugin - Version 0.5.1
+﻿# SIGRID_SWM_3D - QGIS Plugin - Version 0.5.1
 
 ![Version](https://img.shields.io/badge/version-0.5.1-blue)
 ![QGIS](https://img.shields.io/badge/QGIS-4.x-green)
@@ -22,6 +21,8 @@
 8. [Future work](#8-future-work)
 9. [Compatibility Matrix](#9-compatibility-matrix)
 10. [Visual Walkthrough](#10-visual-walkthrough)
+11. [License](#11-license)
+12. [Authors and Contributors](#12-authors-and-contributors)
 
 ## 1. Description
 
@@ -134,9 +135,9 @@ Expected behavior:
 - Because the images are rotated, stereoscopy is not clearly visible in these cases.
 - The ability to rotate images horizontally must be implemented to overcome this limitation.
 
-### The SWM server is experiencing problems with the quality of JPEG images.
+### The SWM server is experiencing problems with the quality of JPEG images
 - The JPEG images are being served in very low quality.
-- Request the images from the StereoWebMap server in **png** format ![](docs/images/010-configure-stereoWebMap-service-connection.png)
+- Request the images from the StereoWebMap server in **png** format instead of JPEG.
 
 
 ---
@@ -179,7 +180,7 @@ The most immediate developments from this baseline version are:
 ![Zoomed area main canvas](docs/images/040-zoomed-area-main-canvas.png)
 
 ### Throw Sigrid StereoWebMap Plugin
-![Throw Sigrid StereoWebMap Plugin](docs/images/045-throw-sigrid-stereowebmap-plugin.png)]
+![Throw Sigrid StereoWebMap Plugin](docs/images/045-throw-sigrid-stereowebmap-plugin.png)
 
 ### Select Stereo Screen (only if more than two displays)
 ![Select Stereo Screen](docs/images/050-select-stereo-screen.png)
@@ -190,6 +191,20 @@ The most immediate developments from this baseline version are:
 ### Stereo Windows Result
 ![Stereo Windows Result](docs/images/070-stereo-windows-result.png)
 
-***
+---
 
-**End of readme.md**
+## 11. License
+
+This plugin is provided under the terms of the LICENSE file included in this repository. For more information, see [LICENSE](LICENSE).
+
+---
+
+## 12. Authors and Contributors
+
+**Main Authors:**
+- Conrado Sánchez López (conradosanchez@sigrid.es)
+- Javier Herrero
+- Tragsatec
+
+**Repository:** https://github.com/conradosigrid/sigrid_stereowebmap_3D  
+**Issue Tracker:** https://github.com/conradosigrid/sigrid_stereowebmap_3D/issues

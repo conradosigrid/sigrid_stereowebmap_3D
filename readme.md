@@ -42,16 +42,17 @@ Use **ALT + mouse wheel** in the main window to adjust the **cursor Z** value, w
 - **Two or more monitors**.
 
 ### 2.2 Recommended
-- One of the monitors should support stereoscopic display.
-- Access to the SWM photogrammetric WMS service. Currently available endpoints:
+- One of the monitors should support stereoscopic system.
+- Access to the SWM photogrammetric WMS service. Currently available endpoints: 
+- **If you are working on an intranet, change 'https://' to 'http://'**
   - https://fenix3d-des.tragsatec.es:8083/ (testing)
   - https://fenix3d-des.tragsatec.es:8084/ (development)
-- If you are working on an intranet, change https:// to http://.
 
 
 ## 3. Installation and/or updating
 - Menu path: Plugins -> Manage and Install Plugins -> Install from ZIP -> ZIP file.
 - Use the ZIP package of the latest plugin version: *sigrid_stereowebmap_3D_x_x_x.zip*.
+- Have access configured to a StereoWebMap service
 
 ## 4. Quick Start
 
@@ -59,8 +60,8 @@ Use **ALT + mouse wheel** in the main window to adjust the **cursor Z** value, w
 2. Open a project with access to a StereowebMap photogrammetric flight WMS endpoint.
 3. Load the required layers into the main window. One of them must be a **StereowebMap® photogrammetric flight WMS** service. Example: https://fenix3d-des.tragsatec.es:8083/
 4. Launch the plugin and open the stereo window on a second monitor.
-4.1 If you have more than two monitors, it will ask you which one to open the photogrammetry window on. 
-4.2 If you only have two, it will open it directly on the monitor where QGIS is not open.
+  1. If you have more than two monitors, it will ask you which one to open the photogrammetry window on.
+  2. If you only have two, it will open it directly on the monitor where QGIS is not open.
 5. Select stereo mode
 5.1
 5.2

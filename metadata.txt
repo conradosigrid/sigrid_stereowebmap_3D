@@ -1,13 +1,12 @@
 [general]
-name=StereoWebMap 3D Plugin
-description=Plugin for managing Sigrid StereoWebMap Wms flight services
-version=1.0
-experimental=false
-deprecated=false
+name=Sigrid StereoWebMap 3D
+description=3D stereo visualization and editing from StereoWebMap services
+about=This plugin opens a window in which photogrammetric flights from WMS StereoWebMap services can be viewed in stereo 3D by overlaying the vector files and tools active on the main QGIS canvas onto this stereo window.
 qgisMinimumVersion=4.0
-category=WMS web service
-tags=WMS stereographic 3D
-homepage=Tragsatec
-author=Conrado Sánchez/Javier Herrero
-email=javier.herrero@gmail.com
-about=Stereo visualization of StereoWebMap photogrammetric WMS service
+version=0.5.1
+author=Conrado Sánchez López, Javier Herrero, Tragsatec
+email=conradosanchez@sigrid.es
+homepage=https://github.com/conradosigrid/sigrid_stereowebmap_3D
+repository=https://github.com/conradosigrid/sigrid_stereowebmap_3D
+tracker=https://github.com/conradosigrid/sigrid_stereowebmap_3D/issues
+experimental=True

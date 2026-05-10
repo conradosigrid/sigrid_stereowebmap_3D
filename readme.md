@@ -26,7 +26,7 @@
 
 ## 1. Description
 
-**SIGRID_SWM_3D** is a QGIS plugin for visualizing **StereowebMap® photogrammetric flight WMS services** content, in stereoscopic mode.
+**SIGRID_SWM_3D** is a QGIS plugin for visualizing **StereowebMap® photogrammetric flight WMS services** content in stereoscopic mode.
 
 The plugin renders the stereoscopic pair in a secondary window synchronized with the main QGIS canvas. All navigation and tools are controlled from the main window and reflected in the stereo view in real time.
 
@@ -44,7 +44,7 @@ Use **ALT + mouse wheel** in the main window to adjust the **cursor Z** value, w
 
 ### 2.2 Recommended
 - One of the monitors should support stereoscopic system.
-- Access to the SWM photogrammetric WMS service. Currently available endpoints: 
+- Access to the SWM photogrammetric WMS service. Currently available endpoints:
 - **If you are working on an intranet, change 'https://' to 'http://'**
   - https://fenix3d-des.tragsatec.es:8083/ (testing)
   - https://fenix3d-des.tragsatec.es:8084/ (development)
@@ -53,14 +53,14 @@ Use **ALT + mouse wheel** in the main window to adjust the **cursor Z** value, w
 ## 3. Installation and/or updating
 - Menu path: Plugins -> Manage and Install Plugins -> Install from ZIP -> ZIP file.
 - Use the ZIP package of the latest plugin version: *sigrid_stereowebmap_3D_x_x_x.zip*.
-- Have access configured to a StereoWebMap service
+- Configure access to a StereoWebMap service.
 
 ## 4. Quick Start
 
 1. Install the plugin from ZIP in QGIS.
 2. Load the required layers into the main window. One of them must be a **StereowebMap® photogrammetric flight WMS** service. Example: https://fenix3d-des.tragsatec.es:8083/
 3. Launch the plugin and open the stereo window on a second monitor. If you have more than two monitors, it will ask you which one to open the photogrammetry window on. If you only have two, it will open it directly on the monitor where QGIS is not open.
-4. Select stereo mode: Anaglyph, Interlaced, side by syde, Mirror right, Mirror up.
+4. Select stereo mode: Anaglyph, Interlaced, side by side, Mirror right, Mirror up.
 5. Navigate in the main QGIS canvas (pan, zoom, tools).
 6. Adjust cursor depth with **ALT + mouse wheel**.
 

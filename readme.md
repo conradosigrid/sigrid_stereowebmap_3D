@@ -57,21 +57,15 @@ Use **ALT + mouse wheel** in the main window to adjust the **cursor Z** value, w
 ## 4. Quick Start
 
 1. Install the plugin from ZIP in QGIS.
-2. Open a project with access to a StereowebMap photogrammetric flight WMS endpoint.
-3. Load the required layers into the main window. One of them must be a **StereowebMap® photogrammetric flight WMS** service. Example: https://fenix3d-des.tragsatec.es:8083/
-4. Launch the plugin and open the stereo window on a second monitor.
-  1. If you have more than two monitors, it will ask you which one to open the photogrammetry window on.
-  2. If you only have two, it will open it directly on the monitor where QGIS is not open.
-5. Select stereo mode
-  1. 
-
+2. Load the required layers into the main window. One of them must be a **StereowebMap® photogrammetric flight WMS** service. Example: https://fenix3d-des.tragsatec.es:8083/
+3. Launch the plugin and open the stereo window on a second monitor. If you have more than two monitors, it will ask you which one to open the photogrammetry window on. If you only have two, it will open it directly on the monitor where QGIS is not open.
+4. Select stereo mode: Anaglyph, Interlaced, side by syde, Mirror right, Mirror up.
 5. Navigate in the main QGIS canvas (pan, zoom, tools).
 6. Adjust cursor depth with **ALT + mouse wheel**.
 
 Expected behavior:
 - Main canvas and stereo window remain synchronized.
 - Depth adjustments are shown dynamically in the stereo view.
-
 
 ## 5. Changes
 

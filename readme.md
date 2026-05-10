@@ -63,8 +63,7 @@ Use **ALT + mouse wheel** in the main window to adjust the **cursor Z** value, w
   1. If you have more than two monitors, it will ask you which one to open the photogrammetry window on.
   2. If you only have two, it will open it directly on the monitor where QGIS is not open.
 5. Select stereo mode
-5.1
-5.2
+  1. 
 
 5. Navigate in the main QGIS canvas (pan, zoom, tools).
 6. Adjust cursor depth with **ALT + mouse wheel**.
@@ -168,30 +167,29 @@ The most immediate developments from this baseline version are:
 
 ## 10. Visual Walkthrough
 
-Add screenshots or GIFs in this section to help users understand setup and operation.
+### Configure StereoWebMap Service Connection
+![Configure StereoWebMap Service Connection](010-configure-stereoWebMap-service-connection.png)
 
-> Note: The current image and GIF files are temporary placeholders and should be replaced with real captures from the plugin workflow.
+### Add WMS StereoWebMap Layer
+![Add WMS StereoWebMap Layer](docs/images/020-add-wms-stereowebmap-layer.png)
 
-Suggested assets:
-- Main QGIS canvas with plugin enabled.
-- Stereo window on second monitor.
-- ALT + mouse wheel depth adjustment demo.
-- Side-by-side synchronization example during pan/zoom.
+### Result main canvas
+![Result main canvas](docs/images/030-result-main-canvas.png)
 
-Template:
+### Zoomed area main canvas
+![Zoomed area main canvas](docs/images/040-zoomed-area-main-canvas.png)
 
-### 10.1 Main Window
-![Main QGIS window with SWM-3D enabled](docs/images/main-window.png)
+### Throw Sigrid StereoWebMap Plugin
+![Throw Sigrid StereoWebMap Plugin](docs/images/045-throw-sigrid-stereowebmap-plugin.png)]
 
-### 10.2 Stereo Window
-![Stereo window on secondary monitor](docs/images/stereo-window.png)
+### Select Stereo Screen (only if more than two displays)
+![Select Stereo Screen](docs/images/050-select-stereo-screen.png)
 
-### 10.3 Depth Adjustment (GIF)
-![Cursor Z adjustment using ALT + mouse wheel](docs/images/depth-adjustment.gif)
+### Select Stereo Mode
+![Select Stereo Mode](docs/images/060-select-stereo-mode.png)
 
-### 10.4 Canvas Synchronization (GIF)
-![Main canvas and stereo window synchronized](docs/images/canvas-sync.gif)
-
+### Stereo Windows Result
+![Stereo Windows Result](docs/images/070-stereo-windows-result.png)
 
 ***
 

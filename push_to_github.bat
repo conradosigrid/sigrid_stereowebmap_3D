@@ -30,9 +30,13 @@ if "%~1"=="" (
     )
     set "COMMIT_MSG=Update plugin files !STAMP!"
 ) else (
-    setlocal DisableDelayedExpansion
-    set "COMMIT_MSG=%*"
-    setlocal EnableDelayedExpansion
+    set "COMMIT_MSG=%~1"
+    :rebuild_msg
+    shift
+    if not "%~1"=="" (
+        set "COMMIT_MSG=!COMMIT_MSG! %~1"
+        goto rebuild_msg
+    )
 )
 
 "%GIT_EXE%" add --all .

@@ -140,13 +140,18 @@ Expected behavior:
 - Because the images are rotated, stereoscopy is not clearly visible in these cases.
 - The ability to rotate images horizontally must be implemented to overcome this limitation.
 
+### The SWM server is experiencing problems with the quality of JPEG images.
+- The JPEG images are being served in very low quality.
+- Request the images from the StereoWebMap server in **png** format ![](docs/images/010-configure-stereoWebMap-service-connection.png)
+
+
 ---
 
 ## 8. Future work
 
 The most immediate developments from this baseline version are:
 
-- Check whether bugs previously detected by Conrado and Andrea/Ada in earlier versions persist in this version and architecture. Fix as needed.
+- Correct the issues pointed out in the previous section.
 - Test and refine the stereoscopic rendering on different hardware setups, especially the dual-screen with a 45-degree mirror.
 - Add visualization support for **anaglyph** and **interlaced horizontal lines** systems.
 - Begin incorporating delineation tools that work directly on the stereoscopic views.

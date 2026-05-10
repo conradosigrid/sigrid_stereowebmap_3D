@@ -31,6 +31,7 @@ if "%~1"=="" (
     set "COMMIT_MSG=Update plugin files !STAMP!"
 ) else (
     set "COMMIT_MSG=%*"
+    if "!COMMIT_MSG:~0,1!"=="\"" if "!COMMIT_MSG:~-1!"=="\"" set "COMMIT_MSG=!COMMIT_MSG:~1,-1!"
 )
 
 "%GIT_EXE%" add --all .

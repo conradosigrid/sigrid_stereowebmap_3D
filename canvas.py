@@ -32,6 +32,7 @@ from qgis.core import QgsMessageLog, Qgis  # for debug messages.
 from qgis.gui import QgsMapCanvas, QgsVertexMarker, QgsRubberBand, QgsMapCanvasItem
 from qgis.core import QgsWkbTypes, QgsGeometry, QgsRasterLayer, QgsVectorLayer, QgsPoint, QgsPointXY
 from qgis.core import QgsSymbol, QgsSingleSymbolRenderer, QgsGeometryGeneratorSymbolLayer
+from qgis.core import QgsCoordinateTransform, QgsCoordinateReferenceSystem, QgsProject
 from qgis.PyQt.QtGui import QColor, QWheelEvent, QImage, QPainter
 from qgis.PyQt.QtCore import Qt
 from typing import Optional, Any, Dict, List
@@ -102,10 +103,11 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         pos = self.qgis_main_canvas.mouseLastXY()
         z = self.parent.z_cursor if self.parent else 0
         point_xy = self.qgis_main_canvas.getCoordinateTransform().toMapCoordinates(pos)
+        point_wrl = self._reproject_point_to_world(point_xy)
         
         # Calculate projected position
         if self.trf_wld2prp:
-            pnt_wrl = QgsPoint(point_xy.x(), point_xy.y(), z)
+            pnt_wrl = QgsPoint(point_wrl.x(), point_wrl.y(), z)
             pnt_prj = self.trf_wld2prp.execute_wrl2prp(pnt_wrl)
             if pnt_prj:
                 self.cursor_marker.setCenter(pnt_prj)
@@ -206,6 +208,60 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                                    "SWM-3D", Qgis.Warning)
         finally:
             self.sync_in_progress = False
+
+    def _get_world_crs(self) -> Optional[QgsCoordinateReferenceSystem]:
+        """
+        Returns the "world" CRS expected by the photogrammetric transform.
+        Uses the SWM layer CRS when available.
+        """
+        if self.layer_swm:
+            swm_crs = self.layer_swm.crs()
+            if swm_crs and swm_crs.isValid():
+                return swm_crs
+        return None
+
+    def _reproject_point_to_world(self, point_xy: QgsPointXY) -> QgsPointXY:
+        """
+        Reprojects a point from main canvas destination CRS to SWM world CRS.
+        """
+        try:
+            world_crs = self._get_world_crs()
+            if not world_crs:
+                return point_xy
+
+            source_crs = self.qgis_main_canvas.mapSettings().destinationCrs()
+            if not source_crs or not source_crs.isValid() or source_crs == world_crs:
+                return point_xy
+
+            trf = QgsCoordinateTransform(source_crs, world_crs, QgsProject.instance())
+            return trf.transform(point_xy)
+        except Exception as e:
+            QgsMessageLog.logMessage(f"CRS: Error reprojecting cursor point to SWM CRS: {str(e)}",
+                                     "SWM-3D", Qgis.Warning)
+            return point_xy
+
+    def _reproject_geometry_to_world(self, geom: QgsGeometry) -> QgsGeometry:
+        """
+        Reprojects geometry from main canvas destination CRS to SWM world CRS.
+        """
+        try:
+            world_crs = self._get_world_crs()
+            if not world_crs:
+                return geom
+
+            source_crs = self.qgis_main_canvas.mapSettings().destinationCrs()
+            if not source_crs or not source_crs.isValid() or source_crs == world_crs:
+                return geom
+
+            trf = QgsCoordinateTransform(source_crs, world_crs, QgsProject.instance())
+            transformed = QgsGeometry(geom)
+            if transformed.transform(trf) == 0:
+                return transformed
+            return geom
+        except Exception as e:
+            QgsMessageLog.logMessage(f"CRS: Error reprojecting geometry to SWM CRS: {str(e)}",
+                                     "SWM-3D", Qgis.Warning)
+            return geom
 
     def _get_canvas_items(self, canvas) -> List[QgsMapCanvasItem]:
         """
@@ -325,7 +381,8 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             if center and self.trf_wld2prp:
                 # Apply 3D transformation if available
                 z = self.parent.z_cursor if self.parent else 0
-                pnt_wrl = QgsPoint(center.x(), center.y(), z)
+                center_wrl = self._reproject_point_to_world(QgsPointXY(center.x(), center.y()))
+                pnt_wrl = QgsPoint(center_wrl.x(), center_wrl.y(), z)
                 pnt_prj = self.trf_wld2prp.execute_wrl2prp(pnt_wrl)
                 if pnt_prj:
                     target.setCenter(pnt_prj)
@@ -364,14 +421,15 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 
                 # Apply tracked Z for stereo-canvas visualization
                 geom_with_tracked_z = self._apply_tracked_z_to_geometry(geom, source)
+                geom_world = self._reproject_geometry_to_world(geom_with_tracked_z)
                 
                 if self.trf_wld2prp:
                     # Apply 3D transformation with tracked Z, same logic as expressions
-                    transformed_geom = self._transform_geometry(geom_with_tracked_z, source)
+                    transformed_geom = self._transform_geometry(geom_world, source)
                     if transformed_geom:
                         target.setToGeometry(transformed_geom, None)
                     else:
-                        target.setToGeometry(geom_with_tracked_z, None)
+                        target.setToGeometry(geom_world, None)
                 else:
                     target.setToGeometry(geom_with_tracked_z, None)
             
@@ -639,7 +697,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                     scene = self.qgis_main_canvas.scene()
                     if hasattr(scene, 'changed'):
                         scene.changed.disconnect(self._on_scene_changed)
-            except RuntimeError:
+            except (RuntimeError, TypeError):
                 pass  # Signals may not be connected
 
     def cleanup_canvas_items_sync(self):
@@ -656,7 +714,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 scene = self.qgis_main_canvas.scene()
                 if hasattr(scene, 'changed'):
                     scene.changed.disconnect(self._on_scene_changed)
-        except RuntimeError:
+        except (RuntimeError, TypeError):
             pass  # Signals may not be connected
         
         # Clear all synchronized items
@@ -845,6 +903,11 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 # Copy layer_main to apply Geometry Generator. Ensure the CRS and other properties are the same
                 # 1) Create an independent logical view for the secondary canvas.
                 layer_copy = QgsVectorLayer(layer_main.source(), layer_main.name(), layer_main.providerType())
+                source_crs = layer_main.crs()
+                if source_crs and source_crs.isValid():
+                    layer_copy.setCustomProperty("swm_source_authid", source_crs.authid())
+                    # Keep declared CRS aligned with source layer so feature filtering by extent works correctly.
+                    layer_copy.setCrs(source_crs)
                 # Update (only once: is_left). Not sure if required. Disabled for now.
                 # if self.is_left:
                 #     layer_main.rendererChanged.connect(lambda: self.parent.trigger_sync_renderer_layerz(layer_copy.name()))
@@ -869,15 +932,11 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 # 5) Assign renderer
                 renderer = QgsSingleSymbolRenderer(final_symbol)
                 layer_copy.setRenderer(renderer) 
-                if layer_main.hasScaleBasedVisibility():
-                    # TODO: With glasses is not working. Real scale in glasses?
-                    layer_copy.setScaleBasedVisibility(True)
-                    layer_copy.setMinimumScale(layer_main.minimumScale())
-                    layer_copy.setMaximumScale(layer_main.maximumScale())
+                # Stereo canvases use a synthetic render context; scale-based visibility
+                # from the main layer can hide features unexpectedly after CRS changes.
+                layer_copy.setScaleBasedVisibility(False)
                 self.layers_z.append(layer_copy)
-                layers_self.append(layer_copy) 
-                # QgsMessageLog.logMessage(f"SYNC_LAYER Layer: {layer_main.name()}-{'LEFT' if self.is_left else 'RIGHT'}.", 
-                #                          "SWM-3D", Qgis.Info)
+                layers_self.append(layer_copy)
             else:
                 # Keep layers that are neither SWM nor Z-enabled
                 layers_self.append(layer_main)
@@ -910,21 +969,46 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         txt_trf_pht2prp = reply.rawHeader(b'SIGRID_PhtTransPhotoToCanvas').data().decode('utf-8')
         self.trf_wld2prp.read_projective(txt_trf_pht2prp)
 
-        # Update Geometry Generator for Z layers. Now transformation is known,
-        # so Z layers (if present) can be updated to transform their geometries.
-        for layer in self.layers():
-            if is_z_layer(layer):
-                layer.setCustomProperty("swm_trf_wrl2pht", txt_trf_wrl2pht)
-                layer.setCustomProperty("swm_trf_pht2prp", txt_trf_pht2prp)
-                # GeometryGenerator must be updated now that transformation is available
-                side = 'left' if self.is_left else 'right'
-                expression = (f"perspective_swm_transform($geometry,'{side}','{self.trf_wld2prp.txt_perspective}','{self.trf_wld2prp.txt_projective}')")
-                symbol_layer = layer.renderer().symbol().symbolLayer(0)
-                if not isinstance(symbol_layer, QgsGeometryGeneratorSymbolLayer):
-                    QgsMessageLog.logMessage(f"Unexpected SymbolLayer type in layer {layer.name()}: {type(symbol_layer)}", "SWM-3D", Qgis.Warning)
-                    continue
+        # Update Geometry Generator for Z layers known by this canvas copy.
+        # Using self.layers_z avoids relying on provider-side wkb reporting of the copy.
+        expressions_updated = False
+        swm_authid = ""
+        if self.layer_swm and self.layer_swm.crs() and self.layer_swm.crs().isValid():
+            swm_authid = self.layer_swm.crs().authid()
+
+        for layer in self.layers_z:
+            layer.setCustomProperty("swm_trf_wrl2pht", txt_trf_wrl2pht)
+            layer.setCustomProperty("swm_trf_pht2prp", txt_trf_pht2prp)
+
+            geometry_input_expr = "$geometry"
+            layer_authid = str(layer.customProperty("swm_source_authid", "")).strip()
+            if not layer_authid:
+                layer_crs = layer.crs()
+                layer_authid = layer_crs.authid() if layer_crs and layer_crs.isValid() else ""
+            if swm_authid and layer_authid and swm_authid != layer_authid:
+                geometry_input_expr = f"transform($geometry,'{layer_authid}','{swm_authid}')"
+
+            # GeometryGenerator must be updated now that transformation is available
+            side = 'left' if self.is_left else 'right'
+            perspective_expr = (f"perspective_swm_transform({geometry_input_expr},'{side}','{self.trf_wld2prp.txt_perspective}','{self.trf_wld2prp.txt_projective}')")
+            expression = perspective_expr
+            if swm_authid and layer_authid and swm_authid != layer_authid:
+                # Return geometry to the layer CRS so QGIS render pipeline transforms it once to canvas CRS.
+                expression = f"transform({perspective_expr},'{swm_authid}','{layer_authid}')"
+            symbol_layer = layer.renderer().symbol().symbolLayer(0)
+            if not isinstance(symbol_layer, QgsGeometryGeneratorSymbolLayer):
+                QgsMessageLog.logMessage(f"Unexpected SymbolLayer type in layer {layer.name()}: {type(symbol_layer)}", "SWM-3D", Qgis.Warning)
+                continue
+            current_expression = symbol_layer.geometryExpression()
+            if current_expression != expression:
                 symbol_layer.setGeometryExpression(expression)
+                layer.triggerRepaint()
+                expressions_updated = True
 
                 # QgsMessageLog.logMessage(f"UPDATE_SWM_HEADER Layer: {layer.name()}-{'LEFT' if self.is_left else 'RIGHT'}.", 
                 #                          "SWM-3D", Qgis.Info)   
         self.render_complete()
+
+        # Ensure first render uses the new expression without waiting for manual pan/zoom.
+        if expressions_updated:
+            self.refresh()

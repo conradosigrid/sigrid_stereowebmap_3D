@@ -42,7 +42,11 @@ import math
 from qgis.core import QgsGeometry, QgsPointXY, QgsWkbTypes
 from qgis.utils import qgsfunction
 
-from qgis.core import QgsMessageLog, Qgis  # for debug messages.
+
+# Center-of-pixel offset applied in projection-plane coordinates.
+# X and Y use different signs due to projection axis convention.
+PIXEL_CENTER_OFFSET_X = -0.5
+PIXEL_CENTER_OFFSET_Y = 0.5
 
 # ------------------------------------------------------------------
 # Parsing cache (key = header text) to avoid reparsing each time
@@ -124,7 +128,7 @@ def photo_to_proj(xp, yp, a, b, c):
     x2 = (a[0]*xp + a[1]*yp + a[2]) / den
     y2 = (b[0]*xp + b[1]*yp + b[2]) / den
 
-    return x2, y2
+    return x2 + PIXEL_CENTER_OFFSET_X, y2 + PIXEL_CENTER_OFFSET_Y
 
 
 @qgsfunction(args='auto', group='Sigrid SWM', usesgeometry=True)
@@ -165,33 +169,39 @@ def perspective_swm_transform(geometry, side, txt_trf_wrl2pht, txt_trf_pht2prp):
 
     # -------------------------------
     # Point or multipoint
-    # Regardless of original type, layer points arrive here one by one.
     # -------------------------------
     if gtype == QgsWkbTypes.PointGeometry:
-        # p = geometry.asPoint()  # Causes silent exceptions captured internally by C++
-        it = geometry.vertices()
-        p = next(it, None)
-        if p is None:
-            QgsMessageLog.logMessage("[DEBUG] perspective_swm_transform: invalid POINTZ", "SWM-3D", Qgis.Warning)
+        transformed_points = []
+
+        for p in geometry.vertices():
+            z = p.z()
+            if not math.isfinite(z):
+                if p.isMeasure() and math.isfinite(p.m()):
+                    z = p.m()
+                else:
+                    continue
+
+            res = world_to_photo(p.x(), p.y(), z, x0, y0, z0, df, r)
+            if not res:
+                continue
+
+            photo_x, photo_y = res[0], res[1]
+
+            res = photo_to_proj(photo_x, photo_y, a, b, c)
+            if not res:
+                continue
+
+            proj_x, proj_y = res[0], res[1]
+
+            transformed_points.append(QgsPointXY(proj_x, proj_y))
+
+        if not transformed_points:
             return geometry
 
-        z = p.z()
-        if not math.isfinite(z):
-            if p.isMeasure() and math.isfinite(p.m()):
-                z = p.m() 
-            else:
-                QgsMessageLog.logMessage("[DEBUG] perspective_swm_transform: POINTZ without Z", "SWM-3D", Qgis.Warning)
-                return geometry
+        if len(transformed_points) == 1:
+            return QgsGeometry.fromPointXY(transformed_points[0])
 
-        res = world_to_photo(p.x(), p.y(), z, x0, y0, z0, df, r)
-        if not res:
-            return geometry
-
-        res = photo_to_proj(res[0], res[1], a, b, c)
-        if not res:
-            return geometry
-
-        return QgsGeometry.fromWkt(f"POINT ({res[0]} {res[1]})")
+        return QgsGeometry.fromMultiPointXY(transformed_points)
 
     # --------------------------------------------------
     # LineString MultiLineString, ... LineZ, LineM, LineZM, MultiLineZ, MultiLineM, MultiLineZM
@@ -210,7 +220,9 @@ def perspective_swm_transform(geometry, side, txt_trf_wrl2pht, txt_trf_pht2prp):
             if not res:
                 continue
 
-            res = photo_to_proj(res[0], res[1], a, b, c)
+            photo_x, photo_y = res[0], res[1]
+
+            res = photo_to_proj(photo_x, photo_y, a, b, c)
             if not res:
                 continue
 
@@ -258,5 +270,4 @@ def perspective_swm_transform(geometry, side, txt_trf_wrl2pht, txt_trf_pht2prp):
 
     else:
         # Unsupported geometries
-        QgsMessageLog.logMessage(f"[DEBUG] expression: Unsupported geometry type: {gtype}", "SWM-3D", Qgis.Info)
         return geometry

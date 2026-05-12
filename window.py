@@ -81,7 +81,26 @@ class QSgdSwmWindow(QMainWindow):
 
         # Capturar eventos del canvas principal qgis
         self.iface.mapCanvas().xyCoordinates.connect(self._sync_canvases_cursor)      # mouse
-        self.iface.mapCanvas().layersChanged.connect(self._sync_canvases_layers)      # new layers
+        self._layer_sync_timer = QTimer(self)
+        self._layer_sync_timer.setSingleShot(True)
+        self._layer_sync_timer.setInterval(50)
+        self._layer_sync_timer.timeout.connect(self._sync_canvases_layers)
+        self._layer_tree_model = None
+        self.iface.mapCanvas().layersChanged.connect(self._schedule_layers_sync)      # new layers / ordering
+        project = QgsProject.instance()
+        if project:
+            root = project.layerTreeRoot()
+            if root and hasattr(root, 'visibilityChanged'):
+                root.visibilityChanged.connect(self._schedule_layers_sync)  # visibility toggles
+        try:
+            layer_tree_view = self.iface.layerTreeView()
+            if layer_tree_view and hasattr(layer_tree_view, 'layerTreeModel'):
+                model = layer_tree_view.layerTreeModel()
+                if model and hasattr(model, 'dataChanged'):
+                    model.dataChanged.connect(self._schedule_layers_sync)
+                    self._layer_tree_model = model
+        except Exception:
+            self._layer_tree_model = None
         self.iface.mapCanvas().extentsChanged.connect(self._sync_canvases_repaint)    # zoom and pan
         if hasattr(self.iface.mapCanvas(), 'destinationCrsChanged'):
             self.iface.mapCanvas().destinationCrsChanged.connect(self._on_main_canvas_crs_changed)
@@ -89,7 +108,14 @@ class QSgdSwmWindow(QMainWindow):
         # Persist cursor Z into edited features on Z-enabled layers.
         self._layer_edit_hooks: Dict[str, Dict[str, Any]] = {}
         self._geometry_update_guard: Set[Tuple[str, int]] = set()
+        self._layer_style_hooks: Dict[str, Dict[str, Any]] = {}
+        self._pending_style_sync = False
+        self._style_sync_timer = QTimer(self)
+        self._style_sync_timer.setSingleShot(True)
+        self._style_sync_timer.setInterval(100)
+        self._style_sync_timer.timeout.connect(self._run_pending_style_sync)
         self._update_digitizing_layer_hooks()
+        self._update_style_layer_hooks()
 
         # Network Manager WMS
         # https://chat.deepseek.com/a/chat/s/5dc872fa-208d-458c-836b-9199dcc3a37c
@@ -129,6 +155,26 @@ class QSgdSwmWindow(QMainWindow):
 
             # Clean up digitizing interceptors
             self._disconnect_all_digitizing_hooks()
+            self._disconnect_all_style_hooks()
+            if self._style_sync_timer and self._style_sync_timer.isActive():
+                self._style_sync_timer.stop()
+            if self._layer_sync_timer and self._layer_sync_timer.isActive():
+                self._layer_sync_timer.stop()
+
+            if self._layer_tree_model and hasattr(self._layer_tree_model, 'dataChanged'):
+                try:
+                    self._layer_tree_model.dataChanged.disconnect(self._schedule_layers_sync)
+                except (RuntimeError, TypeError):
+                    pass
+
+            project = QgsProject.instance()
+            if project:
+                root = project.layerTreeRoot()
+                if root and hasattr(root, 'visibilityChanged'):
+                    try:
+                        root.visibilityChanged.disconnect(self._schedule_layers_sync)
+                    except (RuntimeError, TypeError):
+                        pass
             
             # Clean up synchronization in secondary canvases
             if self.canvas_left:
@@ -360,32 +406,47 @@ class QSgdSwmWindow(QMainWindow):
         self._sync_canvases_destination_crs()
         if self.canvas_left:
             extent_left = self._reproject_extent_to_stereo_crs(self.qgis_main_canvas.extent(), self.canvas_left)
-            # QgsMessageLog.logMessage(f"[DEBUG] <sync_canvases_repaint> Refreshing LEFT canvas", "SWM-3D", Qgis.Info)
-            self.canvas_left.setExtent(extent_left)
-            # self.canvas_left.sync_layers()
-            self.canvas_left.refresh()
+            current_left_extent = self.canvas_left.extent()
+            if current_left_extent != extent_left:
+                self.canvas_left.setExtent(extent_left)
+                self.canvas_left.refresh()
         if self.canvas_right:
             extent_right = self._reproject_extent_to_stereo_crs(self.qgis_main_canvas.extent(), self.canvas_right)
-            # QgsMessageLog.logMessage(f"[DEBUG] <sync_canvases_repaint> Refreshing RIGHT canvas", "SWM-3D", Qgis.Info)
-            self.canvas_right.setExtent(extent_right)
-            # self.canvas_right.sync_layers()
-            self.canvas_right.refresh()
+            current_right_extent = self.canvas_right.extent()
+            if current_right_extent != extent_right:
+                self.canvas_right.setExtent(extent_right)
+                self.canvas_right.refresh()
 
     def _sync_canvases_layers(self):
         """
-        Propagate layer changes (add/remove/reorder) to plugin canvases.
+        Propagate layer changes (visibility, add/remove/reorder) to plugin canvases.
+        Reusing SWM layers is handled inside each stereo canvas to avoid
+        repeated WMS requests during visibility toggles.
         """
+        # Keep hooks aligned with currently active Z layers.
         self._update_digitizing_layer_hooks()
+        self._update_style_layer_hooks()
 
         if self.canvas_left:
             self.canvas_left.sync_layers()
+            self.canvas_left.refresh()
         if self.canvas_right:
             self.canvas_right.sync_layers()
+            self.canvas_right.refresh()
 
         # Layer visibility/type changes can update SWM service CRS availability.
         self._update_swm_service_crs_cache()
         self._sync_canvases_destination_crs()
-        self._sync_canvases_repaint()
+        # Do not force an immediate repaint here: sync_layers() already triggers
+        # render passes and forcing repaint duplicates WMS GetMap requests.
+
+    def _schedule_layers_sync(self, *args):
+        """
+        Coalesces rapid layer/tree events into a single sync pass.
+        This prevents duplicate sync_layers() calls for one user action.
+        """
+        if self._layer_sync_timer:
+            self._layer_sync_timer.start()
 
     def _update_digitizing_layer_hooks(self):
         """
@@ -409,6 +470,115 @@ class QSgdSwmWindow(QMainWindow):
 
         except Exception as e:
             QgsMessageLog.logMessage(f"INTERCEPTOR: Error updating hooks: {str(e)}", "SWM-3D", Qgis.Warning)
+
+    def _update_style_layer_hooks(self):
+        """
+        Connects style-change hooks for currently visible Z-enabled vector layers.
+        These hooks trigger immediate renderer synchronization in stereo canvases.
+        """
+        try:
+            current_z_layers = {}
+            for layer in self.iface.mapCanvas().layers():
+                if is_z_layer(layer):
+                    current_z_layers[layer.id()] = layer
+
+            for layer_id in list(self._layer_style_hooks.keys()):
+                if layer_id not in current_z_layers:
+                    self._disconnect_style_hooks(layer_id)
+
+            for layer_id, layer in current_z_layers.items():
+                if layer_id not in self._layer_style_hooks:
+                    self._connect_style_hooks(layer)
+
+        except Exception as e:
+            QgsMessageLog.logMessage(f"STYLE_SYNC: Error updating style hooks: {str(e)}", "SWM-3D", Qgis.Warning)
+
+    def _connect_style_hooks(self, layer):
+        """
+        Connects renderer/style change signals for one Z-enabled layer.
+        """
+        try:
+            style_slot = lambda *args, lyr=layer: self._on_layer_style_changed(lyr)
+
+            if hasattr(layer, 'rendererChanged'):
+                layer.rendererChanged.connect(style_slot)
+            if hasattr(layer, 'styleChanged'):
+                layer.styleChanged.connect(style_slot)
+
+            self._layer_style_hooks[layer.id()] = {
+                "layer": layer,
+                "style_slot": style_slot,
+            }
+
+        except Exception as e:
+            QgsMessageLog.logMessage(f"STYLE_SYNC: Error connecting hooks for {layer.name()}: {str(e)}", "SWM-3D", Qgis.Warning)
+
+    def _disconnect_style_hooks(self, layer_id):
+        """
+        Disconnects style hooks for one layer id.
+        """
+        hook = self._layer_style_hooks.get(layer_id)
+        if not hook:
+            return
+
+        layer = hook.get("layer")
+        style_slot = hook.get("style_slot")
+
+        try:
+            if layer and style_slot:
+                if hasattr(layer, 'rendererChanged'):
+                    layer.rendererChanged.disconnect(style_slot)
+                if hasattr(layer, 'styleChanged'):
+                    layer.styleChanged.disconnect(style_slot)
+        except (RuntimeError, TypeError):
+            pass
+
+        self._layer_style_hooks.pop(layer_id, None)
+
+    def _disconnect_all_style_hooks(self):
+        """
+        Disconnects all style hooks.
+        """
+        for layer_id in list(self._layer_style_hooks.keys()):
+            self._disconnect_style_hooks(layer_id)
+
+    def _on_layer_style_changed(self, layer):
+        """
+        Handles style changes from the main layer and schedules a debounced
+        propagation to stereo canvases.
+        """
+        try:
+            if not is_z_layer(layer):
+                return
+
+            self._schedule_style_sync()
+
+        except Exception as e:
+            QgsMessageLog.logMessage(f"STYLE_SYNC: Error syncing style for {layer.name()}: {str(e)}", "SWM-3D", Qgis.Warning)
+
+    def _schedule_style_sync(self):
+        """
+        Schedules style synchronization with debounce to avoid repeated
+        expensive resyncs while the user is editing symbology.
+        """
+        self._pending_style_sync = True
+        self._style_sync_timer.start()
+
+    def _run_pending_style_sync(self):
+        """
+        Runs the queued style synchronization once debounce interval expires.
+        """
+        if not self._pending_style_sync:
+            return
+
+        self._pending_style_sync = False
+        try:
+            if self.canvas_left:
+                self.canvas_left.sync_layers()
+            if self.canvas_right:
+                self.canvas_right.sync_layers()
+        except Exception as e:
+            QgsMessageLog.logMessage(f"STYLE_SYNC: Error in debounced sync: {str(e)}", "SWM-3D", Qgis.Warning)
 
     def _connect_digitizing_hooks(self, layer):
         """

@@ -84,10 +84,15 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
 
         self.layer_swm = None
         self.layers_z = []
+        self._swm_layer_cache: Dict[str, QgsRasterLayer] = {}
+        self._z_layer_cache: Dict[str, QgsVectorLayer] = {}
         self.limits = None
         self.z_text = ""  # Z cursor text
 
         self.setCanvasColor(QColor(0, 0, 0, 0))  # QColor(Qt.GlobalColor.transparent)
+        # Keep rendered layer images cached so vector-only visibility toggles
+        # do not force unnecessary WMS requests when extent is unchanged.
+        self.setCachingEnabled(True)
 
     # ============================================================================
     # == Cursor in the stereo canvas ==
@@ -343,10 +348,12 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
     def _sync_vertex_marker_properties(self, source: QgsVertexMarker, target: QgsVertexMarker):
         """
         Synchronizes QgsVertexMarker properties.
+        Applies dynamic center-of-vertex offset based on marker symbol size.
         """
         try:
             # Copy basic properties safely
             # Check getter method availability before using them
+            icon_size = 10  # Default size
             if hasattr(source, 'color'):
                 target.setColor(source.color())
             
@@ -354,11 +361,12 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             # If value retrieval fails, use reasonable defaults
             try:
                 if hasattr(source, 'iconSize'):
-                    target.setIconSize(source.iconSize())
+                    icon_size = source.iconSize()
+                    target.setIconSize(icon_size)
                 else:
-                    target.setIconSize(10)  # Default value
+                    target.setIconSize(icon_size)
             except AttributeError:
-                target.setIconSize(10)
+                target.setIconSize(icon_size)
                 
             try:
                 if hasattr(source, 'iconType'):
@@ -385,7 +393,15 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 pnt_wrl = QgsPoint(center_wrl.x(), center_wrl.y(), z)
                 pnt_prj = self.trf_wld2prp.execute_wrl2prp(pnt_wrl)
                 if pnt_prj:
-                    target.setCenter(pnt_prj)
+                    # Apply dynamic center-of-vertex offset based on symbol size
+                    # Offset is proportional to half the symbol width
+                    # Formula: offset = iconSize / 20 (iconSize 10 → 0.5, iconSize 20 → 1.0, etc.)
+                    offset_value = icon_size / 20.0
+                    offset_x = -offset_value
+                    offset_y = offset_value
+                    
+                    adjusted_point = QgsPointXY(pnt_prj.x() + offset_x, pnt_prj.y() + offset_y)
+                    target.setCenter(adjusted_point)
                 else:
                     target.setCenter(center)
             else:
@@ -875,11 +891,25 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         self.update_cursor()
 
     def sync_layers(self):
-        # Get the layers from the main QGIS canvas
-        layers_main = self.qgis_main_canvas.layers()
+        # Get visible layers from the project layer tree (canonical visibility state).
+        # This avoids stale snapshots that can happen around legend toggle events.
+        layers_main = []
+        project = QgsProject.instance()
+        if project:
+            root = project.layerTreeRoot()
+            if root:
+                for node in root.findLayers():
+                    layer = node.layer()
+                    if layer and node.isVisible():
+                        layers_main.append(layer)
+        if not layers_main:
+            # Fallback to canvas layers if tree lookup is unavailable.
+            layers_main = self.qgis_main_canvas.layers()
+
         layers_self = []  # Get the layers from this canvas
-        self.layer_swm = None 
+        self.layer_swm = None
         self.layers_z = []
+        active_z_layer_ids = set()
 
         # Loop through the layers to short them properly in ONE SWM layer, several vector layers with Z (with geometry generator) 
         # and other layers without Z (copied as they are)
@@ -894,15 +924,25 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 sigrid_layer_main_url = layer_main.source()
                 style_value = 'PHOTOLEFT' if self.is_left else 'PHOTORIGHT'
                 sigrid_layer_self_url = re.sub(r'styles(=[^&]*)?', f'styles={style_value}', sigrid_layer_main_url, flags=re.IGNORECASE)
-                # https://gis.stackexchange.com/questions/467847/creating-qgsrasterlayer-from-wms-layer-using-pyqgis-in-qgis-3-28
-                # This triggers an initial server request (GETCAPABILITIES)
-                self.layer_swm = QgsRasterLayer(sigrid_layer_self_url, style_value, 'wms')            
+                cached_swm = self._swm_layer_cache.get(sigrid_layer_self_url)
+                if cached_swm and cached_swm.isValid():
+                    # Reuse existing WMS layer instance to avoid new service requests.
+                    self.layer_swm = cached_swm
+                else:
+                    # https://gis.stackexchange.com/questions/467847/creating-qgsrasterlayer-from-wms-layer-using-pyqgis-in-qgis-3-28
+                    # This triggers an initial server request (GETCAPABILITIES)
+                    self.layer_swm = QgsRasterLayer(sigrid_layer_self_url, style_value, 'wms')
+                    self._swm_layer_cache[sigrid_layer_self_url] = self.layer_swm
                 layers_self.append(self.layer_swm)  
             elif is_z_layer(layer_main):
+                active_z_layer_ids.add(layer_main.id())
                 # Layer has Z values. Must apply Geometry Generator
                 # Copy layer_main to apply Geometry Generator. Ensure the CRS and other properties are the same
                 # 1) Create an independent logical view for the secondary canvas.
-                layer_copy = QgsVectorLayer(layer_main.source(), layer_main.name(), layer_main.providerType())
+                layer_copy = self._z_layer_cache.get(layer_main.id())
+                if layer_copy is None or not layer_copy.isValid() or layer_copy.source() != layer_main.source():
+                    layer_copy = QgsVectorLayer(layer_main.source(), layer_main.name(), layer_main.providerType())
+                    self._z_layer_cache[layer_main.id()] = layer_copy
                 source_crs = layer_main.crs()
                 if source_crs and source_crs.isValid():
                     layer_copy.setCustomProperty("swm_source_authid", source_crs.authid())
@@ -940,6 +980,11 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             else:
                 # Keep layers that are neither SWM nor Z-enabled
                 layers_self.append(layer_main)
+
+        # Remove stale cached Z copies from layers no longer present.
+        for layer_id in list(self._z_layer_cache.keys()):
+            if layer_id not in active_z_layer_ids:
+                del self._z_layer_cache[layer_id]
 
         self.setLayers(layers_self)
         

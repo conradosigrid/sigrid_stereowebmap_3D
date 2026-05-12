@@ -42,12 +42,6 @@ import math
 from qgis.core import QgsGeometry, QgsPointXY, QgsWkbTypes
 from qgis.utils import qgsfunction
 
-
-# Center-of-pixel offset applied in projection-plane coordinates.
-# X and Y use different signs due to projection axis convention.
-PIXEL_CENTER_OFFSET_X = -0.5
-PIXEL_CENTER_OFFSET_Y = 0.5
-
 # ------------------------------------------------------------------
 # Parsing cache (key = header text) to avoid reparsing each time
 # ------------------------------------------------------------------
@@ -128,7 +122,7 @@ def photo_to_proj(xp, yp, a, b, c):
     x2 = (a[0]*xp + a[1]*yp + a[2]) / den
     y2 = (b[0]*xp + b[1]*yp + b[2]) / den
 
-    return x2 + PIXEL_CENTER_OFFSET_X, y2 + PIXEL_CENTER_OFFSET_Y
+    return x2, y2
 
 
 @qgsfunction(args='auto', group='Sigrid SWM', usesgeometry=True)

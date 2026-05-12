@@ -22,12 +22,6 @@ from qgis.core import QgsPointXY, QgsPoint
 from qgis.core import QgsMessageLog, Qgis  # for debug messages.
 
 
-# Center-of-pixel offset applied in projection-plane coordinates.
-# X and Y use different signs due to projection axis convention.
-PIXEL_CENTER_OFFSET_X = -0.5
-PIXEL_CENTER_OFFSET_Y = 0.5
-
-
 # Class to transform coordinate world to projection plane
 class TrfWldToPrjPln:
     """Class to transform coordinate world to projection plane."""
@@ -58,7 +52,7 @@ class TrfWldToPrjPln:
         x_prp = (self.a[0] * x_pht + self.a[1] * y_pht + self.a[2]) / den
         y_prp = (self.b[0] * x_pht + self.b[1] * y_pht + self.b[2]) / den
 
-        return QgsPointXY(x_prp + PIXEL_CENTER_OFFSET_X, y_prp + PIXEL_CENTER_OFFSET_Y)
+        return QgsPointXY(x_prp, y_prp)
 
     def execute_prp2pht(self, pnt_prp):
         """Projective transformation (projection plane to photo)."""

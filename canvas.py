@@ -753,6 +753,15 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 f"Z-TRACKER: Cleared {tracked_rubber_bands_count} rubber band trackers", 
                 "SWM-3D", Qgis.Info
             )
+
+        # Cleanup main-extent limits rubber band
+        if self.limits:
+            try:
+                self.limits.hide()
+                self._safe_remove_item(self.limits)
+            except Exception:
+                pass
+            self.limits = None
         
         self.sync_in_progress = False
 
@@ -804,30 +813,72 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
 
         if self.filter == self.FILTER_NONE:
             super().paintEvent(e)
+
+            # Draw Z text without filter when filter mode is disabled.
+            if self.z_text:
+                painter = QPainter(self.viewport())
+                self._draw_z_text_with_painter(painter)
+                painter.end()
         else:
             # Render base content
             buffer = QImage(self.size(), QImage.Format_ARGB32)
             buffer.fill(QColor(0, 0, 0, 0))  # QColor(Qt.GlobalColor.transparent)
             super().render(QPainter(buffer))
+
+            # Render Z text in an independent transparent layer so it goes through
+            # the same stereo filter pipeline as the map content.
+            text_buffer = QImage(self.size(), QImage.Format_ARGB32)
+            text_buffer.fill(QColor(0, 0, 0, 0))
+            if self.z_text:
+                text_painter = QPainter(text_buffer)
+                self._draw_z_text_with_painter(text_painter)
+                text_painter.end()
+
             filtered = self.apply_filter(buffer)  # Apply filter to the buffer
+            text_filtered = self.apply_filter(text_buffer) if self.z_text else None
+
             painter = QPainter(self.viewport())  # Paint viewport
             if self.parent and self.parent.stereo_id < 3 and self.is_left:  
                 painter.setCompositionMode(QPainter.CompositionMode_SourceOver)               
             painter.drawImage(0, 0, filtered)
+            if text_filtered is not None:
+                painter.drawImage(0, 0, text_filtered)
             painter.end()        
             self.viewport().update()
-        
-        # Draw Z text if available
-        if self.z_text:
-            from qgis.PyQt.QtGui import QFont
-            painter = QPainter(self.viewport())
-            font = QFont()
-            font.setPointSize(18)
-            font.setBold(True)
-            painter.setFont(font)
-            painter.setPen(QColor(255, 255, 255))
-            painter.drawText(int(self.width()/2 - painter.fontMetrics().horizontalAdvance(self.z_text)/2), int(self.height() * 3 / 4), self.z_text)
-            painter.end()
+
+    def _apply_view_mirror_to_painter(self, painter: QPainter):
+        """
+        Applies the same mirror transform used by the canvas view.
+        """
+        try:
+            view_transform = self.transform()
+            if view_transform.m11() < 0:
+                painter.translate(self.width(), 0)
+                painter.scale(-1, 1)
+            if view_transform.m22() < 0:
+                painter.translate(0, self.height())
+                painter.scale(1, -1)
+        except Exception:
+            pass
+
+    def _draw_z_text_with_painter(self, painter: QPainter):
+        """
+        Draws the Z overlay text using current mirror settings.
+        """
+        from qgis.PyQt.QtGui import QFont
+
+        self._apply_view_mirror_to_painter(painter)
+
+        font = QFont()
+        font.setPointSize(18)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawText(
+            int(self.width() / 2 - painter.fontMetrics().horizontalAdvance(self.z_text) / 2),
+            int(self.height() * 3 / 4),
+            self.z_text,
+        )
 
 
     def update_z_text(self, z_value):
@@ -871,14 +922,31 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             return
 
         extent = self.qgis_main_canvas.extent()  # Get the extent of the main canvas
+
+        # Keep and update a single rubber band instance to avoid scene mismatch warnings.
+        needs_new_limits = self.limits is None
         if self.limits:
-            self.scene().removeItem(self.limits)
-        else:
+            try:
+                limits_scene = self.limits.scene() if hasattr(self.limits, 'scene') else None
+                canvas_scene = self.scene() if hasattr(self, 'scene') else None
+                if canvas_scene and limits_scene and limits_scene != canvas_scene:
+                    self._safe_remove_item(self.limits)
+                    self.limits = None
+                    needs_new_limits = True
+            except Exception:
+                self.limits = None
+                needs_new_limits = True
+
+        if needs_new_limits:
             self.limits = QgsRubberBand(self, QgsWkbTypes.PolygonGeometry)
             border_color = QColor(200, 200, 200)  # Gray color for the border
             self.limits.setColor(border_color)
             self.limits.setWidth(1)
             self.limits.setFillColor(QColor(0, 0, 0, 0))  # QColor(Qt.GlobalColor.transparent)
+
+        if not self.limits:
+            return
+
         self.limits.setToGeometry(QgsGeometry.fromRect(extent), None)
         self.limits.show()
 
@@ -987,9 +1055,74 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 del self._z_layer_cache[layer_id]
 
         self.setLayers(layers_self)
+
+        # Re-apply current 3D transform expression after any visibility/order sync.
+        # Without this, toggling a Z layer can leave it in 2D ($geometry)
+        # until another SWM WMS reply arrives.
+        self._apply_current_transform_to_z_layers()
         
         # Force map canvas item synchronization after changing layers
         self.force_sync_canvas_items()
+
+    def _build_current_geometry_expression(self, layer: QgsVectorLayer) -> str:
+        """
+        Builds the current Geometry Generator expression for a Z layer.
+        Returns a 2D passthrough when no photogrammetric transform is available.
+        """
+        geometry_input_expr = "$geometry"
+
+        swm_authid = ""
+        if self.layer_swm and self.layer_swm.crs() and self.layer_swm.crs().isValid():
+            swm_authid = self.layer_swm.crs().authid()
+
+        layer_authid = str(layer.customProperty("swm_source_authid", "")).strip()
+        if not layer_authid:
+            layer_crs = layer.crs()
+            layer_authid = layer_crs.authid() if layer_crs and layer_crs.isValid() else ""
+
+        if swm_authid and layer_authid and swm_authid != layer_authid:
+            geometry_input_expr = f"transform($geometry,'{layer_authid}','{swm_authid}')"
+
+        # No transform loaded yet: keep 2D rendering path.
+        if not self.trf_wld2prp:
+            return geometry_input_expr
+
+        side = 'left' if self.is_left else 'right'
+        perspective_expr = (
+            f"perspective_swm_transform({geometry_input_expr},'{side}','{self.trf_wld2prp.txt_perspective}','{self.trf_wld2prp.txt_projective}')"
+        )
+
+        if swm_authid and layer_authid and swm_authid != layer_authid:
+            # Return geometry to the layer CRS so QGIS render pipeline transforms once to canvas CRS.
+            return f"transform({perspective_expr},'{swm_authid}','{layer_authid}')"
+
+        return perspective_expr
+
+    def _apply_current_transform_to_z_layers(self) -> bool:
+        """
+        Applies the current Geometry Generator expression to all cached Z layers.
+        Returns True when at least one layer expression changed.
+        """
+        expressions_updated = False
+
+        for layer in self.layers_z:
+            symbol_layer = layer.renderer().symbol().symbolLayer(0)
+            if not isinstance(symbol_layer, QgsGeometryGeneratorSymbolLayer):
+                QgsMessageLog.logMessage(
+                    f"Unexpected SymbolLayer type in layer {layer.name()}: {type(symbol_layer)}",
+                    "SWM-3D",
+                    Qgis.Warning,
+                )
+                continue
+
+            expression = self._build_current_geometry_expression(layer)
+            current_expression = symbol_layer.geometryExpression()
+            if current_expression != expression:
+                symbol_layer.setGeometryExpression(expression)
+                layer.triggerRepaint()
+                expressions_updated = True
+
+        return expressions_updated
 
     def update_data_from_wms_header(self, reply):
         """
@@ -1017,41 +1150,16 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         # Update Geometry Generator for Z layers known by this canvas copy.
         # Using self.layers_z avoids relying on provider-side wkb reporting of the copy.
         expressions_updated = False
-        swm_authid = ""
-        if self.layer_swm and self.layer_swm.crs() and self.layer_swm.crs().isValid():
-            swm_authid = self.layer_swm.crs().authid()
 
         for layer in self.layers_z:
             layer.setCustomProperty("swm_trf_wrl2pht", txt_trf_wrl2pht)
             layer.setCustomProperty("swm_trf_pht2prp", txt_trf_pht2prp)
 
-            geometry_input_expr = "$geometry"
-            layer_authid = str(layer.customProperty("swm_source_authid", "")).strip()
-            if not layer_authid:
-                layer_crs = layer.crs()
-                layer_authid = layer_crs.authid() if layer_crs and layer_crs.isValid() else ""
-            if swm_authid and layer_authid and swm_authid != layer_authid:
-                geometry_input_expr = f"transform($geometry,'{layer_authid}','{swm_authid}')"
+        # GeometryGenerator must be updated now that transformation is available.
+        expressions_updated = self._apply_current_transform_to_z_layers()
 
-            # GeometryGenerator must be updated now that transformation is available
-            side = 'left' if self.is_left else 'right'
-            perspective_expr = (f"perspective_swm_transform({geometry_input_expr},'{side}','{self.trf_wld2prp.txt_perspective}','{self.trf_wld2prp.txt_projective}')")
-            expression = perspective_expr
-            if swm_authid and layer_authid and swm_authid != layer_authid:
-                # Return geometry to the layer CRS so QGIS render pipeline transforms it once to canvas CRS.
-                expression = f"transform({perspective_expr},'{swm_authid}','{layer_authid}')"
-            symbol_layer = layer.renderer().symbol().symbolLayer(0)
-            if not isinstance(symbol_layer, QgsGeometryGeneratorSymbolLayer):
-                QgsMessageLog.logMessage(f"Unexpected SymbolLayer type in layer {layer.name()}: {type(symbol_layer)}", "SWM-3D", Qgis.Warning)
-                continue
-            current_expression = symbol_layer.geometryExpression()
-            if current_expression != expression:
-                symbol_layer.setGeometryExpression(expression)
-                layer.triggerRepaint()
-                expressions_updated = True
-
-                # QgsMessageLog.logMessage(f"UPDATE_SWM_HEADER Layer: {layer.name()}-{'LEFT' if self.is_left else 'RIGHT'}.", 
-                #                          "SWM-3D", Qgis.Info)   
+        # QgsMessageLog.logMessage(f"UPDATE_SWM_HEADER Layer: {layer.name()}-{'LEFT' if self.is_left else 'RIGHT'}.", 
+        #                          "SWM-3D", Qgis.Info)
         self.render_complete()
 
         # Ensure first render uses the new expression without waiting for manual pan/zoom.

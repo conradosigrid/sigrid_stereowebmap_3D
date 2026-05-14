@@ -3,18 +3,21 @@ canvas.py
 
 Custom QGIS map canvas for the Sigrid SWM plugin.
 
-This module implements QgsSgdSwmCanvas, a specialized map canvas used for
-stereoscopic visualization. The canvas mirrors the main QGIS canvas and adds:
 
-- Support for left/right stereoscopic views
-- Stereo rendering filters (anaglyph, interlaced, mirror, etc.)
-- Synchronization of extent, layers and cursor with the main canvas
-- Application of perspective transformations to Z-enabled layers
-  using QGIS Geometry Generator expressions
+This module implements QgsSgdSwmCanvas, a specialized canvas class for stereoscopic visualization.
+The mirror canvas synchronizes:
+    - Extent, layers, and cursor with the main canvas
+    - Items of type QgsMapCanvasItem (including standard QgsRubberBand and QgsVertexMarker)
+    - Stereo filters and 3D transformations
 
-The canvas does not handle network requests, WMS headers, or mathematical
-parsing of transformations. Those responsibilities belong to the window
-controller and expression functions.
+Known limitation:
+    - Rubber bands from standard tools (such as Measure) are synchronized and visible in the stereo canvases.
+    - Temporary rubber bands from digitizing tools (polyline, polygon, etc.) are NOT synchronized nor accessible, because QGIS manages them privately inside QgsMapToolCapture and does not expose them as QgsMapCanvasItem in the main scene.
+    - Therefore, the last in-progress segment during digitizing will not be visible in the stereo canvases until the vertex is completed.
+
+This limitation is structural in QGIS and cannot be solved generically or stably without fragile, tool-specific code.
+
+The canvas does not handle network requests, WMS headers, or mathematical transformation parsing; those responsibilities belong to the window controller and expression functions.
 
 QGIS Main Canvas
     ├── mouse (source)
@@ -30,12 +33,13 @@ QgsSgdSwmCanvas (plugin)
 """
 from qgis.core import QgsMessageLog, Qgis  # for debug messages.
 from qgis.gui import QgsMapCanvas, QgsVertexMarker, QgsRubberBand, QgsMapCanvasItem
-from qgis.core import QgsWkbTypes, QgsGeometry, QgsRasterLayer, QgsVectorLayer, QgsPoint, QgsPointXY
+from qgis.core import QgsWkbTypes, QgsGeometry, QgsRasterLayer, QgsVectorLayer, QgsPoint, QgsPointXY, QgsFeatureRequest
 from qgis.core import QgsSymbol, QgsSingleSymbolRenderer, QgsGeometryGeneratorSymbolLayer
 from qgis.core import QgsCoordinateTransform, QgsCoordinateReferenceSystem, QgsProject
 from qgis.PyQt.QtGui import QColor, QWheelEvent, QImage, QPainter
 from qgis.PyQt.QtCore import Qt
-from typing import Optional, Any, Dict, List
+from typing import Optional, Any, Dict, List, Tuple
+import hashlib
 
 import re
 import math
@@ -47,6 +51,7 @@ from .expressions.perspective_swm_transform import read_perspective, read_projec
 
 
 # Class Sigrid SWM slave (mirrored) canvas transformed from the main QGIS canvas
+
 class QgsSgdSwmCanvas(QgsMapCanvas):
     FILTER_NONE = 0
     FILTER_RED = 1
@@ -76,9 +81,14 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         self.synced_items: Dict[QgsMapCanvasItem, QgsMapCanvasItem] = {}  # main_item -> synced_item
         self.geometry_cache: Dict[QgsMapCanvasItem, str] = {}  # rubber_band -> geometry_wkt to avoid duplicates
         self.sync_in_progress = False  # Prevent concurrent synchronizations
-        
-        # Parallel Z-tracking system - "twin object" for incremental Z capture
-        self.rubber_band_z_tracker: Dict[QgsRubberBand, List[float]] = {}  # rubber_band -> [z1, z2, z3, ...]
+        # Per-rubber-band fixed-vertex Z values for stereo visualization.
+        # The dynamic last vertex (if any) uses current cursor Z.
+        self.rubber_band_fixed_z: Dict[QgsMapCanvasItem, List[float]] = {}
+        self.rubber_band_last_dynamic_z: Dict[QgsMapCanvasItem, float] = {}
+        self.rubber_band_z_by_geom_hash: Dict[str, List[float]] = {}
+        self.vertex_marker_fixed_z: Dict[QgsMapCanvasItem, float] = {}
+        self.vertex_marker_last_center: Dict[QgsMapCanvasItem, QgsPointXY] = {}
+        self.vertex_marker_rb_match: Dict[QgsMapCanvasItem, Tuple[QgsRubberBand, int]] = {}
         
         self._setup_canvas_items_sync()
 
@@ -143,7 +153,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             if hasattr(scene, 'changed'):
                 scene.changed.connect(self._on_scene_changed)
         
-        QgsMessageLog.logMessage(f"SYNC: Signal-based synchronization configured for {'LEFT' if self.is_left else 'RIGHT'} canvas", "SWM-3D", Qgis.Info)
+        # Startup sync configured.
 
     def _on_scene_changed(self, regions):
         """
@@ -169,6 +179,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 return
                 
             main_items = self._get_canvas_items(self.qgis_main_canvas)
+            main_items.sort(key=self._canvas_item_sync_priority)
             current_main_items = set(main_items)
             synced_main_items = set(self.synced_items.keys())
             
@@ -186,15 +197,19 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                     # Clear geometry cache for removed rubber bands
                     if main_item in self.geometry_cache:
                         del self.geometry_cache[main_item]
+
+                    if main_item in self.rubber_band_fixed_z:
+                        del self.rubber_band_fixed_z[main_item]
+                    if main_item in self.rubber_band_last_dynamic_z:
+                        del self.rubber_band_last_dynamic_z[main_item]
+                    if main_item in self.vertex_marker_fixed_z:
+                        del self.vertex_marker_fixed_z[main_item]
+                    if main_item in self.vertex_marker_last_center:
+                        del self.vertex_marker_last_center[main_item]
+                    if main_item in self.vertex_marker_rb_match:
+                        del self.vertex_marker_rb_match[main_item]
                         
-                    # Clear Z tracker for removed rubber bands
-                    if isinstance(main_item, QgsRubberBand) and main_item in self.rubber_band_z_tracker:
-                        tracked_z_count = len(self.rubber_band_z_tracker[main_item])
-                        del self.rubber_band_z_tracker[main_item]
-                        QgsMessageLog.logMessage(
-                            f"Z-TRACKER: Rubber band removed -> cleared {tracked_z_count} Z values", 
-                            "SWM-3D", Qgis.Info
-                        )
+
             
             # Add or update existing items
             for main_item in main_items:
@@ -213,6 +228,17 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                                    "SWM-3D", Qgis.Warning)
         finally:
             self.sync_in_progress = False
+
+    def _canvas_item_sync_priority(self, item: QgsMapCanvasItem) -> int:
+        """
+        Synchronization order: rubber bands first, then vertex markers, then the rest.
+        This guarantees marker Z lookup can use up-to-date tracked rubber-band vertices.
+        """
+        if isinstance(item, QgsRubberBand):
+            return 0
+        if isinstance(item, QgsVertexMarker):
+            return 1
+        return 2
 
     def _get_world_crs(self) -> Optional[QgsCoordinateReferenceSystem]:
         """
@@ -260,7 +286,24 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
 
             trf = QgsCoordinateTransform(source_crs, world_crs, QgsProject.instance())
             transformed = QgsGeometry(geom)
+            source_z_values: List[float] = []
+            const_geom = geom.constGet()
+            if const_geom:
+                for i in range(const_geom.vertexCount()):
+                    source_z_values.append(float(geom.vertexAt(i).z()))
+
             if transformed.transform(trf) == 0:
+                # QGIS CRS transforms can flatten Z on temporary geometries.
+                # Re-attach the original per-vertex Z values so downstream 3D projection
+                # always receives the same Z that was already captured for each vertex.
+                if source_z_values:
+                    transformed_const = transformed.constGet()
+                    if transformed_const:
+                        for i in range(min(len(source_z_values), transformed_const.vertexCount())):
+                            v = transformed.vertexAt(i)
+                            if math.isfinite(source_z_values[i]):
+                                v.setZ(source_z_values[i])
+                                transformed.moveVertex(v, i)
                 return transformed
             return geom
         except Exception as e:
@@ -334,7 +377,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
 
             else:
                 # For other item types, specific update logic can be added here
-                QgsMessageLog.logMessage(f"Unmannaged item type for synchronization: {type(main_item)}", 
+                QgsMessageLog.logMessage(f"Unmanaged item type for synchronization: {type(main_item)}", 
                         "SWM-3D", Qgis.Warning)    
                 
             # Update visibility
@@ -387,11 +430,15 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             # Copy and transform position
             center = source.center()
             if center and self.trf_wld2prp:
+                matched_center = self._get_vertex_marker_center_from_synced_rubber_band(source, QgsPointXY(center.x(), center.y()))
+                if matched_center is not None:
+                    target.setCenter(matched_center)
+                    return
+
                 # Apply 3D transformation if available
-                z = self.parent.z_cursor if self.parent else 0
+                z = self._resolve_vertex_marker_z(source, center)
                 center_wrl = self._reproject_point_to_world(QgsPointXY(center.x(), center.y()))
-                pnt_wrl = QgsPoint(center_wrl.x(), center_wrl.y(), z)
-                pnt_prj = self.trf_wld2prp.execute_wrl2prp(pnt_wrl)
+                pnt_prj = self._project_world_point_with_expression_math(center_wrl.x(), center_wrl.y(), z)
                 if pnt_prj:
                     # Apply dynamic center-of-vertex offset based on symbol size
                     # Offset is proportional to half the symbol width
@@ -411,10 +458,253 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             QgsMessageLog.logMessage(f"Error synchronizing vertex marker: {str(e)}", 
                                    "SWM-3D", Qgis.Warning)
 
+    def _get_vertex_marker_center_from_synced_rubber_band(self, source_marker: QgsVertexMarker, center: QgsPointXY) -> Optional[QgsPointXY]:
+        """
+        Deterministic marker placement: if a marker matches a fixed rubber-band vertex,
+        return the already-transformed vertex position from the synced rubber band.
+        """
+        try:
+            match = self._match_vertex_marker_to_rubber_band_vertex(source_marker, center)
+            if not match:
+                return None
+
+            rb_source, idx = match
+            rb_synced = self.synced_items.get(rb_source)
+            if not isinstance(rb_synced, QgsRubberBand):
+                return None
+
+            geom_synced = rb_synced.asGeometry()
+            if not geom_synced or geom_synced.isEmpty():
+                return None
+            const_geom = geom_synced.constGet()
+            if not const_geom or idx < 0 or idx >= const_geom.vertexCount():
+                return None
+
+            v = geom_synced.vertexAt(idx)
+            return QgsPointXY(v.x(), v.y())
+        except Exception:
+            return None
+
+    def _match_vertex_marker_to_rubber_band_vertex(self, source_marker: QgsVertexMarker, center: QgsPointXY) -> Optional[Tuple[QgsRubberBand, int]]:
+        """
+        Finds/validates stable match of marker XY to fixed rubber-band vertex index.
+        """
+        try:
+            if not self.qgis_main_canvas:
+                return None
+
+            tol = max(float(self.qgis_main_canvas.mapUnitsPerPixel()) * 10.0, 1e-7)
+            tol2 = tol * tol
+
+            existing = self.vertex_marker_rb_match.get(source_marker)
+            if existing:
+                rb_item, idx = existing
+                fixed_z = self.rubber_band_fixed_z.get(rb_item)
+                geom = rb_item.asGeometry() if isinstance(rb_item, QgsRubberBand) else None
+                if not geom or geom.isEmpty():
+                    geom = None
+                const_geom = geom.constGet() if geom and not geom.isEmpty() else None
+                if fixed_z and geom and const_geom and idx < min(len(fixed_z), const_geom.vertexCount()):
+                    v = geom.vertexAt(idx)
+                    dx = v.x() - center.x()
+                    dy = v.y() - center.y()
+                    if (dx * dx + dy * dy) <= (tol2 * 4.0):
+                        return (rb_item, idx)
+
+            best_d2 = float('inf')
+            best_match: Optional[Tuple[QgsRubberBand, int]] = None
+
+            for rb_item, fixed_z in self.rubber_band_fixed_z.items():
+                if not isinstance(rb_item, QgsRubberBand) or not fixed_z:
+                    continue
+                geom = rb_item.asGeometry()
+                if not geom or geom.isEmpty():
+                    continue
+                const_geom = geom.constGet()
+                if not const_geom:
+                    continue
+
+                fixed_count = min(len(fixed_z), const_geom.vertexCount())
+                for i in range(fixed_count):
+                    v = geom.vertexAt(i)
+                    dx = v.x() - center.x()
+                    dy = v.y() - center.y()
+                    d2 = dx * dx + dy * dy
+                    if d2 < best_d2:
+                        best_d2 = d2
+                        best_match = (rb_item, i)
+
+            if best_match and best_d2 <= tol2:
+                self.vertex_marker_rb_match[source_marker] = best_match
+                return best_match
+
+            return None
+        except Exception:
+            return None
+
+    def _project_world_point_with_expression_math(self, x: float, y: float, z: float) -> Optional[QgsPointXY]:
+        """
+        Projects one world XYZ point using the same math path as geometry transformation.
+        This avoids divergence between marker and rubber-band projection routes.
+        """
+        try:
+            if not self.trf_wld2prp:
+                return None
+
+            x0, y0, z0, df, r = read_perspective(self.trf_wld2prp.txt_perspective)
+            a, b, c = read_projective(self.trf_wld2prp.txt_projective)
+
+            photo = world_to_photo(x, y, z, x0, y0, z0, df, r)
+            if not photo:
+                return None
+            proj = photo_to_proj(photo[0], photo[1], a, b, c)
+            if not proj:
+                return None
+            return QgsPointXY(proj[0], proj[1])
+        except Exception:
+            return None
+
+    def _resolve_vertex_marker_z(self, source: QgsVertexMarker, center: QgsPointXY) -> float:
+        """
+        Resolves a stable Z for tool-generated vertex markers.
+        Clicked vertices keep their capture-time Z instead of following cursor Z.
+        """
+        try:
+            matched_z = self._resolve_vertex_marker_z_from_rubber_band(source, center)
+            if matched_z is not None:
+                self.vertex_marker_fixed_z[source] = float(matched_z)
+                self.vertex_marker_last_center[source] = QgsPointXY(center.x(), center.y())
+                return float(matched_z)
+
+            rb_z = self._get_marker_z_from_tracked_rubber_band(center)
+            if rb_z is not None:
+                self.vertex_marker_fixed_z[source] = float(rb_z)
+                self.vertex_marker_last_center[source] = QgsPointXY(center.x(), center.y())
+                return float(rb_z)
+
+            # If center has changed, treat as new marker position and refresh fixed Z.
+            previous_center = self.vertex_marker_last_center.get(source)
+            moved = True
+            if previous_center is not None:
+                dx = center.x() - previous_center.x()
+                dy = center.y() - previous_center.y()
+                moved = (dx * dx + dy * dy) > 1e-18
+
+            if moved or source not in self.vertex_marker_fixed_z:
+                new_z = float(getattr(self.parent, 'z_cursor', 0.0)) if self.parent else 0.0
+                self.vertex_marker_fixed_z[source] = new_z
+                self.vertex_marker_last_center[source] = QgsPointXY(center.x(), center.y())
+
+            return float(self.vertex_marker_fixed_z.get(source, 0.0))
+        except Exception:
+            return float(getattr(self.parent, 'z_cursor', 0.0)) if self.parent else 0.0
+
+    def _resolve_vertex_marker_z_from_rubber_band(self, source: QgsVertexMarker, center: QgsPointXY) -> Optional[float]:
+        """
+        Stable marker-to-rubber-band matching by geometry (no timing).
+        Each marker is matched to a fixed rubber-band vertex index and reuses its Z.
+        """
+        try:
+            if not self.qgis_main_canvas:
+                return None
+
+            tol = max(float(self.qgis_main_canvas.mapUnitsPerPixel()) * 10.0, 1e-7)
+            tol2 = tol * tol
+
+            # Reuse existing match when still valid.
+            existing = self.vertex_marker_rb_match.get(source)
+            if existing:
+                rb_item, idx = existing
+                fixed_z = self.rubber_band_fixed_z.get(rb_item)
+                if fixed_z and idx < len(fixed_z):
+                    geom = rb_item.asGeometry()
+                    if geom and not geom.isEmpty():
+                        const_geom = geom.constGet()
+                        if const_geom and idx < const_geom.vertexCount():
+                            v = geom.vertexAt(idx)
+                            dx = v.x() - center.x()
+                            dy = v.y() - center.y()
+                            if (dx * dx + dy * dy) <= (tol2 * 4.0):
+                                return float(fixed_z[idx])
+
+            # Find best new match among all fixed rubber-band vertices.
+            best_d2 = float('inf')
+            best_rb: Optional[QgsRubberBand] = None
+            best_idx = -1
+            best_z: Optional[float] = None
+
+            for rb_item, fixed_z in self.rubber_band_fixed_z.items():
+                if not isinstance(rb_item, QgsRubberBand) or not fixed_z:
+                    continue
+                geom = rb_item.asGeometry()
+                if not geom or geom.isEmpty():
+                    continue
+                const_geom = geom.constGet()
+                if not const_geom:
+                    continue
+
+                fixed_count = min(len(fixed_z), const_geom.vertexCount())
+                for i in range(fixed_count):
+                    v = geom.vertexAt(i)
+                    dx = v.x() - center.x()
+                    dy = v.y() - center.y()
+                    d2 = dx * dx + dy * dy
+                    if d2 < best_d2:
+                        best_d2 = d2
+                        best_rb = rb_item
+                        best_idx = i
+                        best_z = float(fixed_z[i])
+
+            if best_rb is not None and best_idx >= 0 and best_z is not None and best_d2 <= tol2:
+                self.vertex_marker_rb_match[source] = (best_rb, best_idx)
+                return best_z
+
+            return None
+        except Exception:
+            return None
+
+    def _get_marker_z_from_tracked_rubber_band(self, center: QgsPointXY) -> Optional[float]:
+        """
+        Returns Z from the nearest fixed rubber-band vertex that matches marker XY.
+        """
+        try:
+            if not self.qgis_main_canvas:
+                return None
+
+            tol = max(float(self.qgis_main_canvas.mapUnitsPerPixel()) * 6.0, 1e-7)
+            tol2 = tol * tol
+            best_d2 = float('inf')
+            best_z: Optional[float] = None
+
+            for rb_item, fixed_z in self.rubber_band_fixed_z.items():
+                if not isinstance(rb_item, QgsRubberBand) or not fixed_z:
+                    continue
+
+                geom = rb_item.asGeometry()
+                if not geom or geom.isEmpty():
+                    continue
+
+                const_geom = geom.constGet()
+                if not const_geom:
+                    continue
+
+                fixed_count = min(len(fixed_z), const_geom.vertexCount())
+                for i in range(fixed_count):
+                    v = geom.vertexAt(i)
+                    dx = v.x() - center.x()
+                    dy = v.y() - center.y()
+                    d2 = dx * dx + dy * dy
+                    if d2 <= tol2 and d2 < best_d2:
+                        best_d2 = d2
+                        best_z = float(fixed_z[i])
+
+            return best_z
+        except Exception:
+            return None
+
     def _sync_rubber_band_properties(self, source: QgsRubberBand, target: QgsRubberBand):
         """
-        Synchronizes QgsRubberBand properties using a parallel Z-tracking system.
-        Captures incremental Z from the cursor and stores it in a "twin object".
+        Synchronizes QgsRubberBand properties and geometry.
         """
         try:
             # Copy style properties
@@ -429,185 +719,189 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             if hasattr(source, 'width'):
                 target.setWidth(source.width())
             
-            # Copy geometry using parallel Z tracking
+            # Copy geometry
             geom = source.asGeometry()
             if geom and not geom.isEmpty():
-                # Z-TRACKING SYSTEM: detect changes and capture cursor Z
-                self._track_rubber_band_z_changes(source, geom)
-                
-                # Apply tracked Z for stereo-canvas visualization
-                geom_with_tracked_z = self._apply_tracked_z_to_geometry(geom, source)
-                geom_world = self._reproject_geometry_to_world(geom_with_tracked_z)
+                geom_for_render = QgsGeometry(geom)
+                const_geom = geom_for_render.constGet()
+                if const_geom:
+                    vertex_count = const_geom.vertexCount()
+                    if vertex_count > 0 and self.parent:
+                        cursor_z = float(getattr(self.parent, 'z_cursor', 0.0))
+                        dynamic_last = self._rubber_band_has_dynamic_last_vertex(geom_for_render)
+                        fixed_vertex_count = vertex_count - 1 if (dynamic_last and vertex_count > 1) else vertex_count
+
+                        tracked_fixed_z = self.rubber_band_fixed_z.setdefault(source, [])
+
+                        # Trim tracker if geometry shrank.
+                        if len(tracked_fixed_z) > fixed_vertex_count:
+                            tracked_fixed_z[:] = tracked_fixed_z[:fixed_vertex_count]
+
+                        # Capture Z for newly fixed vertices only.
+                        while len(tracked_fixed_z) < fixed_vertex_count:
+                            new_idx = len(tracked_fixed_z)
+                            pending_click_z = self._get_pending_click_z_for_vertex(new_idx)
+                            src_v = geom.vertexAt(new_idx)
+                            src_z = src_v.z()
+                            if pending_click_z is not None:
+                                tracked_fixed_z.append(float(pending_click_z))
+                            elif math.isfinite(src_z) and abs(src_z) > 1e-9:
+                                tracked_fixed_z.append(float(src_z))
+                            elif new_idx > 0 and source in self.rubber_band_last_dynamic_z:
+                                tracked_fixed_z.append(float(self.rubber_band_last_dynamic_z[source]))
+                            else:
+                                tracked_fixed_z.append(cursor_z)
+
+                        # Apply fixed-vertex Z values.
+                        for i in range(min(fixed_vertex_count, len(tracked_fixed_z))):
+                            v = geom_for_render.vertexAt(i)
+                            if v.z() != tracked_fixed_z[i]:
+                                v.setZ(tracked_fixed_z[i])
+                                geom_for_render.moveVertex(v, i)
+
+                        # Keep the in-progress endpoint attached to current cursor Z.
+                        if dynamic_last and vertex_count > 1:
+                            last_idx = vertex_count - 1
+                            v_last = geom_for_render.vertexAt(last_idx)
+                            if v_last.z() != cursor_z:
+                                v_last.setZ(cursor_z)
+                                geom_for_render.moveVertex(v_last, last_idx)
+                            self.rubber_band_last_dynamic_z[source] = cursor_z
+
+                        # Publish fixed Z snapshot by geometry hash for final feature interception.
+                        if not dynamic_last and fixed_vertex_count > 0:
+                            geom_hash = self._geom_xy_hash(geom_for_render)
+                            if geom_hash:
+                                self.rubber_band_z_by_geom_hash[geom_hash] = tracked_fixed_z[:fixed_vertex_count].copy()
+                                if len(self.rubber_band_z_by_geom_hash) > 256:
+                                    oldest_key = next(iter(self.rubber_band_z_by_geom_hash.keys()))
+                                    del self.rubber_band_z_by_geom_hash[oldest_key]
+
+                geom_world = self._reproject_geometry_to_world(geom_for_render)
                 
                 if self.trf_wld2prp:
-                    # Apply 3D transformation with tracked Z, same logic as expressions
                     transformed_geom = self._transform_geometry(geom_world, source)
                     if transformed_geom:
                         target.setToGeometry(transformed_geom, None)
                     else:
                         target.setToGeometry(geom_world, None)
                 else:
-                    target.setToGeometry(geom_with_tracked_z, None)
+                    target.setToGeometry(geom_world, None)
             
         except Exception as e:
             QgsMessageLog.logMessage(f"Error synchronizing rubber band: {str(e)}", 
                                    "SWM-3D", Qgis.Warning)
 
-    def _track_rubber_band_z_changes(self, rubber_band: QgsRubberBand, current_geom: QgsGeometry):
+    def _get_pending_click_z_for_vertex(self, vertex_index: int) -> Optional[float]:
         """
-        Parallel Z-tracking system - "twin object" for incremental capture.
-        Detects rubber band changes and captures cursor Z per vertex.
-        """
-        try:
-            if not self.parent:
-                return
-                
-            # Get current vertex count
-            const_geom = current_geom.constGet()
-            if not const_geom:
-                return
-                
-            current_vertex_count = const_geom.vertexCount()
-            
-            # Get current cursor Z
-            cursor_z = getattr(self.parent, 'z_cursor', 0.0)
-            
-            # Initialize tracker for a new rubber band
-            if rubber_band not in self.rubber_band_z_tracker:
-                self.rubber_band_z_tracker[rubber_band] = []
-                QgsMessageLog.logMessage(
-                    f"Z-TRACKER: New rubber band detected (cursor Z: {cursor_z})", 
-                    "SWM-3D", Qgis.Info
-                )
-            
-            # Get stored Z values for this rubber band
-            tracked_z_list = self.rubber_band_z_tracker[rubber_band]
-            
-            # More vertices than tracked Z values -> new vertices were added
-            if current_vertex_count > len(tracked_z_list):
-                new_vertices_count = current_vertex_count - len(tracked_z_list)
-                
-                # Capture current cursor Z for new vertices
-                for i in range(new_vertices_count):
-                    tracked_z_list.append(cursor_z)
-                
-                QgsMessageLog.logMessage(
-                    f"Z-TRACKER: {new_vertices_count} new vertices -> Z={cursor_z} "
-                    f"(total: {len(tracked_z_list)} Z's)", 
-                    "SWM-3D", Qgis.Warning
-                )
-                
-            # Fewer vertices -> rubber band was reduced (undo, etc.)
-            elif current_vertex_count < len(tracked_z_list):
-                # Trim Z list to match current vertex count
-                tracked_z_list[:] = tracked_z_list[:current_vertex_count]
-                
-                QgsMessageLog.logMessage(
-                    f"Z-TRACKER: Rubber band reduced to {current_vertex_count} vertices "
-                    f"(Z's: {len(tracked_z_list)})", 
-                    "SWM-3D", Qgis.Info
-                )
-                
-        except Exception as e:
-            QgsMessageLog.logMessage(f"Error tracking Z changes: {str(e)}", "SWM-3D", Qgis.Warning)
-
-    def _apply_tracked_z_to_geometry(self, geom: QgsGeometry, rubber_band: QgsRubberBand) -> QgsGeometry:
-        """
-        Applies parallel tracker Z values to geometry for visualization.
-        Uses incrementally captured Z values, not the current cursor Z.
+        Returns the recorded cursor Z for the given vertex index of the active digitizing layer.
+        This improves rubber-band rendering so fixed vertices keep their click-time Z.
         """
         try:
-            # If no tracked Z values exist for this rubber band, return unchanged
-            if rubber_band not in self.rubber_band_z_tracker:
-                return geom
-                
-            tracked_z_list = self.rubber_band_z_tracker[rubber_band]
-            if not tracked_z_list:
-                return geom
-            
-            # Create new geometry with tracker Z values
-            new_geom = QgsGeometry(geom)
-            const_geom = new_geom.constGet()
-            if not const_geom:
-                return geom
-            
-            vertex_count = const_geom.vertexCount()
-            applied_count = 0
-            
-            # Apply tracker Z values to each vertex
-            for i in range(vertex_count):
-                if i < len(tracked_z_list):
-                    vertex = new_geom.vertexAt(i)
-                    tracked_z = tracked_z_list[i]
-                    
-                    if vertex.z() != tracked_z:
-                        vertex.setZ(tracked_z)
-                        new_geom.moveVertex(vertex, i)
-                        applied_count += 1
-            
-            if applied_count > 0:
-                z_summary = ", ".join([f"{z:.1f}" for z in tracked_z_list[:3]])  # First 3 Z values
-                if len(tracked_z_list) > 3:
-                    z_summary += "..."
-                    
-                QgsMessageLog.logMessage(
-                    f"Z-TRACKER: Applied tracked Z values [{z_summary}] to {applied_count} vertices", 
-                    "SWM-3D", Qgis.Info
-                )
-            
-            return new_geom
-            
-        except Exception as e:
-            QgsMessageLog.logMessage(f"Error applying tracked Z values: {str(e)}", "SWM-3D", Qgis.Warning)
-            return geom
+            if not self.parent or not hasattr(self.parent, 'iface'):
+                return None
+            iface = self.parent.iface
+            if not iface or not hasattr(iface, 'activeLayer'):
+                return None
+            active_layer = iface.activeLayer()
+            if not active_layer:
+                return None
+            layer_id = active_layer.id() if hasattr(active_layer, 'id') else None
+            if not layer_id:
+                return None
 
-    def get_rubber_band_tracked_z(self, rubber_band: QgsRubberBand) -> List[float]:
+            pending_by_layer = getattr(self.parent, '_pending_digitize_z_clicks', None)
+            if not isinstance(pending_by_layer, dict):
+                return None
+            pending = pending_by_layer.get(layer_id)
+            if not isinstance(pending, list):
+                return None
+            if vertex_index < 0 or vertex_index >= len(pending):
+                return None
+
+            z_val = pending[vertex_index]
+            return float(z_val) if math.isfinite(float(z_val)) else None
+        except Exception:
+            return None
+
+    def _rubber_band_has_dynamic_last_vertex(self, geom: QgsGeometry) -> bool:
         """
-        Public method to get captured Z values for a specific rubber band.
-        Useful when applying Z values after finishing vector-layer digitizing.
-        
-        Returns:
-            List[float]: Captured Z values by vertex, or an empty list if not tracked
+        Heuristic for map-tool rubber bands (e.g., Measure):
+        if last vertex is at current mouse map position, treat it as dynamic endpoint.
         """
-        if rubber_band in self.rubber_band_z_tracker:
-            return self.rubber_band_z_tracker[rubber_band].copy()  # Return a copy for safety
-        return []
-    
-    def clear_rubber_band_tracked_z(self, rubber_band: QgsRubberBand) -> bool:
+        try:
+            if not self.qgis_main_canvas:
+                return False
+            const_geom = geom.constGet()
+            if not const_geom or const_geom.vertexCount() < 2:
+                return False
+
+            last_idx = const_geom.vertexCount() - 1
+            last_v = geom.vertexAt(last_idx)
+
+            mouse_px = self.qgis_main_canvas.mouseLastXY()
+            mouse_map = self.qgis_main_canvas.getCoordinateTransform().toMapCoordinates(mouse_px)
+
+            dx = last_v.x() - mouse_map.x()
+            dy = last_v.y() - mouse_map.y()
+            # Tolerance tied to canvas scale: ~4 screen pixels in map units.
+            tol = max(float(self.qgis_main_canvas.mapUnitsPerPixel()) * 4.0, 1e-6)
+            return (dx * dx + dy * dy) <= (tol * tol)
+        except Exception:
+            return False
+
+    def _geom_xy_hash(self, geom: QgsGeometry) -> str:
         """
-        Clears tracked Z values for a specific rubber band.
-        Useful after applying those Z values to final geometry.
-        
-        Returns:
-            bool: True if tracker was found and cleared, False if it did not exist
+        Stable XY hash for vertex sequence (ignores Z).
         """
-        if rubber_band in self.rubber_band_z_tracker:
-            z_count = len(self.rubber_band_z_tracker[rubber_band])
-            del self.rubber_band_z_tracker[rubber_band]
-            QgsMessageLog.logMessage(
-                f"Z-TRACKER: Tracker manually cleared with {z_count} Z values", 
-                "SWM-3D", Qgis.Info
-            )
-            return True
-        return False
+        try:
+            if not geom or geom.isEmpty():
+                return ""
+            const_geom = geom.constGet()
+            if not const_geom:
+                return ""
+            parts = []
+            for i in range(const_geom.vertexCount()):
+                v = geom.vertexAt(i)
+                parts.append(f"{v.x():.8f},{v.y():.8f}")
+            key = ";".join(parts)
+            return hashlib.sha1(key.encode("utf-8")).hexdigest()
+        except Exception:
+            return ""
+
+    def get_tracked_z_for_geometry(self, geom: QgsGeometry) -> List[float]:
+        """
+        Returns tracked fixed Z list for a geometry XY signature, if available.
+        """
+        geom_hash = self._geom_xy_hash(geom)
+        if not geom_hash:
+            return []
+        z_vals = self.rubber_band_z_by_geom_hash.get(geom_hash)
+        return z_vals.copy() if z_vals else []
 
     def _transform_geometry(self, geom: QgsGeometry, source_rubber_band: QgsRubberBand) -> Optional[QgsGeometry]:
         """
         Transforms geometry using the 3D perspective projection.
         Uses the same math functions from the expressions module (perspective_swm_transform),
         including the parameter-parsing cache.
-        Input geometry must already contain assigned Z values (from the Z-tracker).
+        Input geometry must already contain assigned Z values.
         """
         try:
             if not self.trf_wld2prp or not geom or geom.isEmpty():
                 return geom
 
-            # Geometry cache: avoid reprocessing unchanged geometry
+            # Geometry cache: include dynamic Z state because rubber-band geometry is often 2D.
+            tracked_fixed = self.rubber_band_fixed_z.get(source_rubber_band, [])
+            cursor_z = float(getattr(self.parent, 'z_cursor', 0.0)) if self.parent else 0.0
             current_wkt = geom.asWkt()
+            z_signature = ",".join(f"{z:.6f}" for z in tracked_fixed)
+            cache_key = f"{current_wkt}|{cursor_z:.6f}|{z_signature}"
             if source_rubber_band in self.geometry_cache:
-                if self.geometry_cache[source_rubber_band] == current_wkt:
-                    return geom
-            self.geometry_cache[source_rubber_band] = current_wkt
+                if self.geometry_cache[source_rubber_band] == cache_key:
+                    # Important: never return raw input geometry on cache hit.
+                    # During digitizing refreshes this would bypass 3D projection and flatten to plane.
+                    pass
+            self.geometry_cache[source_rubber_band] = cache_key
 
             # Transformation parameters with module-level internal cache
             x0, y0, z0, df, r = read_perspective(self.trf_wld2prp.txt_perspective)
@@ -615,31 +909,72 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
 
             gtype = QgsWkbTypes.geometryType(geom.wkbType())
 
-            # ---- Point ----
+            # ---- Point / MultiPoint ----
             if gtype == QgsWkbTypes.PointGeometry:
-                p = next(geom.vertices(), None)
-                if p is None:
+                transformed_points = []
+                const_geom = geom.constGet()
+                if const_geom is None:
                     return geom
-                z = p.z()
-                if not math.isfinite(z):
-                    return geom
-                res = world_to_photo(p.x(), p.y(), z, x0, y0, z0, df, r)
-                if not res:
-                    return geom
-                res = photo_to_proj(res[0], res[1], a, b, c)
-                if not res:
-                    return geom
-                return QgsGeometry.fromPointXY(QgsPointXY(res[0], res[1]))
+                vertex_index = 0
+                for i in range(const_geom.vertexCount()):
+                    p = geom.vertexAt(i)
+                    z = self._resolve_rubber_band_vertex_z(source_rubber_band, vertex_index, p.z())
+                    vertex_index += 1
+                    if not math.isfinite(z):
+                        continue
+                    res = world_to_photo(p.x(), p.y(), z, x0, y0, z0, df, r)
+                    if not res:
+                        continue
+                    res = photo_to_proj(res[0], res[1], a, b, c)
+                    if not res:
+                        continue
+                    transformed_points.append(QgsPointXY(res[0], res[1]))
 
-            # ---- Line ----
+                if not transformed_points:
+                    return geom
+
+                if QgsWkbTypes.isMultiType(geom.wkbType()) or len(transformed_points) > 1:
+                    return QgsGeometry.fromMultiPointXY(transformed_points)
+
+                return QgsGeometry.fromPointXY(transformed_points[0])
+
+            # ---- Line / MultiLine ----
             elif gtype == QgsWkbTypes.LineGeometry:
+                if QgsWkbTypes.isMultiType(geom.wkbType()):
+                    # Keep each line part independent to avoid bridges between parts.
+                    transformed_multi = []
+                    source_multi = geom.asMultiPolyline()
+                    vertex_index = 0
+                    for line in source_multi:
+                        transformed_line = []
+                        for p in line:
+                            z = self._resolve_rubber_band_vertex_z(source_rubber_band, vertex_index, float("nan"))
+                            vertex_index += 1
+                            if not math.isfinite(z):
+                                continue
+                            res = world_to_photo(p.x(), p.y(), z, x0, y0, z0, df, r)
+                            if not res:
+                                continue
+                            res = photo_to_proj(res[0], res[1], a, b, c)
+                            if not res:
+                                continue
+                            transformed_line.append(QgsPointXY(res[0], res[1]))
+                        if len(transformed_line) >= 2:
+                            transformed_multi.append(transformed_line)
+
+                    if not transformed_multi:
+                        return geom
+                    return QgsGeometry.fromMultiPolylineXY(transformed_multi)
+
                 new_line = []
                 const_geom = geom.constGet()
                 if const_geom is None:
                     return geom
+                vertex_index = 0
                 for i in range(const_geom.vertexCount()):
                     p = geom.vertexAt(i)
-                    z = p.z()
+                    z = self._resolve_rubber_band_vertex_z(source_rubber_band, vertex_index, p.z())
+                    vertex_index += 1
                     if not math.isfinite(z):
                         continue
                     res = world_to_photo(p.x(), p.y(), z, x0, y0, z0, df, r)
@@ -653,35 +988,93 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                     return geom
                 return QgsGeometry.fromPolylineXY(new_line)
 
-            # ---- Polygon ----
+            # ---- Polygon / MultiPolygon ----
             elif gtype == QgsWkbTypes.PolygonGeometry:
-                ring = []
-                const_geom = geom.constGet()
-                if const_geom is None:
+                if QgsWkbTypes.isMultiType(geom.wkbType()):
+                    # Preserve polygon and ring boundaries; flattening vertices would join parts.
+                    transformed_multi = []
+                    source_multi = geom.asMultiPolygon()
+                    vertex_index = 0
+                    for polygon in source_multi:
+                        transformed_polygon = []
+                        for ring in polygon:
+                            transformed_ring = []
+                            for p in ring:
+                                z = self._resolve_rubber_band_vertex_z(source_rubber_band, vertex_index, float("nan"))
+                                vertex_index += 1
+                                if not math.isfinite(z):
+                                    continue
+                                res = world_to_photo(p.x(), p.y(), z, x0, y0, z0, df, r)
+                                if not res:
+                                    continue
+                                res = photo_to_proj(res[0], res[1], a, b, c)
+                                if not res:
+                                    continue
+                                transformed_ring.append(QgsPointXY(res[0], res[1]))
+
+                            if len(transformed_ring) >= 3 and transformed_ring[0] != transformed_ring[-1]:
+                                transformed_ring.append(transformed_ring[0])
+                            if len(transformed_ring) >= 4:
+                                transformed_polygon.append(transformed_ring)
+
+                        if transformed_polygon:
+                            transformed_multi.append(transformed_polygon)
+
+                    if not transformed_multi:
+                        return geom
+                    return QgsGeometry.fromMultiPolygonXY(transformed_multi)
+
+                transformed_polygon = []
+                source_polygon = geom.asPolygon()
+                vertex_index = 0
+                for ring in source_polygon:
+                    transformed_ring = []
+                    for p in ring:
+                        z = self._resolve_rubber_band_vertex_z(source_rubber_band, vertex_index, float("nan"))
+                        vertex_index += 1
+                        if not math.isfinite(z):
+                            continue
+                        res = world_to_photo(p.x(), p.y(), z, x0, y0, z0, df, r)
+                        if not res:
+                            continue
+                        res = photo_to_proj(res[0], res[1], a, b, c)
+                        if not res:
+                            continue
+                        transformed_ring.append(QgsPointXY(res[0], res[1]))
+
+                    if len(transformed_ring) >= 3 and transformed_ring[0] != transformed_ring[-1]:
+                        transformed_ring.append(transformed_ring[0])
+                    if len(transformed_ring) >= 4:
+                        transformed_polygon.append(transformed_ring)
+
+                if not transformed_polygon:
                     return geom
-                for i in range(const_geom.vertexCount()):
-                    p = geom.vertexAt(i)
-                    z = p.z()
-                    if not math.isfinite(z):
-                        continue
-                    res = world_to_photo(p.x(), p.y(), z, x0, y0, z0, df, r)
-                    if not res:
-                        continue
-                    res = photo_to_proj(res[0], res[1], a, b, c)
-                    if not res:
-                        continue
-                    ring.append(QgsPointXY(res[0], res[1]))
-                if len(ring) < 3:
-                    return geom
-                if ring[0] != ring[-1]:
-                    ring.append(ring[0])
-                return QgsGeometry.fromPolygonXY([ring])
+                return QgsGeometry.fromPolygonXY(transformed_polygon)
 
             return geom
 
         except Exception as e:
             QgsMessageLog.logMessage(f"Error transforming geometry: {str(e)}", "SWM-3D", Qgis.Warning)
             return geom
+
+    def _resolve_rubber_band_vertex_z(self, source_rubber_band: QgsRubberBand, vertex_index: int, raw_z: float) -> float:
+        """
+        Resolves Z for rubber-band vertex transformation.
+        Rubber-band geometries are frequently 2D, so we prioritize tracked Z values.
+        """
+        try:
+            if math.isfinite(raw_z) and abs(raw_z) > 1e-9:
+                return float(raw_z)
+
+            tracked_fixed = self.rubber_band_fixed_z.get(source_rubber_band, [])
+            if vertex_index < len(tracked_fixed):
+                return float(tracked_fixed[vertex_index])
+
+            if self.parent:
+                return float(getattr(self.parent, 'z_cursor', 0.0))
+            return 0.0
+        except Exception:
+            return 0.0
 
     def force_sync_canvas_items(self):
         """
@@ -690,10 +1083,8 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         """
         # Prevent multiple rapid calls from sync_layers
         if self.sync_in_progress:
-            QgsMessageLog.logMessage(f"SYNC: Skipping forced sync (in progress) - Canvas {'LEFT' if self.is_left else 'RIGHT'}", "SWM-3D", Qgis.Info)
             return
-            
-        QgsMessageLog.logMessage(f"SYNC: Forcing immediate synchronization - Canvas {'LEFT' if self.is_left else 'RIGHT'}", "SWM-3D", Qgis.Warning)
+
         self._sync_canvas_items()
 
     def set_canvas_items_sync_enabled(self, enabled: bool):
@@ -744,15 +1135,12 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         
         self.synced_items.clear()
         self.geometry_cache.clear()
-        
-        # Clear parallel Z-tracking system
-        tracked_rubber_bands_count = len(self.rubber_band_z_tracker)
-        self.rubber_band_z_tracker.clear()
-        if tracked_rubber_bands_count > 0:
-            QgsMessageLog.logMessage(
-                f"Z-TRACKER: Cleared {tracked_rubber_bands_count} rubber band trackers", 
-                "SWM-3D", Qgis.Info
-            )
+        self.rubber_band_fixed_z.clear()
+        self.rubber_band_last_dynamic_z.clear()
+        self.rubber_band_z_by_geom_hash.clear()
+        self.vertex_marker_fixed_z.clear()
+        self.vertex_marker_last_center.clear()
+        self.vertex_marker_rb_match.clear()
 
         # Cleanup main-extent limits rubber band
         if self.limits:
@@ -1007,10 +1395,29 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 # Layer has Z values. Must apply Geometry Generator
                 # Copy layer_main to apply Geometry Generator. Ensure the CRS and other properties are the same
                 # 1) Create an independent logical view for the secondary canvas.
-                layer_copy = self._z_layer_cache.get(layer_main.id())
-                if layer_copy is None or not layer_copy.isValid() or layer_copy.source() != layer_main.source():
-                    layer_copy = QgsVectorLayer(layer_main.source(), layer_main.name(), layer_main.providerType())
-                    self._z_layer_cache[layer_main.id()] = layer_copy
+                layer_copy = None
+
+                # Editable layers keep unsaved features in edit buffers. Use a materialized
+                # snapshot so stereo canvases render those in-progress edits immediately.
+                if layer_main.isEditable():
+                    try:
+                        layer_copy = layer_main.materialize(QgsFeatureRequest())
+                        if layer_copy and layer_copy.isValid():
+                            layer_copy.setName(layer_main.name())
+                            self._z_layer_cache[layer_main.id()] = layer_copy
+                    except Exception as e:
+                        QgsMessageLog.logMessage(
+                            f"SYNC_LAYER: Error materializing editable layer '{layer_main.name()}': {str(e)}",
+                            "SWM-3D",
+                            Qgis.Warning,
+                        )
+                        layer_copy = None
+
+                if layer_copy is None:
+                    layer_copy = self._z_layer_cache.get(layer_main.id())
+                    if layer_copy is None or not layer_copy.isValid() or layer_copy.source() != layer_main.source():
+                        layer_copy = QgsVectorLayer(layer_main.source(), layer_main.name(), layer_main.providerType())
+                        self._z_layer_cache[layer_main.id()] = layer_copy
                 source_crs = layer_main.crs()
                 if source_crs and source_crs.isValid():
                     layer_copy.setCustomProperty("swm_source_authid", source_crs.authid())

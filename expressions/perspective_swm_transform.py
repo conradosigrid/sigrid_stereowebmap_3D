@@ -228,39 +228,59 @@ def perspective_swm_transform(geometry, side, txt_trf_wrl2pht, txt_trf_pht2prp):
         return QgsGeometry.fromPolylineXY(new_line)
         
     # --------------------------------------------------
-    # Polygon, Multipolygo PolygonZ, PolygonM, PolygonZM, MultiPolygon, MultiPolygonZ, MultiPolygonZM
+    # Polygon, PolygonZ, PolygonM, PolygonZM, MultiPolygon, MultiPolygonZ, MultiPolygonZM
     # WkbType can be any of the previous ones, but polygon features are processed one by one.
+    #
+    # IMPORTANT: geometry.vertices() iterates ALL vertices of ALL rings (exterior + interior)
+    # as a flat sequence. Building a single ring from that flat list causes bridge lines
+    # between the end of one ring and the start of the next.
+    # The fix: process the exterior ring and each interior ring (hole) independently,
+    # then reconstruct with QgsGeometry.fromPolygonXY([exterior, hole1, hole2, ...]).
     # --------------------------------------------------
     elif gtype == QgsWkbTypes.PolygonGeometry:
-        ring = []
-
-        # Iterate all polygon vertices safely
-        for p in geometry.vertices():
-            z = p.z()
-            if not math.isfinite(z):
-                continue
-
-            res = world_to_photo(p.x(), p.y(), z, x0, y0, z0, df, r)
-            if not res:
-                continue
-
-            res = photo_to_proj(res[0], res[1], a, b, c)
-            if not res:
-                continue
-
-            ring.append(QgsPointXY(res[0], res[1]))
-
-        # Close last ring
-        if len(ring) < 3:
+        const_geom = geometry.constGet()
+        if const_geom is None:
             return geometry
-        
-        if ring[0] != ring[-1]:
-            ring.append(ring[0])
 
-        if len(ring) < 4:
+        def _transform_ring(ring_geom):
+            pts = []
+            for p in ring_geom.vertices():
+                z = p.z()
+                if not math.isfinite(z):
+                    continue
+                res = world_to_photo(p.x(), p.y(), z, x0, y0, z0, df, r)
+                if not res:
+                    continue
+                res = photo_to_proj(res[0], res[1], a, b, c)
+                if not res:
+                    continue
+                pts.append(QgsPointXY(res[0], res[1]))
+            if len(pts) >= 3 and pts[0] != pts[-1]:
+                pts.append(pts[0])
+            return pts
+
+        all_rings = []
+
+        # Exterior ring
+        ext_ring = const_geom.exteriorRing()
+        if ext_ring is not None:
+            pts = _transform_ring(ext_ring)
+            if len(pts) >= 4:
+                all_rings.append(pts)
+
+        # Interior rings (holes) — each one transformed independently
+        for i in range(const_geom.numInteriorRings()):
+            int_ring = const_geom.interiorRing(i)
+            if int_ring is None:
+                continue
+            pts = _transform_ring(int_ring)
+            if len(pts) >= 4:
+                all_rings.append(pts)
+
+        if not all_rings:
             return geometry
-        
-        return QgsGeometry.fromPolygonXY([ring])
+
+        return QgsGeometry.fromPolygonXY(all_rings)
 
     else:
         # Unsupported geometries

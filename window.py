@@ -21,14 +21,16 @@ transformations to the canvas and expression layers.
 from qgis.core import QgsMessageLog, Qgis  # for debug messages.
 from qgis.core import QgsNetworkAccessManager
 from qgis.core import QgsGeometry
+from qgis.core import QgsVectorLayer
 from qgis.core import QgsCoordinateTransform, QgsProject
 from qgis.PyQt.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QStackedLayout
-from qgis.PyQt.QtWidgets import QInputDialog, QMessageBox, QLabel, QApplication
+from qgis.PyQt.QtWidgets import QInputDialog, QLabel, QApplication
 from qgis.PyQt.QtGui import QTransform, QGuiApplication, QCursor
 from qgis.PyQt.QtCore import Qt, QEvent, QTimer
 import re
 import math
-from typing import Dict, Any, Set, Tuple, Optional
+import time
+from typing import Dict, Any, Set, Tuple, Optional, List
 
 # SWM libraries
 from .canvas import QgsSgdSwmCanvas
@@ -76,7 +78,7 @@ class QSgdSwmWindow(QMainWindow):
         # Shared global Z; always assign through @z_cursor.setter to update everything
         self._z_proj_plane = 0.0
         self.z_cursor = 0.0
-        # Install event filter only for wheel-based Z control
+        # Install global event filter for cursor Z control and click capture.
         QApplication.instance().installEventFilter(self)
 
         # Capturar eventos del canvas principal qgis
@@ -108,6 +110,10 @@ class QSgdSwmWindow(QMainWindow):
         # Persist cursor Z into edited features on Z-enabled layers.
         self._layer_edit_hooks: Dict[str, Dict[str, Any]] = {}
         self._geometry_update_guard: Set[Tuple[str, int]] = set()
+        self._feature_vertex_z_history: Dict[Tuple[str, int], List[float]] = {}
+        self._pending_digitize_z_clicks: Dict[str, List[float]] = {}
+        self._last_click_capture: Dict[str, Tuple[float, float, str]] = {}
+        self._layers_rolling_back: Set[str] = set()
         self._layer_style_hooks: Dict[str, Dict[str, Any]] = {}
         self._pending_style_sync = False
         self._style_sync_timer = QTimer(self)
@@ -185,7 +191,7 @@ class QSgdSwmWindow(QMainWindow):
             # Remove Z label from the status bar
             try:
                 self.iface.mainWindow().statusBar().removeWidget(self.z_label)
-            except:
+            except Exception:
                 pass
                 
         except Exception as e:
@@ -221,8 +227,6 @@ class QSgdSwmWindow(QMainWindow):
         if not ok:
             return("Canceled")
         self.stereo_id = int(stereo_choice.split()[0])    
-        stereo_name = stereo_choice.split()[1]
-
         filter_letf = QgsSgdSwmCanvas.FILTER_NONE
         filter_right = QgsSgdSwmCanvas.FILTER_NONE
         if self.stereo_id == 1:
@@ -423,6 +427,9 @@ class QSgdSwmWindow(QMainWindow):
         Reusing SWM layers is handled inside each stereo canvas to avoid
         repeated WMS requests during visibility toggles.
         """
+        if self._layers_rolling_back:
+            return
+
         # Keep hooks aligned with currently active Z layers.
         self._update_digitizing_layer_hooks()
         self._update_style_layer_hooks()
@@ -445,26 +452,29 @@ class QSgdSwmWindow(QMainWindow):
         Coalesces rapid layer/tree events into a single sync pass.
         This prevents duplicate sync_layers() calls for one user action.
         """
+        if self._layers_rolling_back:
+            return
+
         if self._layer_sync_timer:
             self._layer_sync_timer.start()
 
     def _update_digitizing_layer_hooks(self):
         """
-        Connects editing interceptors for currently visible Z-enabled vector layers.
+        Connects editing interceptors for currently visible vector layers.
         """
         try:
-            current_z_layers = {}
+            current_vector_layers = {}
             for layer in self.iface.mapCanvas().layers():
-                if is_z_layer(layer):
-                    current_z_layers[layer.id()] = layer
+                if isinstance(layer, QgsVectorLayer):
+                    current_vector_layers[layer.id()] = layer
 
             # Disconnect removed hooks first.
             for layer_id in list(self._layer_edit_hooks.keys()):
-                if layer_id not in current_z_layers:
+                if layer_id not in current_vector_layers:
                     self._disconnect_digitizing_hooks(layer_id)
 
             # Connect new hooks.
-            for layer_id, layer in current_z_layers.items():
+            for layer_id, layer in current_vector_layers.items():
                 if layer_id not in self._layer_edit_hooks:
                     self._connect_digitizing_hooks(layer)
 
@@ -582,25 +592,39 @@ class QSgdSwmWindow(QMainWindow):
 
     def _connect_digitizing_hooks(self, layer):
         """
-        Connect feature and geometry edit signals for one Z-enabled layer.
+        Connect feature and geometry edit signals for one vector layer.
         """
         try:
             feature_slot = lambda fid, lyr=layer: self._on_layer_feature_added(lyr, fid)
             geometry_slot = lambda fid, geom, lyr=layer: self._on_layer_geometry_changed(lyr, fid, geom)
+            before_rollback_slot = lambda lyr=layer: self._on_layer_before_rollback(lyr)
+            after_rollback_slot = lambda lyr=layer: self._on_layer_after_rollback(lyr)
 
             layer.featureAdded.connect(feature_slot)
             layer.geometryChanged.connect(geometry_slot)
+            connected_before_rollback_signal = None
+            connected_after_rollback_signal = None
+            for signal_name in ('beforeRollBack', 'beforeRollback'):
+                if hasattr(layer, signal_name):
+                    getattr(layer, signal_name).connect(before_rollback_slot)
+                    connected_before_rollback_signal = signal_name
+                    break
+            for signal_name in ('afterRollBack', 'afterRollback'):
+                if hasattr(layer, signal_name):
+                    getattr(layer, signal_name).connect(after_rollback_slot)
+                    connected_after_rollback_signal = signal_name
+                    break
 
             self._layer_edit_hooks[layer.id()] = {
                 "layer": layer,
                 "feature_slot": feature_slot,
                 "geometry_slot": geometry_slot,
+                "before_rollback_slot": before_rollback_slot,
+                "after_rollback_slot": after_rollback_slot,
+                "before_rollback_signal": connected_before_rollback_signal,
+                "after_rollback_signal": connected_after_rollback_signal,
             }
 
-            QgsMessageLog.logMessage(
-                f"INTERCEPTOR: Hooked layer '{layer.name()}' for Z capture",
-                "SWM-3D", Qgis.Info
-            )
         except Exception as e:
             QgsMessageLog.logMessage(f"INTERCEPTOR: Error connecting layer hooks: {str(e)}", "SWM-3D", Qgis.Warning)
 
@@ -627,7 +651,28 @@ class QSgdSwmWindow(QMainWindow):
         except Exception:
             pass
 
+        try:
+            signal_name = hook.get("before_rollback_signal")
+            if signal_name and hook.get("before_rollback_slot") and hasattr(layer, signal_name):
+                getattr(layer, signal_name).disconnect(hook["before_rollback_slot"])
+        except Exception:
+            pass
+
+        try:
+            signal_name = hook.get("after_rollback_signal")
+            if signal_name and hook.get("after_rollback_slot") and hasattr(layer, signal_name):
+                getattr(layer, signal_name).disconnect(hook["after_rollback_slot"])
+        except Exception:
+            pass
+
         self._layer_edit_hooks.pop(layer_id, None)
+        self._layers_rolling_back.discard(layer_id)
+        # Drop per-feature Z history for removed layer hooks.
+        keys_to_remove = [k for k in self._feature_vertex_z_history.keys() if k[0] == layer_id]
+        for k in keys_to_remove:
+            self._feature_vertex_z_history.pop(k, None)
+        self._pending_digitize_z_clicks.pop(layer_id, None)
+        self._last_click_capture.pop(layer_id, None)
 
     def _disconnect_all_digitizing_hooks(self):
         """
@@ -636,23 +681,134 @@ class QSgdSwmWindow(QMainWindow):
         for layer_id in list(self._layer_edit_hooks.keys()):
             self._disconnect_digitizing_hooks(layer_id)
         self._geometry_update_guard.clear()
+        self._feature_vertex_z_history.clear()
+        self._pending_digitize_z_clicks.clear()
+        self._last_click_capture.clear()
+        self._layers_rolling_back.clear()
+
+    def _on_layer_before_rollback(self, layer):
+        """
+        Temporarily disable edit-driven sync while layer rollback is running.
+        """
+        try:
+            self._layers_rolling_back.add(layer.id())
+            if self._layer_sync_timer and self._layer_sync_timer.isActive():
+                self._layer_sync_timer.stop()
+            self._geometry_update_guard.clear()
+            keys_to_remove = [k for k in self._feature_vertex_z_history.keys() if k[0] == layer.id()]
+            for k in keys_to_remove:
+                self._feature_vertex_z_history.pop(k, None)
+            self._pending_digitize_z_clicks.pop(layer.id(), None)
+            self._last_click_capture.pop(layer.id(), None)
+        except Exception:
+            pass
+
+    def _is_capture_map_tool_active(self) -> bool:
+        """
+        Returns True when a QGIS capture map tool (line/polygon digitizing) appears active.
+        """
+        try:
+            tool = self.iface.mapCanvas().mapTool() if self.iface and self.iface.mapCanvas() else None
+            if not tool:
+                return False
+            tool_name = type(tool).__name__
+            if "Identify" in tool_name:
+                return False
+            return (
+                "Capture" in tool_name
+                or "DigitizeFeature" in tool_name
+                or "AddFeature" in tool_name
+            )
+        except Exception:
+            return False
+
+    def _on_layer_after_rollback(self, layer):
+        """
+        Re-enable edit-driven sync after rollback and refresh stereo layers once.
+        """
+        try:
+            self._layers_rolling_back.discard(layer.id())
+            self._schedule_layers_sync()
+        except Exception:
+            pass
 
     def _on_layer_feature_added(self, layer, fid: int):
         """
-        Triggered when a new feature is digitized. Ensures Z is persisted from cursor.
+        Triggered when a new feature is digitized.
         """
-        self._apply_cursor_z_to_feature(layer, fid, None)
+        if layer.id() in self._layers_rolling_back:
+            return
+
+        if is_z_layer(layer):
+            # Defer Z write so we do not mutate geometry re-entrantly
+            # while QGIS is still finalizing the edit command/undo state.
+            QTimer.singleShot(0, lambda lyr=layer, feature_id=fid: self._apply_cursor_z_to_feature(lyr, feature_id, None))
+        self._schedule_layers_sync()
+        if self.canvas_left:
+            self.canvas_left.refresh()
+        if self.canvas_right:
+            self.canvas_right.refresh()
 
     def _on_layer_geometry_changed(self, layer, fid: int, geom: QgsGeometry):
         """
-        Triggered when an edited geometry changes. Ensures Z is persisted from cursor.
+        Triggered when an edited geometry changes.
         """
-        self._apply_cursor_z_to_feature(layer, fid, geom)
+        if layer.id() in self._layers_rolling_back:
+            return
+
+        if is_z_layer(layer):
+            self._capture_feature_vertex_z(layer, fid, geom)
+
+        # Keep this handler read-only for stability during undo/rollback flows.
+        self._schedule_layers_sync()
+        if self.canvas_left:
+            self.canvas_left.refresh()
+        if self.canvas_right:
+            self.canvas_right.refresh()
+
+    def _capture_feature_vertex_z(self, layer, fid: int, geom: QgsGeometry):
+        """
+        Captures Z per vertex as digitizing progresses for one feature.
+        Only appends values when vertex count grows.
+        """
+        try:
+            if not geom or geom.isEmpty():
+                return
+            const_geom = geom.constGet()
+            if const_geom is None:
+                return
+
+            key = (layer.id(), int(fid))
+            vertex_count = const_geom.vertexCount()
+            if vertex_count <= 0:
+                self._feature_vertex_z_history.pop(key, None)
+                return
+
+            z_history = self._feature_vertex_z_history.setdefault(key, [])
+
+            if len(z_history) > vertex_count:
+                z_history[:] = z_history[:vertex_count]
+
+            cursor_z = float(self.z_cursor)
+            while len(z_history) < vertex_count:
+                src_idx = len(z_history)
+                src_v = geom.vertexAt(src_idx)
+                src_z = src_v.z()
+                if math.isfinite(src_z):
+                    z_history.append(float(src_z))
+                else:
+                    z_history.append(cursor_z)
+
+        except Exception as e:
+            QgsMessageLog.logMessage(f"INTERCEPTOR: Error capturing vertex Z for feature {fid}: {str(e)}", "SWM-3D", Qgis.Warning)
 
     def _apply_cursor_z_to_feature(self, layer, fid: int, geom: Optional[QgsGeometry]):
         """
         Assigns current cursor Z to vertices that still have Z=0 or non-finite Z.
         """
+        if layer.id() in self._layers_rolling_back:
+            return
+
         guard_key = (layer.id(), int(fid))
         if guard_key in self._geometry_update_guard:
             return
@@ -668,17 +824,44 @@ class QSgdSwmWindow(QMainWindow):
             if not working_geom or working_geom.isEmpty():
                 return
 
-            cursor_z = float(self.z_cursor)
+
             const_geom = working_geom.constGet()
             if const_geom is None:
                 return
 
             changed = False
-            for i in range(const_geom.vertexCount()):
+            key = (layer.id(), int(fid))
+            z_history = self._feature_vertex_z_history.get(key)
+            vtx_count = const_geom.vertexCount()
+
+            # Primary fallback for featureAdded timing race: use recorded click Z values.
+            if (not z_history) and vtx_count > 0:
+                pending = self._pending_digitize_z_clicks.get(layer.id(), [])
+                if len(pending) >= vtx_count:
+                    z_history = pending[-vtx_count:].copy()
+                    del pending[-vtx_count:]
+                    if not pending:
+                        self._pending_digitize_z_clicks.pop(layer.id(), None)
+
+            if (not z_history) and self.canvas_left and hasattr(self.canvas_left, 'get_tracked_z_for_geometry'):
+                try:
+                    z_history = self.canvas_left.get_tracked_z_for_geometry(working_geom)
+                except Exception:
+                    z_history = self._feature_vertex_z_history.get(key)
+            if (not z_history) and self.canvas_right and hasattr(self.canvas_right, 'get_tracked_z_for_geometry'):
+                try:
+                    z_history = self.canvas_right.get_tracked_z_for_geometry(working_geom)
+                except Exception:
+                    z_history = self._feature_vertex_z_history.get(key)
+            for i in range(vtx_count):
                 vertex = working_geom.vertexAt(i)
+                if z_history and i < len(z_history):
+                    z_to_apply = float(z_history[i])
+                else:
+                    z_to_apply = float(self.z_cursor)
                 current_z = vertex.z()
-                if (not math.isfinite(current_z)) or abs(current_z) < 1e-9:
-                    vertex.setZ(cursor_z)
+                if (not math.isfinite(current_z)) or abs(current_z) < 1e-9 or abs(current_z - z_to_apply) > 1e-6:
+                    vertex.setZ(z_to_apply)
                     if working_geom.moveVertex(vertex, i):
                         changed = True
 
@@ -688,10 +871,10 @@ class QSgdSwmWindow(QMainWindow):
             self._geometry_update_guard.add(guard_key)
             ok = layer.changeGeometry(fid, working_geom)
             if ok:
-                QgsMessageLog.logMessage(
-                    f"INTERCEPTOR: Applied Z={cursor_z:.1f} to feature {fid} in '{layer.name()}'",
-                    "SWM-3D", Qgis.Info
-                )
+                # Geometry is persisted; tracker is no longer needed for this feature.
+                self._feature_vertex_z_history.pop(key, None)
+                self._pending_digitize_z_clicks.pop(layer.id(), None)
+                self._last_click_capture.pop(layer.id(), None)
             else:
                 QgsMessageLog.logMessage(
                     f"INTERCEPTOR: Failed applying Z to feature {fid} in '{layer.name()}'",
@@ -719,6 +902,47 @@ class QSgdSwmWindow(QMainWindow):
                 return True
 
             # Wheel-based Z control
+            if event.type() == QEvent.Type.MouseButtonPress:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    try:
+                        main_canvas = self.iface.mapCanvas() if self.iface else None
+                        from_main_canvas = False
+                        if main_canvas:
+                            vp = main_canvas.viewport() if hasattr(main_canvas, 'viewport') else None
+                            from_main_canvas = (obj is main_canvas) or (vp is not None and obj is vp)
+
+                        active_layer = self.iface.activeLayer() if self.iface else None
+                        if (
+                            not is_stereo_object
+                            and from_main_canvas
+                            and isinstance(active_layer, QgsVectorLayer)
+                            and active_layer.isEditable()
+                            and is_z_layer(active_layer)
+                            and self._is_capture_map_tool_active()
+                        ):
+                            pending = self._pending_digitize_z_clicks.setdefault(active_layer.id(), [])
+                            current_z = float(self.z_cursor)
+                            if len(pending) > 512:
+                                del pending[:-512]
+                            tool_name = ""
+                            if main_canvas and hasattr(main_canvas, 'mapTool'):
+                                tool = main_canvas.mapTool()
+                                tool_name = type(tool).__name__ if tool else ""
+
+                            now = time.monotonic()
+                            last = self._last_click_capture.get(active_layer.id())
+                            is_duplicate = False
+                            if last:
+                                last_t, last_z, last_tool = last
+                                if (now - last_t) < 0.25 and abs(last_z - current_z) < 1e-6 and last_tool == tool_name:
+                                    is_duplicate = True
+
+                            if not is_duplicate:
+                                pending.append(current_z)
+                                self._last_click_capture[active_layer.id()] = (now, current_z, tool_name)
+                    except Exception:
+                        pass
+
             if event.type() == QEvent.Type.Wheel:
                 modifiers = QApplication.keyboardModifiers()
                 if not (modifiers & Qt.KeyboardModifier.AltModifier):
@@ -730,14 +954,11 @@ class QSgdSwmWindow(QMainWindow):
                 elif modifiers & Qt.KeyboardModifier.ShiftModifier:
                     delta *= 10.
                     
-                old_z = self.z_cursor
                 self.z_cursor = round(self.z_cursor + delta, 1)
-                
-                QgsMessageLog.logMessage(f"Z changed: {old_z} → {self._z_cursor}", "SWM-3D", Qgis.Info)
                 return True
                 
             return False
-        except:
+        except Exception:
             return False
 
     def network_reply_handle(self, reply):

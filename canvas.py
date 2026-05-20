@@ -1215,17 +1215,13 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         if self._is_overlay_mode():
             rendered = self._render_canvas_buffer()
             self._last_rendered_buffer = rendered
-
-            if self.is_left:
-                # Keep a provisional per-eye image visible underneath.
-                # The right canvas will overwrite it with the final composed image when ready.
-                filtered = self.apply_filter(rendered.copy())
-                self._paint_image_to_viewport(filtered)
-                return
-
             composed = self._compose_overlay_image()
             if composed is None:
-                composed = self.apply_filter(rendered.copy())
+                # Fallback to this eye rendering while the opposite eye catches up.
+                if self.parent and self.parent.stereo_id == 1:
+                    composed = rendered
+                else:
+                    composed = self.apply_filter(rendered.copy())
             self._paint_image_to_viewport(composed, replace=True)
         elif self.filter == self.FILTER_NONE:
             super().paintEvent(e)

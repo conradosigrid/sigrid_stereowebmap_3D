@@ -35,10 +35,24 @@ REM Stage, commit and push
 "%GIT_EXE%" diff --cached --quiet
 if errorlevel 1 (
     "%GIT_EXE%" commit -m "%COMMIT_MSG%"
-    "%GIT_EXE%" push origin main
 ) else (
     echo No changes to commit.
 )
+
+REM Push current active branch
+for /f "delims=" %%b in ('"%GIT_EXE%" rev-parse --abbrev-ref HEAD') do set "CURRENT_BRANCH=%%b"
+if not defined CURRENT_BRANCH (
+    echo Could not detect active branch.
+    popd
+    exit /b 1
+)
+if /I "%CURRENT_BRANCH%"=="HEAD" (
+    echo Detached HEAD state detected. Checkout a branch before pushing.
+    popd
+    exit /b 1
+)
+
+"%GIT_EXE%" push origin "%CURRENT_BRANCH%"
 
 popd
 exit /b 0

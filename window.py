@@ -197,8 +197,7 @@ class QSgdSwmWindow(QMainWindow):
 
     def _keep_cursor_in_main_qgis_window(self):
         """Prevents the cursor from staying over the stereo window (cross-platform)."""
-        # if _debug_module is not None and _debug_module.DEBUG:
-        if True:
+        if _debug_module is not None and _debug_module.DEBUG:
             return
 
         try:
@@ -240,6 +239,8 @@ class QSgdSwmWindow(QMainWindow):
         self.canvas_right = QgsSgdSwmCanvas(False, self.qgis_main_canvas, filter_right, self)
 
         central_widget = QWidget()
+        central_widget.setContentsMargins(0, 0, 0, 0)
+        central_widget.setAutoFillBackground(False)
         self.setCentralWidget(central_widget)
         if self.stereo_id <= 3:
             # Overlayed stereo modes share the same viewport.
@@ -256,6 +257,8 @@ class QSgdSwmWindow(QMainWindow):
             # Mirror-right / mirror-up layout.
             layout = QVBoxLayout()
             self._apply_horizontal_mirror(self.canvas_right)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         central_widget.setLayout(layout)
 
         layout.addWidget(self.canvas_left)

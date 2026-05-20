@@ -1,3 +1,5 @@
+import os
+import numpy as np
 """
 canvas.py
 
@@ -37,7 +39,7 @@ from qgis.core import QgsWkbTypes, QgsGeometry, QgsRasterLayer, QgsVectorLayer, 
 from qgis.core import QgsSymbol, QgsSingleSymbolRenderer, QgsGeometryGeneratorSymbolLayer
 from qgis.core import QgsCoordinateTransform, QgsCoordinateReferenceSystem, QgsProject
 from qgis.PyQt.QtGui import QColor, QWheelEvent, QImage, QPainter
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import Qt, QTimer
 from typing import Optional, Any, Dict, List, Tuple
 import hashlib
 
@@ -60,6 +62,20 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
     FILTER_EVEN = 3
     FILTER_ODD = 4
 
+    def _debug_save_channels(self, arr, prefix):
+        """Guarda canales de un array de imagen como PNG en disco para depuración."""
+        try:
+            from PIL import Image
+            outdir = os.path.join(os.path.expanduser("~"), "swm_debug")
+            os.makedirs(outdir, exist_ok=True)
+            labels = ['R', 'G', 'B', 'A'] if arr.shape[2] >= 4 else ['R', 'G', 'B']
+            for i, ch in enumerate(labels):
+                img = Image.fromarray(arr[:, :, i])
+                img.save(os.path.join(outdir, f"{prefix}_ch{ch}.png"))
+        except Exception as e:
+            from qgis.core import QgsMessageLog
+            QgsMessageLog.logMessage(f"[STEREO] Error saving debug channels: {e}", "StereoWebMap")
+
     def __init__(self, is_left: bool, qgis_main_canvas, filter: int = FILTER_NONE, parent: Optional[Any] = None):
         super(QgsSgdSwmCanvas, self).__init__(parent)
  
@@ -72,11 +88,18 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         self.trf_wld2prp = None
 
         # Cursor marker (must be created before item synchronization)
+        # Two overlapped markers create a black outline with white center.
         self.cursor_marker = QgsVertexMarker(self)
         self.cursor_marker.setColor(QColor(Qt.GlobalColor.black))
         self.cursor_marker.setIconSize(10)
         self.cursor_marker.setIconType(QgsVertexMarker.ICON_CROSS)
-        self.cursor_marker.setPenWidth(3)
+        self.cursor_marker.setPenWidth(5)
+
+        self.cursor_marker_inner = QgsVertexMarker(self)
+        self.cursor_marker_inner.setColor(QColor(Qt.GlobalColor.white))
+        self.cursor_marker_inner.setIconSize(10)
+        self.cursor_marker_inner.setIconType(QgsVertexMarker.ICON_CROSS)
+        self.cursor_marker_inner.setPenWidth(2)
 
         # Map canvas items synchronization (after creating cursor_marker)
         self.synced_items: Dict[QgsMapCanvasItem, QgsMapCanvasItem] = {}  # main_item -> synced_item
@@ -100,6 +123,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         self.limits = None
         self.z_text = ""  # Z cursor text
         self._last_rendered_buffer: Optional[QImage] = None
+        self._last_base_buffer: Optional[QImage] = None
 
         self.setCanvasColor(QColor(0, 0, 0, 0))  # QColor(Qt.GlobalColor.transparent)
         # Keep rendered layer images cached so vector-only visibility toggles
@@ -114,6 +138,23 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         # always applied.
         if self.filter != self.FILTER_NONE:
             self.mapCanvasRefreshed.connect(self.update)
+            self.mapCanvasRefreshed.connect(self._schedule_base_capture)
+
+    def _schedule_base_capture(self):
+        """Schedule raw viewport capture after Qt finishes repainting."""
+        QTimer.singleShot(0, self._capture_base_buffer)
+
+    def _capture_base_buffer(self):
+        """Capture the latest raw map image from viewport (no custom paintEvent post-processing)."""
+        try:
+            viewport = self.viewport()
+            if viewport is None:
+                return
+            pix = viewport.grab()
+            if pix and not pix.isNull():
+                self._last_base_buffer = pix.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+        except Exception:
+            pass
 
     # ============================================================================
     # == Cursor in the stereo canvas ==
@@ -137,13 +178,17 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             pnt_prj = self.trf_wld2prp.execute_wrl2prp(pnt_wrl)
             if pnt_prj:
                 self.cursor_marker.setCenter(pnt_prj)
+                self.cursor_marker_inner.setCenter(pnt_prj)
                 self.cursor_marker.show()
+                self.cursor_marker_inner.show()
                 if self.filter != self.FILTER_NONE:
                     self.update()
                 return
 
         self.cursor_marker.setCenter(point_xy)
+        self.cursor_marker_inner.setCenter(point_xy)
         self.cursor_marker.show()
+        self.cursor_marker_inner.show()
         if self.filter != self.FILTER_NONE:
             self.update()
 
@@ -336,8 +381,10 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 for item in canvas.scene().items():
                     # Ensure it is a QgsMapCanvasItem and exclude our cursor marker if present
                     if isinstance(item, QgsMapCanvasItem):
-                        # Exclude our own cursor marker to avoid recursion
+                        # Exclude our own cursor markers to avoid recursion
                         if hasattr(self, 'cursor_marker') and item == self.cursor_marker:
+                            continue
+                        if hasattr(self, 'cursor_marker_inner') and item == self.cursor_marker_inner:
                             continue
                         items.append(item)
         except Exception as e:
@@ -1215,13 +1262,17 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         if self._is_overlay_mode():
             rendered = self._render_canvas_buffer()
             self._last_rendered_buffer = rendered
+
+            if self.is_left:
+                # Keep a provisional per-eye image visible underneath.
+                # The right canvas will overwrite it with the final composed image when ready.
+                filtered = self.apply_filter(rendered.copy())
+                self._paint_image_to_viewport(filtered)
+                return
+
             composed = self._compose_overlay_image()
             if composed is None:
-                # Fallback to this eye rendering while the opposite eye catches up.
-                if self.parent and self.parent.stereo_id == 1:
-                    composed = rendered
-                else:
-                    composed = self.apply_filter(rendered.copy())
+                composed = self.apply_filter(rendered.copy())
             self._paint_image_to_viewport(composed, replace=True)
         elif self.filter == self.FILTER_NONE:
             super().paintEvent(e)
@@ -1261,6 +1312,8 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         if not left_canvas or not right_canvas:
             return None
 
+        # Single composition pipeline for both anaglyph and interlaced modes.
+        # This avoids diverging logic paths and reduces synchronization glitches.
         if left_canvas._last_rendered_buffer is None:
             left_canvas._last_rendered_buffer = left_canvas._render_canvas_buffer()
         if right_canvas._last_rendered_buffer is None:
@@ -1274,36 +1327,8 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             return None
 
         try:
-            if self.parent.stereo_id == 1:
-                # Exact anaglyph: simple direct RGB split.
-                left_rgba = left_image.convertToFormat(QImage.Format.Format_RGBA8888)
-                right_rgba = right_image.convertToFormat(QImage.Format.Format_RGBA8888)
-
-                left_ptr = left_rgba.bits()
-                left_ptr.setsize(left_rgba.sizeInBytes())
-                left_arr = np.frombuffer(left_ptr, np.uint8).reshape(left_rgba.height(), left_rgba.width(), 4)
-
-                right_ptr = right_rgba.bits()
-                right_ptr.setsize(right_rgba.sizeInBytes())
-                right_arr = np.frombuffer(right_ptr, np.uint8).reshape(right_rgba.height(), right_rgba.width(), 4)
-
-                composed = np.empty_like(left_arr)
-                composed[:, :, 0] = left_arr[:, :, 0]   # R from left eye
-                composed[:, :, 1] = right_arr[:, :, 1]  # G from right eye
-                composed[:, :, 2] = right_arr[:, :, 2]  # B from right eye
-                composed[:, :, 3] = 255
-
-                result = QImage(
-                    composed.data,
-                    left_rgba.width(),
-                    left_rgba.height(),
-                    left_rgba.bytesPerLine(),
-                    QImage.Format.Format_RGBA8888,
-                )
-                return result.copy()
-
-            left_filtered = left_canvas.apply_filter(left_image.copy())
-            right_filtered = right_canvas.apply_filter(right_image.copy())
+            left_filtered = left_canvas.apply_filter(left_image.copy()).convertToFormat(QImage.Format.Format_RGBA8888)
+            right_filtered = right_canvas.apply_filter(right_image.copy()).convertToFormat(QImage.Format.Format_RGBA8888)
 
             left_ptr = left_filtered.bits()
             left_ptr.setsize(left_filtered.sizeInBytes())
@@ -1313,19 +1338,60 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             right_ptr.setsize(right_filtered.sizeInBytes())
             right_arr = np.frombuffer(right_ptr, np.uint8).reshape(right_filtered.height(), right_filtered.width(), 4)
 
-            # Interlaced overlay: each filtered eye already owns alternate rows.
-            left_alpha = left_arr[:, :, 3] > 0
-            right_alpha = right_arr[:, :, 3] > 0
-            composed = np.zeros_like(left_arr)
-            composed[left_alpha] = left_arr[left_alpha]
-            composed[right_alpha] = right_arr[right_alpha]
+            # Normalize channel values to avoid dominance of one channel
+            left_arr = left_arr / 255.0
+            right_arr = right_arr / 255.0
+
+            if self.parent.stereo_id == 1:
+                # Anaglyph: Red from left, Green and Blue from right
+                composed = np.empty_like(left_arr)
+                composed[:, :, 0] = left_arr[:, :, 0]  # Red from left
+                composed[:, :, 1] = right_arr[:, :, 1]  # Green from right
+                composed[:, :, 2] = right_arr[:, :, 2]  # Blue from right
+
+                # Debug stats after filtering: should be left=red and right=cyan.
+                try:
+                    left_mean = np.mean(left_arr, axis=(0, 1))
+                    right_mean = np.mean(right_arr, axis=(0, 1))
+                    QgsMessageLog.logMessage(f"[STEREO] ANAGLYPH left_mean={left_mean}, right_mean={right_mean}", "StereoWebMap")
+                except Exception:
+                    pass
+
+                # Save filtered images for debugging
+                left_debug_path = "C:/Desarrollo/PyQgis/Plugins/sigrid_stereowebmap_3D/debug_left_filtered.png"
+                right_debug_path = "C:/Desarrollo/PyQgis/Plugins/sigrid_stereowebmap_3D/debug_right_filtered.png"
+                left_filtered.save(left_debug_path)
+                right_filtered.save(right_debug_path)
+
+                # Save composed image for debugging
+                composed_debug_array_path = "C:/Desarrollo/PyQgis/Plugins/sigrid_stereowebmap_3D/debug_composed_array.png"
+                from PIL import Image
+                composed_image_pil = Image.fromarray((composed[:, :, :3] * 255).astype(np.uint8))
+                composed_image_pil.save(composed_debug_array_path)
+
+                # Create QImage with an alternative format
+                result = QImage(
+                    composed.data,
+                    left_filtered.width(),
+                    left_filtered.height(),
+                    left_filtered.bytesPerLine(),
+                    QImage.Format.Format_RGB888,
+                )
+                return result.copy()
+            else:
+                # Interlaced overlay: each filtered eye already owns alternate rows.
+                left_alpha = left_arr[:, :, 3] > 0
+                right_alpha = right_arr[:, :, 3] > 0
+                composed = np.zeros_like(left_arr)
+                composed[left_alpha] = left_arr[left_alpha]
+                composed[right_alpha] = right_arr[right_alpha]
 
             result = QImage(
                 composed.data,
                 left_filtered.width(),
                 left_filtered.height(),
                 left_filtered.bytesPerLine(),
-                QImage.Format.Format_RGBA8888,
+                QImage.Format.Format_RGB32,
             )
             return result.copy()
         except Exception as e:

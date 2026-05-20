@@ -1,4 +1,4 @@
-﻿# SIGRID_SWM_3D - QGIS Plugin - Version 0.5.1
+﻿# SIGRID_SWM_3D - QGIS Plugin - Version 0.6.1
 
 ![Version](https://img.shields.io/badge/version-0.5.1-blue)
 ![QGIS](https://img.shields.io/badge/QGIS-4.x-green)
@@ -71,6 +71,11 @@ Expected behavior:
 
 ## 5. Changes
 
+### Version 0.6.1
+- Incorporated overlapping stereos (anaglyph and interlaced).
+- Automatic transmission of symbology changes to the stereo canvases.
+- Visible-invisible switching on main canvas 
+
 ### Version 0.6.0
 - Corrected vertex displacement in polyline.
 - Automatic transmission of symbology changes to the stereo canvases.
@@ -129,13 +134,8 @@ Expected behavior:
 
 ### The last segment is not visible in the stereo canvases during line and segment digitization tasks. 
 - This segment connects the last digitized vertex to the cursor position and is visible in the main canvas but not in the stereo canvases.
-- It could not be implemented in the stereo canvases because its handling is contained within QGIS's C++ code and is not accessible from Python. 
-- This is a purely graphical feature.
-- It was decided not to include it in the stereo canvases because it would complicate the stability and ease of tracking of the plugin's code.
+- It could not be implemented in the stereo canvases because its handling is contained within QGIS's C++ code and is not accessible from Python. This is a purely graphical feature, so it was decided not to include it in the stereo canvases because it would complicate the stability and ease of tracking of the plugin's code.
 
-### Exact Anaglyph Composition Pending
-- Interlaced overlay mode is working.
-- Anaglyph mode still needs a dedicated non-reentrant compositor so it can combine the two eye images as exact channel output instead of relying on stacked widget painting.
 
 ### Stereoscopy is less clear for flights that are not east-west passes
 - Because the images are rotated, stereoscopy is not clearly visible in these cases.
@@ -154,8 +154,6 @@ The most immediate developments from this baseline version are:
 
 - Correct the issues pointed out in the previous section.
 - Test and refine the stereoscopic rendering on different hardware setups, especially the dual-screen with a 45-degree mirror.
-- Finalize the exact **anaglyph** compositor without introducing re-entrant Qt painting.
-- Begin incorporating delineation tools that work directly on the stereoscopic views.
 
 ---
 

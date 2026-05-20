@@ -133,8 +133,9 @@ Expected behavior:
 - This is a purely graphical feature.
 - It was decided not to include it in the stereo canvases because it would complicate the stability and ease of tracking of the plugin's code.
 
-### Overlay Stereo Modes Not Working
-- Currently, stereo modes based on overlaying the two images (left and right) with transparency are not working: anaglyph and interlaced stereo.
+### Exact Anaglyph Composition Pending
+- Interlaced overlay mode is working.
+- Anaglyph mode still needs a dedicated non-reentrant compositor so it can combine the two eye images as exact channel output instead of relying on stacked widget painting.
 
 ### Stereoscopy is less clear for flights that are not east-west passes
 - Because the images are rotated, stereoscopy is not clearly visible in these cases.
@@ -153,7 +154,7 @@ The most immediate developments from this baseline version are:
 
 - Correct the issues pointed out in the previous section.
 - Test and refine the stereoscopic rendering on different hardware setups, especially the dual-screen with a 45-degree mirror.
-- Add visualization support for **anaglyph** and **interlaced horizontal lines** systems.
+- Finalize the exact **anaglyph** compositor without introducing re-entrant Qt painting.
 - Begin incorporating delineation tools that work directly on the stereoscopic views.
 
 ---

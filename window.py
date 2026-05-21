@@ -1,4 +1,3 @@
-
 """
 window.py
 
@@ -20,15 +19,21 @@ transformations to the canvas and expression layers.
 
 from qgis.core import QgsMessageLog, Qgis  # for debug messages.
 from qgis.core import QgsNetworkAccessManager
+from qgis.core import QgsGeometry
+from qgis.core import QgsVectorLayer
+from qgis.core import QgsCoordinateTransform, QgsProject
 from qgis.PyQt.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QStackedLayout
-from qgis.PyQt.QtWidgets import QInputDialog, QMessageBox, QLabel, QApplication
+from qgis.PyQt.QtWidgets import QInputDialog, QLabel, QApplication
 from qgis.PyQt.QtGui import QTransform, QGuiApplication, QCursor
 from qgis.PyQt.QtCore import Qt, QEvent, QTimer
 import re
+import math
+import time
+from typing import Dict, Any, Set, Tuple, Optional, List
 
 # SWM libraries
 from .canvas import QgsSgdSwmCanvas
-from .utils import is_z_layer
+from .utils import is_z_layer, is_sgd_swm_layer
 try:
     from . import debug as _debug_module
 except ImportError:
@@ -50,6 +55,8 @@ class QSgdSwmWindow(QMainWindow):
         self.iface = iface
         # Used to maximize only after a valid SWM reply is received
         self._has_received_swm_reply = False
+        # Cached fixed CRS of SWM service (from capabilities/layer metadata)
+        self._swm_service_crs = None
 
         # Set the screen for the Swm Window
         self.init_error = self.set_screen()
@@ -70,13 +77,53 @@ class QSgdSwmWindow(QMainWindow):
         # Shared global Z; always assign through @z_cursor.setter to update everything
         self._z_proj_plane = 0.0
         self.z_cursor = 0.0
-        # Install event filter only for wheel-based Z control
+        # Install global event filter for cursor Z control and click capture.
         QApplication.instance().installEventFilter(self)
 
         # Capturar eventos del canvas principal qgis
         self.iface.mapCanvas().xyCoordinates.connect(self._sync_canvases_cursor)      # mouse
-        self.iface.mapCanvas().layersChanged.connect(self._sync_canvases_layers)      # new layers
+        self._layer_sync_timer = QTimer(self)
+        self._layer_sync_timer.setSingleShot(True)
+        self._layer_sync_timer.setInterval(50)
+        self._layer_sync_timer.timeout.connect(self._sync_canvases_layers)
+        self._canvas_refresh_timer = QTimer(self)
+        self._canvas_refresh_timer.setSingleShot(True)
+        self._canvas_refresh_timer.setInterval(0)
+        self._canvas_refresh_timer.timeout.connect(self._run_canvas_refresh)
+        self.iface.mapCanvas().layersChanged.connect(self._schedule_layers_sync)      # new layers / ordering
+        project = QgsProject.instance()
+        if project:
+            root = project.layerTreeRoot()
+            if root and hasattr(root, 'visibilityChanged'):
+                root.visibilityChanged.connect(self._schedule_layers_sync)  # visibility toggles
+        try:
+            layer_tree_view = self.iface.layerTreeView()
+            if layer_tree_view and hasattr(layer_tree_view, 'layerTreeModel'):
+                model = layer_tree_view.layerTreeModel()
+                if model and hasattr(model, 'dataChanged'):
+                    model.dataChanged.connect(self._schedule_layers_sync)
+                    self._layer_tree_model = model
+        except Exception:
+            self._layer_tree_model = None
         self.iface.mapCanvas().extentsChanged.connect(self._sync_canvases_repaint)    # zoom and pan
+        if hasattr(self.iface.mapCanvas(), 'destinationCrsChanged'):
+            self.iface.mapCanvas().destinationCrsChanged.connect(self._on_main_canvas_crs_changed)
+
+        # Persist cursor Z into edited features on Z-enabled layers.
+        self._layer_edit_hooks: Dict[str, Dict[str, Any]] = {}
+        self._geometry_update_guard: Set[Tuple[str, int]] = set()
+        self._feature_vertex_z_history: Dict[Tuple[str, int], List[float]] = {}
+        self._pending_digitize_z_clicks: Dict[str, List[float]] = {}
+        self._last_click_capture: Dict[str, Tuple[float, float, str]] = {}
+        self._layers_rolling_back: Set[str] = set()
+        self._layer_style_hooks: Dict[str, Dict[str, Any]] = {}
+        self._pending_style_sync = False
+        self._style_sync_timer = QTimer(self)
+        self._style_sync_timer.setSingleShot(True)
+        self._style_sync_timer.setInterval(100)
+        self._style_sync_timer.timeout.connect(self._run_pending_style_sync)
+        self._update_digitizing_layer_hooks()
+        self._update_style_layer_hooks()
 
         # Network Manager WMS
         # https://chat.deepseek.com/a/chat/s/5dc872fa-208d-458c-836b-9199dcc3a37c
@@ -90,11 +137,14 @@ class QSgdSwmWindow(QMainWindow):
         """
         super().showEvent(event)
         # Initial sync after the window is shown
+        self._sync_canvases_destination_crs()
         if self.canvas_left:
-            self.canvas_left.setExtent(self.qgis_main_canvas.extent())
+            extent_left = self._reproject_extent_to_stereo_crs(self.qgis_main_canvas.extent(), self.canvas_left)
+            self.canvas_left.setExtent(extent_left)
             self.canvas_left.sync_layers()
         if self.canvas_right:
-            self.canvas_right.setExtent(self.qgis_main_canvas.extent())
+            extent_right = self._reproject_extent_to_stereo_crs(self.qgis_main_canvas.extent(), self.canvas_right)
+            self.canvas_right.setExtent(extent_right)
             self.canvas_right.sync_layers()
         # Keep for now; may be removed later if unnecessary
         if self.canvas_left:
@@ -110,6 +160,23 @@ class QSgdSwmWindow(QMainWindow):
         try:
             # Clean up event filter
             QApplication.instance().removeEventFilter(self)
+
+            # Clean up digitizing interceptors
+            self._disconnect_all_digitizing_hooks()
+            self._disconnect_all_style_hooks()
+            if self._style_sync_timer and self._style_sync_timer.isActive():
+                self._style_sync_timer.stop()
+            if self._layer_sync_timer and self._layer_sync_timer.isActive():
+                self._layer_sync_timer.stop()
+
+            project = QgsProject.instance()
+            if project:
+                root = project.layerTreeRoot()
+                if root and hasattr(root, 'visibilityChanged'):
+                    try:
+                        root.visibilityChanged.disconnect(self._schedule_layers_sync)
+                    except (RuntimeError, TypeError):
+                        pass
             
             # Clean up synchronization in secondary canvases
             if self.canvas_left:
@@ -120,11 +187,11 @@ class QSgdSwmWindow(QMainWindow):
             # Remove Z label from the status bar
             try:
                 self.iface.mainWindow().statusBar().removeWidget(self.z_label)
-            except:
+            except Exception:
                 pass
                 
         except Exception as e:
-            QgsMessageLog.logMessage(f"Cleanup error: {str(e)}", "SWM-3D", QgsMessageLog.MessageType.Critical)
+            QgsMessageLog.logMessage(f"Cleanup error: {str(e)}", "SWM-3D")
         
         super().closeEvent(event)
 
@@ -143,7 +210,6 @@ class QSgdSwmWindow(QMainWindow):
             pass
 
     def configure_canvases(self):
-        # Select stereo mode
         stereo_options = [
             "1 Anaglyph",
             "2 Interlaced even",
@@ -155,53 +221,80 @@ class QSgdSwmWindow(QMainWindow):
         stereo_choice, ok = QInputDialog.getItem(self.iface.mainWindow(), "Stereo mode", "Select stereo mode for SWM-3D plugin:", stereo_options, 3, False)
         if not ok:
             return("Canceled")
-        self.stereo_id = int(stereo_choice.split()[0])    
-        stereo_name = stereo_choice.split()[1]
+        self.stereo_id = int(stereo_choice.split()[0])
 
-        filter_letf = QgsSgdSwmCanvas.FILTER_NONE
+        filter_left = QgsSgdSwmCanvas.FILTER_NONE
         filter_right = QgsSgdSwmCanvas.FILTER_NONE
         if self.stereo_id == 1:
-            filter_letf = QgsSgdSwmCanvas.FILTER_RED
+            filter_left = QgsSgdSwmCanvas.FILTER_RED
             filter_right = QgsSgdSwmCanvas.FILTER_CYAN
         elif self.stereo_id == 2:
-            filter_letf = QgsSgdSwmCanvas.FILTER_EVEN
+            filter_left = QgsSgdSwmCanvas.FILTER_EVEN
             filter_right = QgsSgdSwmCanvas.FILTER_ODD
         elif self.stereo_id == 3:
-            filter_letf = QgsSgdSwmCanvas.FILTER_ODD
+            filter_left = QgsSgdSwmCanvas.FILTER_ODD
             filter_right = QgsSgdSwmCanvas.FILTER_EVEN
-        # FALTA
-        # elif self.stereo_id == 4:
-        #     filter_letf = QgsSgdSwmCanvas.FILTER_RED
-        #     filter_right = QgsSgdSwmCanvas.FILTER_CYAN
-        # elif self.stereo_id == 5:
-        #     filter_letf = QgsSgdSwmCanvas.FILTER_ODD
-        #     filter_right = QgsSgdSwmCanvas.FILTER_EVEN
 
-        self.canvas_left = QgsSgdSwmCanvas(True, self.qgis_main_canvas, filter_letf, self)
+        self.canvas_left = QgsSgdSwmCanvas(True, self.qgis_main_canvas, filter_left, self)
         self.canvas_right = QgsSgdSwmCanvas(False, self.qgis_main_canvas, filter_right, self)
 
         central_widget = QWidget()
+        central_widget.setContentsMargins(0, 0, 0, 0)
+        central_widget.setAutoFillBackground(False)
         self.setCentralWidget(central_widget)
         if self.stereo_id <= 3:
-            # Overlayed canvas
+            # Overlayed stereo modes share the same viewport.
             layout = QStackedLayout()
-            layout.setStackingMode(QStackedLayout.StackAll)
-            layout.setCurrentIndex(1)  # Ensure the right canvas stays on top
+            layout.setStackingMode(QStackedLayout.StackingMode.StackAll)
+            layout.setCurrentIndex(1)
+            self._configure_overlay_canvases()
         elif self.stereo_id <= 5:
-            # Horizontally disposed canvas
+            # Side-by-side mode.
             layout = QHBoxLayout()
             if self.stereo_id == 5:
-                self.canvas_right.setTransform(QTransform().scale(-1, 1))  # Mirror right canvas horizontally
+                self._apply_horizontal_mirror(self.canvas_right)
         elif self.stereo_id == 6:
-            # Vertically disposed canvas
+            # Mirror-right / mirror-up layout.
             layout = QVBoxLayout()
-            self.canvas_right.setTransform(QTransform().scale(-1, 1))  # Mirror right canvas vertically        
+            self._apply_horizontal_mirror(self.canvas_right)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         central_widget.setLayout(layout)
 
         layout.addWidget(self.canvas_left)
         layout.addWidget(self.canvas_right)
 
         return None
+
+    def _configure_overlay_canvases(self):
+        """Makes both stereo canvases transparent when stacked."""
+        for canvas in (self.canvas_left, self.canvas_right):
+            if canvas is None:
+                continue
+            canvas.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            canvas.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+            viewport = canvas.viewport()
+            if viewport is not None:
+                viewport.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+                viewport.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+            canvas.setStyleSheet("background: transparent;")
+
+    def _apply_horizontal_mirror(self, canvas):
+        """Applies the horizontal mirror used by mirrored stereo layouts."""
+        if canvas:
+            canvas.setTransform(QTransform().scale(-1, 1))
+
+    def _schedule_canvas_refresh(self):
+        """Coalesces repeated refresh requests into one repaint per event loop."""
+        if self._canvas_refresh_timer:
+            self._canvas_refresh_timer.start()
+
+    def _run_canvas_refresh(self):
+        """Refreshes both stereo canvases once after rapid state changes settle."""
+        if self.canvas_left:
+            self.canvas_left.refresh()
+        if self.canvas_right:
+            self.canvas_right.refresh()
 
     # Z value updates using the mouse wheel
     @property
@@ -234,6 +327,94 @@ class QSgdSwmWindow(QMainWindow):
         self._z_proj_plane = z
         self.z_cursor = z  # @z_cursor.setter already propagates cursor update to canvases
 
+    def _sync_canvases_destination_crs(self):
+        """
+        Keeps stereo canvas destination CRS aligned to SWM service CRS whenever known.
+        Falls back to main canvas CRS only if SWM service CRS is not available yet.
+        """
+        try:
+            self._update_swm_service_crs_cache()
+
+            main_crs = self.qgis_main_canvas.mapSettings().destinationCrs()
+            if not main_crs or not main_crs.isValid():
+                return
+
+            target_crs = self._swm_service_crs if self._swm_service_crs and self._swm_service_crs.isValid() else main_crs
+
+            if self.canvas_left:
+                left_crs = self.canvas_left.mapSettings().destinationCrs()
+                if (not left_crs) or (not left_crs.isValid()) or (left_crs != target_crs):
+                    self.canvas_left.setDestinationCrs(target_crs)
+
+            if self.canvas_right:
+                right_crs = self.canvas_right.mapSettings().destinationCrs()
+                if (not right_crs) or (not right_crs.isValid()) or (right_crs != target_crs):
+                    self.canvas_right.setDestinationCrs(target_crs)
+
+        except Exception as e:
+            QgsMessageLog.logMessage(f"CRS: Error syncing stereo destination CRS: {str(e)}", "SWM-3D", Qgis.Warning)
+
+    def _update_swm_service_crs_cache(self):
+        """
+        Updates cached SWM service CRS from available SWM layers.
+        """
+        try:
+            for layer in self.qgis_main_canvas.layers():
+                if is_sgd_swm_layer(layer):
+                    layer_crs = layer.crs()
+                    if layer_crs and layer_crs.isValid():
+                        self._swm_service_crs = layer_crs
+                        return
+
+            if self.canvas_left and self.canvas_left.layer_swm:
+                layer_crs = self.canvas_left.layer_swm.crs()
+                if layer_crs and layer_crs.isValid():
+                    self._swm_service_crs = layer_crs
+                    return
+
+            if self.canvas_right and self.canvas_right.layer_swm:
+                layer_crs = self.canvas_right.layer_swm.crs()
+                if layer_crs and layer_crs.isValid():
+                    self._swm_service_crs = layer_crs
+                    return
+        except Exception:
+            pass
+
+    def _on_main_canvas_crs_changed(self, *args):
+        """
+        Reacts to main canvas destination CRS changes.
+        """
+        self._sync_canvases_destination_crs()
+        self._sync_canvases_repaint()
+
+    def _reproject_extent_to_stereo_crs(self, extent, target_canvas):
+        """
+        Reprojects an extent from main canvas CRS to the provided stereo canvas CRS (if different).
+        Returns the original extent if CRS match or if reprojection cannot be performed.
+        """
+        try:
+            if not target_canvas:
+                return extent
+                
+            source_crs = self.qgis_main_canvas.mapSettings().destinationCrs()
+            dest_crs = target_canvas.mapSettings().destinationCrs()
+            
+            if not source_crs or not source_crs.isValid():
+                return extent
+            if not dest_crs or not dest_crs.isValid():
+                return extent
+            if source_crs == dest_crs:
+                return extent
+                
+            # Create transform and reproject extent
+            trf = QgsCoordinateTransform(source_crs, dest_crs, QgsProject.instance())
+            reprojected = trf.transformBoundingBox(extent)
+            return reprojected
+        except Exception as e:
+            QgsMessageLog.logMessage(f"CRS: Error reprojecting extent to stereo CRS: {str(e)}",
+                                     "SWM-3D", Qgis.Warning)
+            return extent
+
     def _sync_canvases_cursor(self, point_xy):
         """
         Synchronizes the cursor position (XY) of the main QGIS canvas into the two steresocopic canvas.
@@ -250,25 +431,476 @@ class QSgdSwmWindow(QMainWindow):
         2) New projections should be loaded, updating Geometry Generator on Z layers and SWM layer.
         3) A final refresh is still needed so everything is repainted.
         """
+        self._sync_canvases_destination_crs()
         if self.canvas_left:
-            # QgsMessageLog.logMessage(f"[DEBUG] <sync_canvases_repaint> Refreshing LEFT canvas", "SWM-3D", Qgis.Info)
-            self.canvas_left.setExtent(self.qgis_main_canvas.extent())
-            # self.canvas_left.sync_layers()
-            self.canvas_left.refresh()
+            extent_left = self._reproject_extent_to_stereo_crs(self.qgis_main_canvas.extent(), self.canvas_left)
+            current_left_extent = self.canvas_left.extent()
+            if current_left_extent != extent_left:
+                self.canvas_left.setExtent(extent_left)
         if self.canvas_right:
-            # QgsMessageLog.logMessage(f"[DEBUG] <sync_canvases_repaint> Refreshing RIGHT canvas", "SWM-3D", Qgis.Info)
-            self.canvas_right.setExtent(self.qgis_main_canvas.extent())
-            # self.canvas_right.sync_layers()
-            self.canvas_right.refresh()
+            extent_right = self._reproject_extent_to_stereo_crs(self.qgis_main_canvas.extent(), self.canvas_right)
+            current_right_extent = self.canvas_right.extent()
+            if current_right_extent != extent_right:
+                self.canvas_right.setExtent(extent_right)
+        self._schedule_canvas_refresh()
 
     def _sync_canvases_layers(self):
         """
-        Propagate layer changes (add/remove/reorder) to plugin canvases.
+        Propagate layer changes (visibility, add/remove/reorder) to plugin canvases.
+        Reusing SWM layers is handled inside each stereo canvas to avoid
+        repeated WMS requests during visibility toggles.
         """
+        if self._layers_rolling_back:
+            return
+
+        # Keep hooks aligned with currently active Z layers.
+        self._update_digitizing_layer_hooks()
+        self._update_style_layer_hooks()
+
         if self.canvas_left:
             self.canvas_left.sync_layers()
         if self.canvas_right:
             self.canvas_right.sync_layers()
+
+        # Layer visibility/type changes can update SWM service CRS availability.
+        self._update_swm_service_crs_cache()
+        self._sync_canvases_destination_crs()
+        # Do not force an immediate repaint here: sync_layers() already triggers
+        # render passes and forcing repaint duplicates WMS GetMap requests.
+
+    def _schedule_layers_sync(self, *args):
+        """
+        Coalesces rapid layer/tree events into a single sync pass.
+        This prevents duplicate sync_layers() calls for one user action.
+        """
+        if self._layers_rolling_back:
+            return
+
+        if self._layer_sync_timer:
+            self._layer_sync_timer.start()
+
+    def _update_digitizing_layer_hooks(self):
+        """
+        Connects editing interceptors for currently visible vector layers.
+        """
+        try:
+            current_vector_layers = {}
+            for layer in self.iface.mapCanvas().layers():
+                if isinstance(layer, QgsVectorLayer):
+                    current_vector_layers[layer.id()] = layer
+
+            # Disconnect removed hooks first.
+            for layer_id in list(self._layer_edit_hooks.keys()):
+                if layer_id not in current_vector_layers:
+                    self._disconnect_digitizing_hooks(layer_id)
+
+            # Connect new hooks.
+            for layer_id, layer in current_vector_layers.items():
+                if layer_id not in self._layer_edit_hooks:
+                    self._connect_digitizing_hooks(layer)
+
+        except Exception as e:
+            QgsMessageLog.logMessage(f"INTERCEPTOR: Error updating hooks: {str(e)}", "SWM-3D", Qgis.Warning)
+
+    def _update_style_layer_hooks(self):
+        """
+        Connects style-change hooks for currently visible Z-enabled vector layers.
+        These hooks trigger immediate renderer synchronization in stereo canvases.
+        """
+        try:
+            current_z_layers = {}
+            for layer in self.iface.mapCanvas().layers():
+                if is_z_layer(layer):
+                    current_z_layers[layer.id()] = layer
+
+            for layer_id in list(self._layer_style_hooks.keys()):
+                if layer_id not in current_z_layers:
+                    self._disconnect_style_hooks(layer_id)
+
+            for layer_id, layer in current_z_layers.items():
+                if layer_id not in self._layer_style_hooks:
+                    self._connect_style_hooks(layer)
+
+        except Exception as e:
+            QgsMessageLog.logMessage(f"STYLE_SYNC: Error updating style hooks: {str(e)}", "SWM-3D", Qgis.Warning)
+
+    def _connect_style_hooks(self, layer):
+        """
+        Connects renderer/style change signals for one Z-enabled layer.
+        """
+        try:
+            style_slot = lambda *args, lyr=layer: self._on_layer_style_changed(lyr)
+
+            if hasattr(layer, 'rendererChanged'):
+                layer.rendererChanged.connect(style_slot)
+            if hasattr(layer, 'styleChanged'):
+                layer.styleChanged.connect(style_slot)
+
+            self._layer_style_hooks[layer.id()] = {
+                "layer": layer,
+                "style_slot": style_slot,
+            }
+
+        except Exception as e:
+            QgsMessageLog.logMessage(f"STYLE_SYNC: Error connecting hooks for {layer.name()}: {str(e)}", "SWM-3D", Qgis.Warning)
+
+    def _disconnect_style_hooks(self, layer_id):
+        """
+        Disconnects style hooks for one layer id.
+        """
+        hook = self._layer_style_hooks.get(layer_id)
+        if not hook:
+            return
+
+        layer = hook.get("layer")
+        style_slot = hook.get("style_slot")
+
+        try:
+            if layer and style_slot:
+                if hasattr(layer, 'rendererChanged'):
+                    layer.rendererChanged.disconnect(style_slot)
+                if hasattr(layer, 'styleChanged'):
+                    layer.styleChanged.disconnect(style_slot)
+        except (RuntimeError, TypeError):
+            pass
+
+        self._layer_style_hooks.pop(layer_id, None)
+
+    def _disconnect_all_style_hooks(self):
+        """
+        Disconnects all style hooks.
+        """
+        for layer_id in list(self._layer_style_hooks.keys()):
+            self._disconnect_style_hooks(layer_id)
+
+    def _on_layer_style_changed(self, layer):
+        """
+        Handles style changes from the main layer and schedules a debounced
+        propagation to stereo canvases.
+        """
+        try:
+            if not is_z_layer(layer):
+                return
+
+            self._schedule_style_sync()
+
+        except Exception as e:
+            QgsMessageLog.logMessage(f"STYLE_SYNC: Error syncing style for {layer.name()}: {str(e)}", "SWM-3D", Qgis.Warning)
+
+    def _schedule_style_sync(self):
+        """
+        Schedules style synchronization with debounce to avoid repeated
+        expensive resyncs while the user is editing symbology.
+        """
+        self._pending_style_sync = True
+        self._style_sync_timer.start()
+
+    def _run_pending_style_sync(self):
+        """
+        Runs the queued style synchronization once debounce interval expires.
+        """
+        if not self._pending_style_sync:
+            return
+
+        self._pending_style_sync = False
+        try:
+            if self.canvas_left:
+                self.canvas_left.sync_layers()
+            if self.canvas_right:
+                self.canvas_right.sync_layers()
+            self._schedule_canvas_refresh()
+        except Exception as e:
+            QgsMessageLog.logMessage(f"STYLE_SYNC: Error in debounced sync: {str(e)}", "SWM-3D", Qgis.Warning)
+
+    def _connect_digitizing_hooks(self, layer):
+        """
+        Connect feature and geometry edit signals for one vector layer.
+        """
+        try:
+            feature_slot = lambda fid, lyr=layer: self._on_layer_feature_added(lyr, fid)
+            geometry_slot = lambda fid, geom, lyr=layer: self._on_layer_geometry_changed(lyr, fid, geom)
+            before_rollback_slot = lambda lyr=layer: self._on_layer_before_rollback(lyr)
+            after_rollback_slot = lambda lyr=layer: self._on_layer_after_rollback(lyr)
+
+            layer.featureAdded.connect(feature_slot)
+            layer.geometryChanged.connect(geometry_slot)
+            connected_before_rollback_signal = None
+            connected_after_rollback_signal = None
+            for signal_name in ('beforeRollBack', 'beforeRollback'):
+                if hasattr(layer, signal_name):
+                    getattr(layer, signal_name).connect(before_rollback_slot)
+                    connected_before_rollback_signal = signal_name
+                    break
+            for signal_name in ('afterRollBack', 'afterRollback'):
+                if hasattr(layer, signal_name):
+                    getattr(layer, signal_name).connect(after_rollback_slot)
+                    connected_after_rollback_signal = signal_name
+                    break
+
+            self._layer_edit_hooks[layer.id()] = {
+                "layer": layer,
+                "feature_slot": feature_slot,
+                "geometry_slot": geometry_slot,
+                "before_rollback_slot": before_rollback_slot,
+                "after_rollback_slot": after_rollback_slot,
+                "before_rollback_signal": connected_before_rollback_signal,
+                "after_rollback_signal": connected_after_rollback_signal,
+            }
+
+        except Exception as e:
+            QgsMessageLog.logMessage(f"INTERCEPTOR: Error connecting layer hooks: {str(e)}", "SWM-3D", Qgis.Warning)
+
+    def _disconnect_digitizing_hooks(self, layer_id):
+        """
+        Disconnect feature and geometry edit signals for one layer.
+        """
+        hook = self._layer_edit_hooks.get(layer_id)
+        if not hook:
+            return
+
+        layer = hook.get("layer")
+        if layer is None:
+            self._layer_edit_hooks.pop(layer_id, None)
+            return
+
+        try:
+            layer.featureAdded.disconnect(hook["feature_slot"])
+        except Exception:
+            pass
+
+        try:
+            layer.geometryChanged.disconnect(hook["geometry_slot"])
+        except Exception:
+            pass
+
+        try:
+            signal_name = hook.get("before_rollback_signal")
+            if signal_name and hook.get("before_rollback_slot") and hasattr(layer, signal_name):
+                getattr(layer, signal_name).disconnect(hook["before_rollback_slot"])
+        except Exception:
+            pass
+
+        try:
+            signal_name = hook.get("after_rollback_signal")
+            if signal_name and hook.get("after_rollback_slot") and hasattr(layer, signal_name):
+                getattr(layer, signal_name).disconnect(hook["after_rollback_slot"])
+        except Exception:
+            pass
+
+        self._layer_edit_hooks.pop(layer_id, None)
+        self._layers_rolling_back.discard(layer_id)
+        # Drop per-feature Z history for removed layer hooks.
+        keys_to_remove = [k for k in self._feature_vertex_z_history.keys() if k[0] == layer_id]
+        for k in keys_to_remove:
+            self._feature_vertex_z_history.pop(k, None)
+        self._pending_digitize_z_clicks.pop(layer_id, None)
+        self._last_click_capture.pop(layer_id, None)
+
+    def _disconnect_all_digitizing_hooks(self):
+        """
+        Disconnect all currently registered layer edit hooks.
+        """
+        for layer_id in list(self._layer_edit_hooks.keys()):
+            self._disconnect_digitizing_hooks(layer_id)
+        self._geometry_update_guard.clear()
+        self._feature_vertex_z_history.clear()
+        self._pending_digitize_z_clicks.clear()
+        self._last_click_capture.clear()
+        self._layers_rolling_back.clear()
+
+    def _on_layer_before_rollback(self, layer):
+        """
+        Temporarily disable edit-driven sync while layer rollback is running.
+        """
+        try:
+            self._layers_rolling_back.add(layer.id())
+            if self._layer_sync_timer and self._layer_sync_timer.isActive():
+                self._layer_sync_timer.stop()
+            self._geometry_update_guard.clear()
+            keys_to_remove = [k for k in self._feature_vertex_z_history.keys() if k[0] == layer.id()]
+            for k in keys_to_remove:
+                self._feature_vertex_z_history.pop(k, None)
+            self._pending_digitize_z_clicks.pop(layer.id(), None)
+            self._last_click_capture.pop(layer.id(), None)
+        except Exception:
+            pass
+
+    def _is_capture_map_tool_active(self) -> bool:
+        """
+        Returns True when a QGIS capture map tool (line/polygon digitizing) appears active.
+        """
+        try:
+            tool = self.iface.mapCanvas().mapTool() if self.iface and self.iface.mapCanvas() else None
+            if not tool:
+                return False
+            tool_name = type(tool).__name__
+            if "Identify" in tool_name:
+                return False
+            return (
+                "Capture" in tool_name
+                or "DigitizeFeature" in tool_name
+                or "AddFeature" in tool_name
+            )
+        except Exception:
+            return False
+
+    def _on_layer_after_rollback(self, layer):
+        """
+        Re-enable edit-driven sync after rollback and refresh stereo layers once.
+        """
+        try:
+            self._layers_rolling_back.discard(layer.id())
+            self._schedule_layers_sync()
+        except Exception:
+            pass
+
+    def _on_layer_feature_added(self, layer, fid: int):
+        """
+        Triggered when a new feature is digitized.
+        """
+        if layer.id() in self._layers_rolling_back:
+            return
+
+        if is_z_layer(layer):
+            # Defer Z write so we do not mutate geometry re-entrantly
+            # while QGIS is still finalizing the edit command/undo state.
+            QTimer.singleShot(0, lambda lyr=layer, feature_id=fid: self._apply_cursor_z_to_feature(lyr, feature_id, None))
+        self._schedule_layers_sync()
+        self._schedule_canvas_refresh()
+
+    def _on_layer_geometry_changed(self, layer, fid: int, geom: QgsGeometry):
+        """
+        Triggered when an edited geometry changes.
+        """
+        if layer.id() in self._layers_rolling_back:
+            return
+
+        if is_z_layer(layer):
+            self._capture_feature_vertex_z(layer, fid, geom)
+
+        # Keep this handler read-only for stability during undo/rollback flows.
+        self._schedule_layers_sync()
+        self._schedule_canvas_refresh()
+
+    def _capture_feature_vertex_z(self, layer, fid: int, geom: QgsGeometry):
+        """
+        Captures Z per vertex as digitizing progresses for one feature.
+        Only appends values when vertex count grows.
+        """
+        try:
+            if not geom or geom.isEmpty():
+                return
+            const_geom = geom.constGet()
+            if const_geom is None:
+                return
+
+            key = (layer.id(), int(fid))
+            vertex_count = const_geom.vertexCount()
+            if vertex_count <= 0:
+                self._feature_vertex_z_history.pop(key, None)
+                return
+
+            z_history = self._feature_vertex_z_history.setdefault(key, [])
+
+            if len(z_history) > vertex_count:
+                z_history[:] = z_history[:vertex_count]
+
+            cursor_z = float(self.z_cursor)
+            while len(z_history) < vertex_count:
+                src_idx = len(z_history)
+                src_v = geom.vertexAt(src_idx)
+                src_z = src_v.z()
+                if math.isfinite(src_z):
+                    z_history.append(float(src_z))
+                else:
+                    z_history.append(cursor_z)
+
+        except Exception as e:
+            QgsMessageLog.logMessage(f"INTERCEPTOR: Error capturing vertex Z for feature {fid}: {str(e)}", "SWM-3D", Qgis.Warning)
+
+    def _apply_cursor_z_to_feature(self, layer, fid: int, geom: Optional[QgsGeometry]):
+        """
+        Assigns current cursor Z to vertices that still have Z=0 or non-finite Z.
+        """
+        if layer.id() in self._layers_rolling_back:
+            return
+
+        guard_key = (layer.id(), int(fid))
+        if guard_key in self._geometry_update_guard:
+            return
+
+        try:
+            working_geom = QgsGeometry(geom) if geom else QgsGeometry()
+            if working_geom.isEmpty():
+                feature = layer.getFeature(fid)
+                if not feature.isValid():
+                    return
+                working_geom = feature.geometry()
+
+            if not working_geom or working_geom.isEmpty():
+                return
+
+
+            const_geom = working_geom.constGet()
+            if const_geom is None:
+                return
+
+            changed = False
+            key = (layer.id(), int(fid))
+            z_history = self._feature_vertex_z_history.get(key)
+            vtx_count = const_geom.vertexCount()
+
+            # Primary fallback for featureAdded timing race: use recorded click Z values.
+            if (not z_history) and vtx_count > 0:
+                pending = self._pending_digitize_z_clicks.get(layer.id(), [])
+                if len(pending) >= vtx_count:
+                    z_history = pending[-vtx_count:].copy()
+                    del pending[-vtx_count:]
+                    if not pending:
+                        self._pending_digitize_z_clicks.pop(layer.id(), None)
+
+            if (not z_history) and self.canvas_left and hasattr(self.canvas_left, 'get_tracked_z_for_geometry'):
+                try:
+                    z_history = self.canvas_left.get_tracked_z_for_geometry(working_geom)
+                except Exception:
+                    z_history = self._feature_vertex_z_history.get(key)
+            if (not z_history) and self.canvas_right and hasattr(self.canvas_right, 'get_tracked_z_for_geometry'):
+                try:
+                    z_history = self.canvas_right.get_tracked_z_for_geometry(working_geom)
+                except Exception:
+                    z_history = self._feature_vertex_z_history.get(key)
+            for i in range(vtx_count):
+                vertex = working_geom.vertexAt(i)
+                if z_history and i < len(z_history):
+                    z_to_apply = float(z_history[i])
+                else:
+                    z_to_apply = float(self.z_cursor)
+                current_z = vertex.z()
+                if (not math.isfinite(current_z)) or abs(current_z) < 1e-9 or abs(current_z - z_to_apply) > 1e-6:
+                    vertex.setZ(z_to_apply)
+                    if working_geom.moveVertex(vertex, i):
+                        changed = True
+
+            if not changed:
+                return
+
+            self._geometry_update_guard.add(guard_key)
+            ok = layer.changeGeometry(fid, working_geom)
+            if ok:
+                # Geometry is persisted; tracker is no longer needed for this feature.
+                self._feature_vertex_z_history.pop(key, None)
+                self._pending_digitize_z_clicks.pop(layer.id(), None)
+                self._last_click_capture.pop(layer.id(), None)
+            else:
+                QgsMessageLog.logMessage(
+                    f"INTERCEPTOR: Failed applying Z to feature {fid} in '{layer.name()}'",
+                    "SWM-3D", Qgis.Warning
+                )
+
+        except Exception as e:
+            QgsMessageLog.logMessage(f"INTERCEPTOR: Error applying Z to feature {fid}: {str(e)}", "SWM-3D", Qgis.Warning)
+        finally:
+            self._geometry_update_guard.discard(guard_key)
 
     def eventFilter(self, obj, event):
         """
@@ -286,6 +918,47 @@ class QSgdSwmWindow(QMainWindow):
                 return True
 
             # Wheel-based Z control
+            if event.type() == QEvent.Type.MouseButtonPress:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    try:
+                        main_canvas = self.iface.mapCanvas() if self.iface else None
+                        from_main_canvas = False
+                        if main_canvas:
+                            vp = main_canvas.viewport() if hasattr(main_canvas, 'viewport') else None
+                            from_main_canvas = (obj is main_canvas) or (vp is not None and obj is vp)
+
+                        active_layer = self.iface.activeLayer() if self.iface else None
+                        if (
+                            not is_stereo_object
+                            and from_main_canvas
+                            and isinstance(active_layer, QgsVectorLayer)
+                            and active_layer.isEditable()
+                            and is_z_layer(active_layer)
+                            and self._is_capture_map_tool_active()
+                        ):
+                            pending = self._pending_digitize_z_clicks.setdefault(active_layer.id(), [])
+                            current_z = float(self.z_cursor)
+                            if len(pending) > 512:
+                                del pending[:-512]
+                            tool_name = ""
+                            if main_canvas and hasattr(main_canvas, 'mapTool'):
+                                tool = main_canvas.mapTool()
+                                tool_name = type(tool).__name__ if tool else ""
+
+                            now = time.monotonic()
+                            last = self._last_click_capture.get(active_layer.id())
+                            is_duplicate = False
+                            if last:
+                                last_t, last_z, last_tool = last
+                                if (now - last_t) < 0.25 and abs(last_z - current_z) < 1e-6 and last_tool == tool_name:
+                                    is_duplicate = True
+
+                            if not is_duplicate:
+                                pending.append(current_z)
+                                self._last_click_capture[active_layer.id()] = (now, current_z, tool_name)
+                    except Exception:
+                        pass
+
             if event.type() == QEvent.Type.Wheel:
                 modifiers = QApplication.keyboardModifiers()
                 if not (modifiers & Qt.KeyboardModifier.AltModifier):
@@ -297,14 +970,11 @@ class QSgdSwmWindow(QMainWindow):
                 elif modifiers & Qt.KeyboardModifier.ShiftModifier:
                     delta *= 10.
                     
-                old_z = self.z_cursor
                 self.z_cursor = round(self.z_cursor + delta, 1)
-                
-                QgsMessageLog.logMessage(f"Z changed: {old_z} → {self._z_cursor}", "SWM-3D", Qgis.Info)
                 return True
                 
             return False
-        except:
+        except Exception:
             return False
 
     def network_reply_handle(self, reply):
@@ -316,7 +986,9 @@ class QSgdSwmWindow(QMainWindow):
         this method is connected to QgsNetworkAccessManager's finished() signal,
         which is emitted every time a server response is received.
         """
-        if not self.isVisible():
+        # Do not require window visibility here: first SWM headers can arrive
+        # during startup before the stereo window is fully shown.
+        if not self.canvas_left and not self.canvas_right:
             return
         request_url = reply.request().url().toString()
 

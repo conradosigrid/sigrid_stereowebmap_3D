@@ -42,8 +42,6 @@ import math
 from qgis.core import QgsGeometry, QgsPointXY, QgsWkbTypes
 from qgis.utils import qgsfunction
 
-from qgis.core import QgsMessageLog, Qgis  # for debug messages.
-
 # ------------------------------------------------------------------
 # Parsing cache (key = header text) to avoid reparsing each time
 # ------------------------------------------------------------------
@@ -165,33 +163,39 @@ def perspective_swm_transform(geometry, side, txt_trf_wrl2pht, txt_trf_pht2prp):
 
     # -------------------------------
     # Point or multipoint
-    # Regardless of original type, layer points arrive here one by one.
     # -------------------------------
     if gtype == QgsWkbTypes.PointGeometry:
-        # p = geometry.asPoint()  # Causes silent exceptions captured internally by C++
-        it = geometry.vertices()
-        p = next(it, None)
-        if p is None:
-            QgsMessageLog.logMessage("[DEBUG] perspective_swm_transform: invalid POINTZ", "SWM-3D", Qgis.Warning)
+        transformed_points = []
+
+        for p in geometry.vertices():
+            z = p.z()
+            if not math.isfinite(z):
+                if p.isMeasure() and math.isfinite(p.m()):
+                    z = p.m()
+                else:
+                    continue
+
+            res = world_to_photo(p.x(), p.y(), z, x0, y0, z0, df, r)
+            if not res:
+                continue
+
+            photo_x, photo_y = res[0], res[1]
+
+            res = photo_to_proj(photo_x, photo_y, a, b, c)
+            if not res:
+                continue
+
+            proj_x, proj_y = res[0], res[1]
+
+            transformed_points.append(QgsPointXY(proj_x, proj_y))
+
+        if not transformed_points:
             return geometry
 
-        z = p.z()
-        if not math.isfinite(z):
-            if p.isMeasure() and math.isfinite(p.m()):
-                z = p.m() 
-            else:
-                QgsMessageLog.logMessage("[DEBUG] perspective_swm_transform: POINTZ without Z", "SWM-3D", Qgis.Warning)
-                return geometry
+        if len(transformed_points) == 1:
+            return QgsGeometry.fromPointXY(transformed_points[0])
 
-        res = world_to_photo(p.x(), p.y(), z, x0, y0, z0, df, r)
-        if not res:
-            return geometry
-
-        res = photo_to_proj(res[0], res[1], a, b, c)
-        if not res:
-            return geometry
-
-        return QgsGeometry.fromWkt(f"POINT ({res[0]} {res[1]})")
+        return QgsGeometry.fromMultiPointXY(transformed_points)
 
     # --------------------------------------------------
     # LineString MultiLineString, ... LineZ, LineM, LineZM, MultiLineZ, MultiLineM, MultiLineZM
@@ -210,7 +214,9 @@ def perspective_swm_transform(geometry, side, txt_trf_wrl2pht, txt_trf_pht2prp):
             if not res:
                 continue
 
-            res = photo_to_proj(res[0], res[1], a, b, c)
+            photo_x, photo_y = res[0], res[1]
+
+            res = photo_to_proj(photo_x, photo_y, a, b, c)
             if not res:
                 continue
 
@@ -222,41 +228,60 @@ def perspective_swm_transform(geometry, side, txt_trf_wrl2pht, txt_trf_pht2prp):
         return QgsGeometry.fromPolylineXY(new_line)
         
     # --------------------------------------------------
-    # Polygon, Multipolygo PolygonZ, PolygonM, PolygonZM, MultiPolygon, MultiPolygonZ, MultiPolygonZM
+    # Polygon, PolygonZ, PolygonM, PolygonZM, MultiPolygon, MultiPolygonZ, MultiPolygonZM
     # WkbType can be any of the previous ones, but polygon features are processed one by one.
+    #
+    # IMPORTANT: geometry.vertices() iterates ALL vertices of ALL rings (exterior + interior)
+    # as a flat sequence. Building a single ring from that flat list causes bridge lines
+    # between the end of one ring and the start of the next.
+    # The fix: process the exterior ring and each interior ring (hole) independently,
+    # then reconstruct with QgsGeometry.fromPolygonXY([exterior, hole1, hole2, ...]).
     # --------------------------------------------------
     elif gtype == QgsWkbTypes.PolygonGeometry:
-        ring = []
-
-        # Iterate all polygon vertices safely
-        for p in geometry.vertices():
-            z = p.z()
-            if not math.isfinite(z):
-                continue
-
-            res = world_to_photo(p.x(), p.y(), z, x0, y0, z0, df, r)
-            if not res:
-                continue
-
-            res = photo_to_proj(res[0], res[1], a, b, c)
-            if not res:
-                continue
-
-            ring.append(QgsPointXY(res[0], res[1]))
-
-        # Close last ring
-        if len(ring) < 3:
+        const_geom = geometry.constGet()
+        if const_geom is None:
             return geometry
-        
-        if ring[0] != ring[-1]:
-            ring.append(ring[0])
 
-        if len(ring) < 4:
+        def _transform_ring(ring_geom):
+            pts = []
+            for p in ring_geom.vertices():
+                z = p.z()
+                if not math.isfinite(z):
+                    continue
+                res = world_to_photo(p.x(), p.y(), z, x0, y0, z0, df, r)
+                if not res:
+                    continue
+                res = photo_to_proj(res[0], res[1], a, b, c)
+                if not res:
+                    continue
+                pts.append(QgsPointXY(res[0], res[1]))
+            if len(pts) >= 3 and pts[0] != pts[-1]:
+                pts.append(pts[0])
+            return pts
+
+        all_rings = []
+
+        # Exterior ring
+        ext_ring = const_geom.exteriorRing()
+        if ext_ring is not None:
+            pts = _transform_ring(ext_ring)
+            if len(pts) >= 4:
+                all_rings.append(pts)
+
+        # Interior rings (holes) — each one transformed independently
+        for i in range(const_geom.numInteriorRings()):
+            int_ring = const_geom.interiorRing(i)
+            if int_ring is None:
+                continue
+            pts = _transform_ring(int_ring)
+            if len(pts) >= 4:
+                all_rings.append(pts)
+
+        if not all_rings:
             return geometry
-        
-        return QgsGeometry.fromPolygonXY([ring])
+
+        return QgsGeometry.fromPolygonXY(all_rings)
 
     else:
         # Unsupported geometries
-        QgsMessageLog.logMessage(f"[DEBUG] expression: Unsupported geometry type: {gtype}", "SWM-3D", Qgis.Info)
         return geometry

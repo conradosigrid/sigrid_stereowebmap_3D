@@ -1,6 +1,6 @@
-﻿# SIGRID_SWM_3D - QGIS Plugin - Version 0.5.1
+﻿# SIGRID_SWM_3D - QGIS Plugin - Version 0.6.1
 
-![Version](https://img.shields.io/badge/version-0.5.1-blue)
+![Version](https://img.shields.io/badge/version-6.1-blue)
 ![QGIS](https://img.shields.io/badge/QGIS-4.x-green)
 ![OS](https://img.shields.io/badge/OS-Windows-0078D6)
 
@@ -23,6 +23,7 @@
 10. [Visual Walkthrough](#10-visual-walkthrough)
 11. [License](#11-license)
 12. [Authors and Contributors](#12-authors-and-contributors)
+13. [Technical notes](#13-technical-notes)
 
 ## 1. Description
 
@@ -70,6 +71,21 @@ Expected behavior:
 
 ## 5. Changes
 
+### Version 0.6.1
+- Incorporated overlapping stereos (anaglyph and interlaced).
+- Automatic transmission of symbology changes to the stereo canvases.
+- Visible-invisible switching on main canvas 
+
+### Version 0.6.0
+- Corrected vertex displacement in polyline.
+- Automatic transmission of symbology changes to the stereo canvases.
+- Visible-invisible switching on main canvas instantly reflected on stereo canvas
+- Fixed drawing issue with main canvas boundaries in stereo canvases
+- Corrected text of Z not reflected in stereo canvas where appropriate.
+- Cloning Map Canvas Items from the main canvas to the stereo canvases.
+- Verification of proper functioning of QGIS digitization tools on stereo canvases with correct capture and display of Z
+- Solved problem of drawing connection lines in the case of multiple figures (points, lines or polygons).
+
 ### Version 0.5.1
 - Prevent the cursor from entering the photogrammetric window.
 - Translate all code comments into English.
@@ -83,12 +99,10 @@ Expected behavior:
   - Scalability
   - *QGIS-native* approach
   - Long-term maintainability
-
 - Code adapted to **Qt 6**, the new standard in **QGIS 4**.  
   Although this is not the current LTR release, **SWM-3D** development targets this version,
   which is expected to become LTR in the future. The improvements introduced in the Qt 6
   libraries justify this decision.
-
 - Introduction of additional error handling to prevent unexpected *crashes* and  
   ensure that failures are reported explicitly and in a controlled manner.
 
@@ -118,18 +132,10 @@ Expected behavior:
 
 ## 7. Known Issues
 
-### Overlay Stereo Modes Not Working
-- Currently, stereo modes based on overlaying the two images (left and right) with transparency are not working: anaglyph and interlaced stereo.
+### The last segment is not visible in the stereo canvases during line and segment digitization tasks. 
+- This segment connects the last digitized vertex to the cursor position and is visible in the main canvas but not in the stereo canvases.
+- It could not be implemented in the stereo canvases because its handling is contained within QGIS's C++ code and is not accessible from Python. This is a purely graphical feature, so it was decided not to include it in the stereo canvases because it would complicate the stability and ease of tracking of the plugin's code.
 
-### Vector Layer Overlay with Z
-- This functionality has not yet been fully implemented and debugged.
-- PointZ and MultiPointZ entities are causing problems.
-- For linear and polygonal entities, it sometimes fails when the first model is loaded. After that, it seems to work correctly.
-
-### Duplication of map canvas items from the main canvas to stereoscopic canvases
-- This duplication is experiencing problems.
-- Sometimes excessive delay is observed.
-- In map canvas items with a Z value per vertex, items are often not replicated and captured correctly.
 
 ### Stereoscopy is less clear for flights that are not east-west passes
 - Because the images are rotated, stereoscopy is not clearly visible in these cases.
@@ -148,8 +154,6 @@ The most immediate developments from this baseline version are:
 
 - Correct the issues pointed out in the previous section.
 - Test and refine the stereoscopic rendering on different hardware setups, especially the dual-screen with a 45-degree mirror.
-- Add visualization support for **anaglyph** and **interlaced horizontal lines** systems.
-- Begin incorporating delineation tools that work directly on the stereoscopic views.
 
 ---
 
@@ -208,3 +212,39 @@ This plugin is provided under the terms of the LICENSE file included in this rep
 
 **Repository:** https://github.com/conradosigrid/sigrid_stereowebmap_3D  
 **Issue Tracker:** https://github.com/conradosigrid/sigrid_stereowebmap_3D/issues
+
+## 13. Technical notes
+
+### 13.1 Rendering paths and regression checks
+
+This plugin uses two different geometry paths, and they do not behave the same internally.
+
+Path A: layer rendering (QGIS renderer + expressions)
+- Used for normal map layers.
+- QGIS applies the renderer pipeline, including Geometry Generator expressions.
+- Geometry structure (multipart, rings, holes) is handled by the layer rendering engine.
+
+Path B: canvas items (rubber bands, vertex markers)
+- Used for interactive temporary items from tools.
+- These are not rendered by the layer renderer pipeline.
+- The plugin clones/transforms geometry directly in Python before assigning it to the stereo canvases.
+
+Why explicit ring/part handling is required in Path B
+- A MultiPolygon is not just a list of points; it is a set of polygon parts, each with one outer ring and optional inner rings.
+- If vertices are flattened into one sequence, the last vertex of one part can be connected to the first vertex of another part.
+- The visible effect is a false bridge line between polygons (same risk for multiline/multipoint shape integrity).
+
+What a regression test means here
+- A regression test is a permanent check to ensure a fixed bug does not return later.
+- In this project, the multipart regression check verifies that transformed output keeps:
+  - MultiPoint as multi-point with same part count.
+  - MultiLineString as multi-line with independent parts.
+  - MultiPolygon as multi-polygon without bridge segments between parts.
+
+### 13.2 Geometry structure
+
+_Reserved for future notes about multipart geometry handling, ring preservation, and related rendering details._
+
+### 13.3 Regression checks
+
+_Reserved for future notes about manual smoke tests, reproduction steps, and validation checks._

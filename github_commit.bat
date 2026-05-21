@@ -30,12 +30,11 @@ if "%~1"=="" (
     )
 )
 
-REM Stage, commit and push
+REM Stage and commit only (no push)
 "%GIT_EXE%" add --all .
 "%GIT_EXE%" diff --cached --quiet
 if errorlevel 1 (
     "%GIT_EXE%" commit -m "%COMMIT_MSG%"
-    "%GIT_EXE%" push origin main
 ) else (
     echo No changes to commit.
 )

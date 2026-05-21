@@ -1,6 +1,6 @@
 ﻿# SIGRID_SWM_3D - QGIS Plugin - Version 0.6.1
 
-![Version](https://img.shields.io/badge/version-0.5.1-blue)
+![Version](https://img.shields.io/badge/version-6.1-blue)
 ![QGIS](https://img.shields.io/badge/QGIS-4.x-green)
 ![OS](https://img.shields.io/badge/OS-Windows-0078D6)
 

@@ -29,7 +29,7 @@ from qgis.PyQt.QtCore import Qt, QEvent, QTimer
 import re
 import math
 import time
-from typing import Dict, Any, Set, Tuple, Optional, List
+from typing import Dict, Any, Set, Tuple, Optional, List, cast
 
 # SWM libraries
 from .canvas import QgsSgdSwmCanvas
@@ -57,6 +57,8 @@ class QSgdSwmWindow(QMainWindow):
         self._has_received_swm_reply = False
         # Cached fixed CRS of SWM service (from capabilities/layer metadata)
         self._swm_service_crs = None
+        # Stereo projection is only active when the main canvas is zoomed in to this scale or more.
+        self._stereo_activation_scale_threshold = 100000.0
         self._flight_rotation_threshold_deg = 10.0
         self._flight_rotation_current_deg = 0.0
         self._photo_center_left = None   # (x0, y0) world coords of left photo
@@ -243,6 +245,25 @@ class QSgdSwmWindow(QMainWindow):
         except Exception:
             pass
 
+    def _is_stereo_projection_active(self) -> bool:
+        """Returns True when the main canvas scale is within the stereo activation range."""
+        try:
+            if not self.qgis_main_canvas:
+                return True
+
+            scale_getter = getattr(self.qgis_main_canvas, 'scale', None)
+            if callable(scale_getter):
+                main_scale = float(cast(Any, scale_getter()))
+            else:
+                map_settings = self.qgis_main_canvas.mapSettings() if hasattr(self.qgis_main_canvas, 'mapSettings') else None
+                if not map_settings or not hasattr(map_settings, 'scale'):
+                    return True
+                main_scale = float(map_settings.scale())
+
+            return main_scale <= float(self._stereo_activation_scale_threshold)
+        except Exception:
+            return True
+
     def _update_auto_flight_rotation(self):
         """
         Computes and applies automatic rotation compensation for tilted flight strips.
@@ -252,6 +273,16 @@ class QSgdSwmWindow(QMainWindow):
         horizontal (nearest 0 or 180 degrees).
         """
         if self._photo_center_left is None or self._photo_center_right is None:
+            return
+
+        # Keep flight-strip auto-rotation disabled outside stereo-active scales.
+        if not self._is_stereo_projection_active():
+            target_rotation = 0.0
+            if abs(target_rotation - self._flight_rotation_current_deg) < 0.05:
+                return
+            self._flight_rotation_current_deg = target_rotation
+            self._apply_rotation_to_all_canvases(target_rotation)
+            self._schedule_canvas_refresh()
             return
 
         x_l, y_l = self._photo_center_left
@@ -531,6 +562,9 @@ class QSgdSwmWindow(QMainWindow):
             current_right_extent = self.canvas_right.extent()
             if current_right_extent != extent_right:
                 self.canvas_right.setExtent(extent_right)
+
+        # Re-evaluate strip-rotation activation whenever scale changes (zoom/pan).
+        self._update_auto_flight_rotation()
         self._schedule_canvas_refresh()
 
     def _sync_canvases_layers(self):

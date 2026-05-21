@@ -140,6 +140,15 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             self.mapCanvasRefreshed.connect(self.update)
             self.mapCanvasRefreshed.connect(self._schedule_base_capture)
 
+    def _is_stereo_projection_active(self) -> bool:
+        """Delegates stereo activation to the parent window when available."""
+        try:
+            if self.parent and hasattr(self.parent, '_is_stereo_projection_active'):
+                return bool(self.parent._is_stereo_projection_active())
+        except Exception:
+            pass
+        return True
+
     def _schedule_base_capture(self):
         """Schedule raw viewport capture after Qt finishes repainting."""
         QTimer.singleShot(0, self._capture_base_buffer)
@@ -173,7 +182,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         point_wrl = self._reproject_point_to_world(point_xy)
         
         # Calculate projected position
-        if self.trf_wld2prp:
+        if self.trf_wld2prp and self._is_stereo_projection_active():
             pnt_wrl = QgsPoint(point_wrl.x(), point_wrl.y(), z)
             pnt_prj = self.trf_wld2prp.execute_wrl2prp(pnt_wrl)
             if pnt_prj:
@@ -490,7 +499,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             
             # Copy and transform position
             center = source.center()
-            if center and self.trf_wld2prp:
+            if center and self.trf_wld2prp and self._is_stereo_projection_active():
                 matched_center = self._get_vertex_marker_center_from_synced_rubber_band(source, QgsPointXY(center.x(), center.y()))
                 if matched_center is not None:
                     target.setCenter(matched_center)
@@ -840,7 +849,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
 
                 geom_world = self._reproject_geometry_to_world(geom_for_render)
                 
-                if self.trf_wld2prp:
+                if self.trf_wld2prp and self._is_stereo_projection_active():
                     transformed_geom = self._transform_geometry(geom_world, source)
                     if transformed_geom:
                         target.setToGeometry(transformed_geom, None)
@@ -948,7 +957,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         Input geometry must already contain assigned Z values.
         """
         try:
-            if not self.trf_wld2prp or not geom or geom.isEmpty():
+            if not self._is_stereo_projection_active() or not self.trf_wld2prp or not geom or geom.isEmpty():
                 return geom
 
             # Geometry cache: include dynamic Z state because rubber-band geometry is often 2D.
@@ -1656,6 +1665,9 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         Returns a 2D passthrough when no photogrammetric transform is available.
         """
         geometry_input_expr = "$geometry"
+
+        if not self._is_stereo_projection_active():
+            return geometry_input_expr
 
         swm_authid = ""
         if self.layer_swm and self.layer_swm.crs() and self.layer_swm.crs().isValid():

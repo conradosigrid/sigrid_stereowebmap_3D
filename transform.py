@@ -18,6 +18,8 @@ geometry iteration.
 It is "the Python representation of the active photogrammetric model"
 
 """
+import math
+
 from qgis.core import QgsPointXY, QgsPoint
 from qgis.core import QgsMessageLog, Qgis  # for debug messages.
 
@@ -56,16 +58,39 @@ class TrfWldToPrjPln:
 
     def execute_prp2pht(self, pnt_prp):
         """Projective transformation (projection plane to photo)."""
-        x_pht = pnt_prp.x()
-        y_pht = pnt_prp.y()
+        x_prp = pnt_prp.x()
+        y_prp = pnt_prp.y()
 
-        den = self.ci[0] * x_pht + self.ci[1] * y_pht + 1
+        den = self.ci[0] * x_prp + self.ci[1] * y_prp + 1
         if den == 0:
             return None
-        x_prp = (self.ai[0] * x_pht + self.ai[1] * y_pht + self.ai[2]) / den
-        y_prp = (self.bi[0] * x_pht + self.bi[1] * y_pht + self.bi[2]) / den
+        x_pht = (self.ai[0] * x_prp + self.ai[1] * y_prp + self.ai[2]) / den
+        y_pht = (self.bi[0] * x_prp + self.bi[1] * y_prp + self.bi[2]) / den
 
-        return QgsPointXY(x_prp, y_prp)
+        return QgsPointXY(x_pht, y_pht)
+
+    def estimate_flight_angle_deg_from_prp2pht(self, sample_step: float = 1000.0):
+        """
+        Estimate strip direction angle (degrees) from inverse projective transform.
+
+        It samples a horizontal segment in projection-plane coordinates and maps it
+        back to photo coordinates using execute_prp2pht(). The returned angle is the
+        orientation of that mapped segment against the positive X axis.
+        """
+        if sample_step <= 0:
+            return None
+
+        p0 = self.execute_prp2pht(QgsPointXY(0.0, 0.0))
+        p1 = self.execute_prp2pht(QgsPointXY(sample_step, 0.0))
+        if p0 is None or p1 is None:
+            return None
+
+        dx = p1.x() - p0.x()
+        dy = p1.y() - p0.y()
+        if abs(dx) < 1e-12 and abs(dy) < 1e-12:
+            return None
+
+        return math.degrees(math.atan2(dy, dx))
 
     def execute_prp_wrl2pht(self, pnt_wrl):
         """Perspective transformation (world 3D to photo 2D)."""

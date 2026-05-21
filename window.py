@@ -57,6 +57,13 @@ class QSgdSwmWindow(QMainWindow):
         self._has_received_swm_reply = False
         # Cached fixed CRS of SWM service (from capabilities/layer metadata)
         self._swm_service_crs = None
+        self._flight_rotation_threshold_deg = 10.0
+        self._flight_rotation_current_deg = 0.0
+        self._photo_center_left = None   # (x0, y0) world coords of left photo
+        self._photo_center_right = None  # (x0, y0) world coords of right photo
+        self._main_canvas_rotation_at_start = 0.0
+        if self.qgis_main_canvas and hasattr(self.qgis_main_canvas, 'rotation'):
+            self._main_canvas_rotation_at_start = float(self.qgis_main_canvas.rotation())
 
         # Set the screen for the Swm Window
         self.init_error = self.set_screen()
@@ -161,6 +168,9 @@ class QSgdSwmWindow(QMainWindow):
             # Clean up event filter
             QApplication.instance().removeEventFilter(self)
 
+            # Restore original main-canvas rotation from before stereo session.
+            self._restore_main_canvas_rotation()
+
             # Clean up digitizing interceptors
             self._disconnect_all_digitizing_hooks()
             self._disconnect_all_style_hooks()
@@ -195,9 +205,88 @@ class QSgdSwmWindow(QMainWindow):
         
         super().closeEvent(event)
 
+    @staticmethod
+    def _normalize_signed_angle_deg(angle_deg: float) -> float:
+        """Normalize angle to [-180, 180)."""
+        return ((float(angle_deg) + 180.0) % 360.0) - 180.0
+
+    def _signed_delta_to_nearest_horizontal(self, angle_deg: float) -> float:
+        """
+        Returns signed angular offset to nearest horizontal reference (0 or +/-180).
+        """
+        a = self._normalize_signed_angle_deg(angle_deg)
+        candidates = (0.0, 180.0, -180.0)
+        best_delta = None
+        for target in candidates:
+            delta = self._normalize_signed_angle_deg(a - target)
+            if best_delta is None or abs(delta) < abs(best_delta):
+                best_delta = delta
+        return float(best_delta) if best_delta is not None else 0.0
+
+    def _apply_rotation_to_all_canvases(self, rotation_deg: float):
+        """Apply identical map rotation to main and stereo canvases."""
+        try:
+            if self.qgis_main_canvas and hasattr(self.qgis_main_canvas, 'setRotation'):
+                self.qgis_main_canvas.setRotation(float(rotation_deg))
+            if self.canvas_left and hasattr(self.canvas_left, 'setRotation'):
+                self.canvas_left.setRotation(float(rotation_deg))
+            if self.canvas_right and hasattr(self.canvas_right, 'setRotation'):
+                self.canvas_right.setRotation(float(rotation_deg))
+        except Exception as e:
+            QgsMessageLog.logMessage(f"ROT: Error applying canvas rotation: {str(e)}", "SWM-3D", Qgis.Warning)
+
+    def _restore_main_canvas_rotation(self):
+        """Restore the main QGIS canvas rotation that existed before opening SWM window."""
+        try:
+            if self.qgis_main_canvas and hasattr(self.qgis_main_canvas, 'setRotation'):
+                self.qgis_main_canvas.setRotation(float(self._main_canvas_rotation_at_start))
+        except Exception:
+            pass
+
+    def _update_auto_flight_rotation(self):
+        """
+        Computes and applies automatic rotation compensation for tilted flight strips.
+
+        Calculates the angle of the baseline between left and right photo centers
+        (x0, y0 from perspective transform) and compensates so the baseline becomes
+        horizontal (nearest 0 or 180 degrees).
+        """
+        if self._photo_center_left is None or self._photo_center_right is None:
+            return
+
+        x_l, y_l = self._photo_center_left
+        x_r, y_r = self._photo_center_right
+        dx = x_r - x_l
+        dy = y_r - y_l
+        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+            return
+
+        # Angle of baseline left->right photo center against horizontal
+        strip_angle = self._normalize_signed_angle_deg(math.degrees(math.atan2(dy, dx)))
+        QgsMessageLog.logMessage(
+            f"ROT: photo_center_L=({x_l:.1f},{y_l:.1f}) R=({x_r:.1f},{y_r:.1f}) "
+            f"strip_angle={strip_angle:.2f}°",
+            "SWM-3D", Qgis.Info
+        )
+
+        delta_to_horizontal = self._signed_delta_to_nearest_horizontal(strip_angle)
+        if abs(delta_to_horizontal) > float(self._flight_rotation_threshold_deg):
+            target_rotation = delta_to_horizontal
+        else:
+            target_rotation = 0.0
+
+        target_rotation = self._normalize_signed_angle_deg(target_rotation)
+        if abs(target_rotation - self._flight_rotation_current_deg) < 0.05:
+            return
+
+        self._flight_rotation_current_deg = target_rotation
+        self._apply_rotation_to_all_canvases(target_rotation)
+        self._schedule_canvas_refresh()
+
     def _keep_cursor_in_main_qgis_window(self):
         """Prevents the cursor from staying over the stereo window (cross-platform)."""
-        if _debug_module is not None and _debug_module.DEBUG:
+        # if _debug_module is not None and _debug_module.DEBUG:
+        if True:
             return
 
         try:
@@ -1019,6 +1108,10 @@ class QSgdSwmWindow(QMainWindow):
             self._set_projection_plane_z(z_proj_plane)
             if self.canvas_left:
                 self.canvas_left.update_data_from_wms_header(reply)
+                trf_left = self.canvas_left.trf_wld2prp
+                if trf_left:
+                    self._photo_center_left = (trf_left.x0, trf_left.y0)
+                    self._update_auto_flight_rotation()
             if not self._has_received_swm_reply:
                 self._has_received_swm_reply = True
                 # This timer waits for the next Qt event-loop cycle
@@ -1026,6 +1119,10 @@ class QSgdSwmWindow(QMainWindow):
         else:
             if self.canvas_right:
                 self.canvas_right.update_data_from_wms_header(reply)
+                trf_right = self.canvas_right.trf_wld2prp
+                if trf_right:
+                    self._photo_center_right = (trf_right.x0, trf_right.y0)
+                    self._update_auto_flight_rotation()
 
     def keyPressEvent(self, event):
         """Only used to exit FullScreen mode."""

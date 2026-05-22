@@ -125,7 +125,8 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         self._last_rendered_buffer: Optional[QImage] = None
         self._last_base_buffer: Optional[QImage] = None
 
-        self.setCanvasColor(QColor(0, 0, 0, 0))  # QColor(Qt.GlobalColor.transparent)
+        overlay_color = QColor(Qt.GlobalColor.white) if self.filter != self.FILTER_NONE else QColor(0, 0, 0, 0)
+        self.setCanvasColor(overlay_color)
         # Keep rendered layer images cached so vector-only visibility toggles
         # do not force unnecessary WMS requests when extent is unchanged.
         self.setCachingEnabled(True)
@@ -1296,7 +1297,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
     def _render_canvas_buffer(self) -> QImage:
         """Render this canvas content, including Z text, into an off-screen image."""
         buffer = QImage(self.size(), QImage.Format.Format_ARGB32)
-        buffer.fill(QColor(0, 0, 0, 0))
+        buffer.fill(QColor(Qt.GlobalColor.white) if self._is_overlay_mode() else QColor(0, 0, 0, 0))
 
         painter = QPainter(buffer)
         super().render(painter)

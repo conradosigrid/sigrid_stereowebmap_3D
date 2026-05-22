@@ -1,4 +1,4 @@
-﻿# SIGRID_SWM_3D - QGIS Plugin - Version 0.6.1
+﻿# SIGRID_SWM_3D - QGIS Plugin - Version 0.6.2
 
 ![Version](https://img.shields.io/badge/version-6.1-blue)
 ![QGIS](https://img.shields.io/badge/QGIS-4.x-green)
@@ -71,6 +71,11 @@ Expected behavior:
 
 ## 5. Changes
 
+### Version 0.6.2
+- Fixed bug with overlapping stereos (anaglyph and interlaced)
+- Fixed issue with oblique flights. When the pass angle (α) exceeds 10º, all canvases (stereo and main) are rotated -αº
+- A minimum scale (1/100,000) is set for 3D projection on stereo canvas. 3D projection is not applicable for smaller scales.
+
 ### Version 0.6.1
 - Incorporated overlapping stereos (anaglyph and interlaced).
 - Automatic transmission of symbology changes to the stereo canvases.
@@ -135,11 +140,6 @@ Expected behavior:
 ### The last segment is not visible in the stereo canvases during line and segment digitization tasks. 
 - This segment connects the last digitized vertex to the cursor position and is visible in the main canvas but not in the stereo canvases.
 - It could not be implemented in the stereo canvases because its handling is contained within QGIS's C++ code and is not accessible from Python. This is a purely graphical feature, so it was decided not to include it in the stereo canvases because it would complicate the stability and ease of tracking of the plugin's code.
-
-
-### Stereoscopy is less clear for flights that are not east-west passes
-- Because the images are rotated, stereoscopy is not clearly visible in these cases.
-- The ability to rotate images horizontally must be implemented to overcome this limitation.
 
 ### The SWM server is experiencing problems with the quality of JPEG images
 - The JPEG images are being served in very low quality.

@@ -364,17 +364,20 @@ class QSgdSwmWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         if self.stereo_id <= 3:
             # Overlayed stereo modes share the same viewport.
+            central_widget.setStyleSheet("background-color: white;")
             layout = QStackedLayout()
             layout.setStackingMode(QStackedLayout.StackingMode.StackAll)
             layout.setCurrentIndex(1)
             self._configure_overlay_canvases()
         elif self.stereo_id <= 5:
             # Side-by-side mode.
+            central_widget.setStyleSheet("")
             layout = QHBoxLayout()
             if self.stereo_id == 5:
                 self._apply_horizontal_mirror(self.canvas_right)
         elif self.stereo_id == 6:
             # Mirror-right / mirror-up layout.
+            central_widget.setStyleSheet("")
             layout = QVBoxLayout()
             self._apply_horizontal_mirror(self.canvas_right)
         layout.setContentsMargins(0, 0, 0, 0)

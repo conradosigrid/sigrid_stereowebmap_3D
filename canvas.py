@@ -1271,17 +1271,13 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         if self._is_overlay_mode():
             rendered = self._render_canvas_buffer()
             self._last_rendered_buffer = rendered
-
-            if self.is_left:
-                # Keep a provisional per-eye image visible underneath.
-                # The right canvas will overwrite it with the final composed image when ready.
-                filtered = self.apply_filter(rendered.copy())
-                self._paint_image_to_viewport(filtered)
-                return
-
             composed = self._compose_overlay_image()
             if composed is None:
-                composed = self.apply_filter(rendered.copy())
+                # Fallback while opposite eye catches up.
+                if self.parent and self.parent.stereo_id == 1:
+                    composed = rendered
+                else:
+                    composed = self.apply_filter(rendered.copy())
             self._paint_image_to_viewport(composed, replace=True)
         elif self.filter == self.FILTER_NONE:
             super().paintEvent(e)
@@ -1321,8 +1317,6 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         if not left_canvas or not right_canvas:
             return None
 
-        # Single composition pipeline for both anaglyph and interlaced modes.
-        # This avoids diverging logic paths and reduces synchronization glitches.
         if left_canvas._last_rendered_buffer is None:
             left_canvas._last_rendered_buffer = left_canvas._render_canvas_buffer()
         if right_canvas._last_rendered_buffer is None:
@@ -1347,44 +1341,30 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             right_ptr.setsize(right_filtered.sizeInBytes())
             right_arr = np.frombuffer(right_ptr, np.uint8).reshape(right_filtered.height(), right_filtered.width(), 4)
 
-            # Normalize channel values to avoid dominance of one channel
-            left_arr = left_arr / 255.0
-            right_arr = right_arr / 255.0
-
             if self.parent.stereo_id == 1:
-                # Anaglyph: Red from left, Green and Blue from right
-                composed = np.empty_like(left_arr)
-                composed[:, :, 0] = left_arr[:, :, 0]  # Red from left
-                composed[:, :, 1] = right_arr[:, :, 1]  # Green from right
-                composed[:, :, 2] = right_arr[:, :, 2]  # Blue from right
+                left_rgba = left_image.convertToFormat(QImage.Format.Format_RGBA8888)
+                right_rgba = right_image.convertToFormat(QImage.Format.Format_RGBA8888)
 
-                # Debug stats after filtering: should be left=red and right=cyan.
-                try:
-                    left_mean = np.mean(left_arr, axis=(0, 1))
-                    right_mean = np.mean(right_arr, axis=(0, 1))
-                    QgsMessageLog.logMessage(f"[STEREO] ANAGLYPH left_mean={left_mean}, right_mean={right_mean}", "StereoWebMap")
-                except Exception:
-                    pass
+                left_rgba_ptr = left_rgba.bits()
+                left_rgba_ptr.setsize(left_rgba.sizeInBytes())
+                left_rgba_arr = np.frombuffer(left_rgba_ptr, np.uint8).reshape(left_rgba.height(), left_rgba.width(), 4)
 
-                # Save filtered images for debugging
-                left_debug_path = "C:/Desarrollo/PyQgis/Plugins/sigrid_stereowebmap_3D/debug_left_filtered.png"
-                right_debug_path = "C:/Desarrollo/PyQgis/Plugins/sigrid_stereowebmap_3D/debug_right_filtered.png"
-                left_filtered.save(left_debug_path)
-                right_filtered.save(right_debug_path)
+                right_rgba_ptr = right_rgba.bits()
+                right_rgba_ptr.setsize(right_rgba.sizeInBytes())
+                right_rgba_arr = np.frombuffer(right_rgba_ptr, np.uint8).reshape(right_rgba.height(), right_rgba.width(), 4)
 
-                # Save composed image for debugging
-                composed_debug_array_path = "C:/Desarrollo/PyQgis/Plugins/sigrid_stereowebmap_3D/debug_composed_array.png"
-                from PIL import Image
-                composed_image_pil = Image.fromarray((composed[:, :, :3] * 255).astype(np.uint8))
-                composed_image_pil.save(composed_debug_array_path)
+                composed = np.empty_like(left_rgba_arr)
+                composed[:, :, 0] = left_rgba_arr[:, :, 0]
+                composed[:, :, 1] = right_rgba_arr[:, :, 1]
+                composed[:, :, 2] = right_rgba_arr[:, :, 2]
+                composed[:, :, 3] = 255
 
-                # Create QImage with an alternative format
                 result = QImage(
                     composed.data,
-                    left_filtered.width(),
-                    left_filtered.height(),
-                    left_filtered.bytesPerLine(),
-                    QImage.Format.Format_RGB888,
+                    left_rgba.width(),
+                    left_rgba.height(),
+                    composed.strides[0],
+                    QImage.Format.Format_RGBA8888,
                 )
                 return result.copy()
             else:
@@ -1399,8 +1379,8 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 composed.data,
                 left_filtered.width(),
                 left_filtered.height(),
-                left_filtered.bytesPerLine(),
-                QImage.Format.Format_RGB32,
+                composed.strides[0],
+                QImage.Format.Format_RGBA8888,
             )
             return result.copy()
         except Exception as e:

@@ -59,10 +59,21 @@ class QSgdSwmWindow(QMainWindow):
         self._swm_service_crs = None
         # Stereo projection is only active when the main canvas is zoomed in to this scale or more.
         self._stereo_activation_scale_threshold = 100000.0
+        # Auto strip-rotation enabled: compensates non E-W flight headings.
+        self._auto_flight_rotation_enabled = True
         self._flight_rotation_threshold_deg = 10.0
         self._flight_rotation_current_deg = 0.0
         self._photo_center_left = None   # (x0, y0) world coords of left photo
         self._photo_center_right = None  # (x0, y0) world coords of right photo
+        self._last_photo_bbox_left: Optional[str] = None
+        self._last_photo_bbox_right: Optional[str] = None
+        self._last_rotation_bbox_applied: Optional[str] = None
+        self._stereo_refresh_revision = 0
+        self._last_applied_stereo_refresh_signature: Optional[Tuple[Any, ...]] = None
+        self._last_main_repaint_signature: Optional[Tuple[Any, ...]] = None
+        self._last_layers_sync_signature: Optional[Tuple[Any, ...]] = None
+        self._trace_wms_debug = False
+        self._trace_seq = 0
         self._main_canvas_rotation_at_start = 0.0
         if self.qgis_main_canvas and hasattr(self.qgis_main_canvas, 'rotation'):
             self._main_canvas_rotation_at_start = float(self.qgis_main_canvas.rotation())
@@ -109,9 +120,7 @@ class QSgdSwmWindow(QMainWindow):
             layer_tree_view = self.iface.layerTreeView()
             if layer_tree_view and hasattr(layer_tree_view, 'layerTreeModel'):
                 model = layer_tree_view.layerTreeModel()
-                if model and hasattr(model, 'dataChanged'):
-                    model.dataChanged.connect(self._schedule_layers_sync)
-                    self._layer_tree_model = model
+                self._layer_tree_model = model
         except Exception:
             self._layer_tree_model = None
         self.iface.mapCanvas().extentsChanged.connect(self._sync_canvases_repaint)    # zoom and pan
@@ -150,16 +159,12 @@ class QSgdSwmWindow(QMainWindow):
         if self.canvas_left:
             extent_left = self._reproject_extent_to_stereo_crs(self.qgis_main_canvas.extent(), self.canvas_left)
             self.canvas_left.setExtent(extent_left)
-            self.canvas_left.sync_layers()
         if self.canvas_right:
             extent_right = self._reproject_extent_to_stereo_crs(self.qgis_main_canvas.extent(), self.canvas_right)
             self.canvas_right.setExtent(extent_right)
-            self.canvas_right.sync_layers()
-        # Keep for now; may be removed later if unnecessary
-        if self.canvas_left:
-            self.canvas_left.refresh()
-        if self.canvas_right:
-            self.canvas_right.refresh()
+        # Route initial layer setup through the deduplicated sync path so later
+        # startup layer-tree signals do not repeat the same SWM requests.
+        self._sync_canvases_layers()
 
     def enterEvent(self, event):
         self._keep_cursor_in_main_qgis_window()
@@ -225,10 +230,13 @@ class QSgdSwmWindow(QMainWindow):
                 best_delta = delta
         return float(best_delta) if best_delta is not None else 0.0
 
-    def _apply_rotation_to_all_canvases(self, rotation_deg: float):
-        """Apply identical map rotation to main and stereo canvases."""
+    def _apply_rotation_to_all_canvases(self, rotation_deg: float, apply_main_canvas: bool = False):
+        """
+        Apply map rotation to stereo canvases and optionally to main canvas.
+        Stereo freeze/unfreeze is handled by the caller when batching updates.
+        """
         try:
-            if self.qgis_main_canvas and hasattr(self.qgis_main_canvas, 'setRotation'):
+            if apply_main_canvas and self.qgis_main_canvas and hasattr(self.qgis_main_canvas, 'setRotation'):
                 self.qgis_main_canvas.setRotation(float(rotation_deg))
             if self.canvas_left and hasattr(self.canvas_left, 'setRotation'):
                 self.canvas_left.setRotation(float(rotation_deg))
@@ -264,33 +272,41 @@ class QSgdSwmWindow(QMainWindow):
         except Exception:
             return True
 
-    def _update_auto_flight_rotation(self):
+    def _update_auto_flight_rotation(self, apply_main_canvas: bool = True) -> bool:
         """
         Computes and applies automatic rotation compensation for tilted flight strips.
 
         Calculates the angle of the baseline between left and right photo centers
         (x0, y0 from perspective transform) and compensates so the baseline becomes
         horizontal (nearest 0 or 180 degrees).
+
+        Returns True when a new rotation value was applied.
         """
+        if not self._auto_flight_rotation_enabled:
+            if abs(self._flight_rotation_current_deg) < 0.05:
+                return False
+            self._flight_rotation_current_deg = 0.0
+            self._apply_rotation_to_all_canvases(0.0, apply_main_canvas=apply_main_canvas)
+            return True
+
         if self._photo_center_left is None or self._photo_center_right is None:
-            return
+            return False
 
         # Keep flight-strip auto-rotation disabled outside stereo-active scales.
         if not self._is_stereo_projection_active():
             target_rotation = 0.0
             if abs(target_rotation - self._flight_rotation_current_deg) < 0.05:
-                return
+                return False
             self._flight_rotation_current_deg = target_rotation
-            self._apply_rotation_to_all_canvases(target_rotation)
-            self._schedule_canvas_refresh()
-            return
+            self._apply_rotation_to_all_canvases(target_rotation, apply_main_canvas=apply_main_canvas)
+            return True
 
         x_l, y_l = self._photo_center_left
         x_r, y_r = self._photo_center_right
         dx = x_r - x_l
         dy = y_r - y_l
         if abs(dx) < 1e-9 and abs(dy) < 1e-9:
-            return
+            return False
 
         # Angle of baseline left->right photo center against horizontal
         strip_angle = self._normalize_signed_angle_deg(math.degrees(math.atan2(dy, dx)))
@@ -308,11 +324,11 @@ class QSgdSwmWindow(QMainWindow):
 
         target_rotation = self._normalize_signed_angle_deg(target_rotation)
         if abs(target_rotation - self._flight_rotation_current_deg) < 0.05:
-            return
+            return False
 
         self._flight_rotation_current_deg = target_rotation
-        self._apply_rotation_to_all_canvases(target_rotation)
-        self._schedule_canvas_refresh()
+        self._apply_rotation_to_all_canvases(target_rotation, apply_main_canvas=apply_main_canvas)
+        return True
 
     def _keep_cursor_in_main_qgis_window(self):
         """Prevents the cursor from staying over the stereo window (cross-platform)."""
@@ -411,9 +427,99 @@ class QSgdSwmWindow(QMainWindow):
         """Coalesces repeated refresh requests into one repaint per event loop."""
         if self._canvas_refresh_timer:
             self._canvas_refresh_timer.start()
+            self._trace("REFRESH: scheduled")
+
+    def _trace(self, message: str):
+        """Structured troubleshooting log for request-flow diagnostics."""
+        if not self._trace_wms_debug:
+            return
+        self._trace_seq += 1
+        QgsMessageLog.logMessage(f"TRACE[{self._trace_seq:05d}] {message}", "SWM-3D", Qgis.Info)
+
+    def _stereo_refresh_signature(self) -> Tuple[Any, ...]:
+        """Returns a stable signature of current stereo render state for deduping refreshes."""
+        def _canvas_state(canvas):
+            if not canvas:
+                return None
+            try:
+                ex = canvas.extent()
+                rot = float(canvas.rotation()) if hasattr(canvas, 'rotation') else 0.0
+                return (
+                    round(float(ex.xMinimum()), 3),
+                    round(float(ex.yMinimum()), 3),
+                    round(float(ex.xMaximum()), 3),
+                    round(float(ex.yMaximum()), 3),
+                    round(rot, 3),
+                    int(canvas.width()) if hasattr(canvas, 'width') else 0,
+                    int(canvas.height()) if hasattr(canvas, 'height') else 0,
+                )
+            except Exception:
+                return None
+
+        return (
+            _canvas_state(self.canvas_left),
+            _canvas_state(self.canvas_right),
+            round(float(self._flight_rotation_current_deg), 3),
+            int(self._stereo_refresh_revision),
+        )
+
+    def _main_canvas_repaint_signature(self) -> Optional[Tuple[Any, ...]]:
+        """Returns a signature of main-canvas state used to ignore repeated repaint events."""
+        try:
+            if not self.qgis_main_canvas:
+                return None
+
+            ex = self.qgis_main_canvas.extent()
+            crs = self.qgis_main_canvas.mapSettings().destinationCrs() if hasattr(self.qgis_main_canvas, 'mapSettings') else None
+            crs_authid = crs.authid() if crs and crs.isValid() else ""
+            rotation = float(self.qgis_main_canvas.rotation()) if hasattr(self.qgis_main_canvas, 'rotation') else 0.0
+
+            return (
+                round(float(ex.xMinimum()), 6),
+                round(float(ex.yMinimum()), 6),
+                round(float(ex.xMaximum()), 6),
+                round(float(ex.yMaximum()), 6),
+                crs_authid,
+                round(rotation, 3),
+                int(self.qgis_main_canvas.width()) if hasattr(self.qgis_main_canvas, 'width') else 0,
+                int(self.qgis_main_canvas.height()) if hasattr(self.qgis_main_canvas, 'height') else 0,
+            )
+        except Exception:
+            return None
+
+    def _current_layers_sync_signature(self) -> Tuple[Any, ...]:
+        """Returns a stable signature for current layer stack relevant to stereo sync."""
+        items: List[Tuple[str, bool]] = []
+        try:
+            project = QgsProject.instance()
+            if project:
+                root = project.layerTreeRoot()
+                if root:
+                    for node in root.findLayers():
+                        layer = node.layer()
+                        if layer:
+                            items.append((str(layer.id()), bool(node.isVisible())))
+        except Exception:
+            items = []
+
+        if not items:
+            try:
+                for layer in self.iface.mapCanvas().layers():
+                    items.append((str(layer.id()), True))
+            except Exception:
+                pass
+
+        return tuple(items)
 
     def _run_canvas_refresh(self):
         """Refreshes both stereo canvases once after rapid state changes settle."""
+        signature = self._stereo_refresh_signature()
+        if signature == self._last_applied_stereo_refresh_signature:
+            self._trace("REFRESH: skipped (same stereo signature)")
+            return
+        self._last_applied_stereo_refresh_signature = signature
+        self._trace(f"REFRESH: apply signature={signature}")
+
         if self.canvas_left:
             self.canvas_left.refresh()
         if self.canvas_right:
@@ -554,6 +660,13 @@ class QSgdSwmWindow(QMainWindow):
         2) New projections should be loaded, updating Geometry Generator on Z layers and SWM layer.
         3) A final refresh is still needed so everything is repainted.
         """
+        main_signature = self._main_canvas_repaint_signature()
+        self._trace(f"REPAINT: signal main_signature={main_signature}")
+        if main_signature is not None and main_signature == self._last_main_repaint_signature:
+            self._trace("REPAINT: skipped (same main signature)")
+            return
+        self._last_main_repaint_signature = main_signature
+
         self._sync_canvases_destination_crs()
         if self.canvas_left:
             extent_left = self._reproject_extent_to_stereo_crs(self.qgis_main_canvas.extent(), self.canvas_left)
@@ -566,8 +679,12 @@ class QSgdSwmWindow(QMainWindow):
             if current_right_extent != extent_right:
                 self.canvas_right.setExtent(extent_right)
 
-        # Re-evaluate strip-rotation activation whenever scale changes (zoom/pan).
-        self._update_auto_flight_rotation()
+        # Re-evaluate strip rotation in the same zoom/pan cycle.
+        rotation_changed = self._update_auto_flight_rotation()
+        self._trace(f"REPAINT: post-update rotation_changed={rotation_changed}")
+
+        # Always request stereo refresh for zoom/pan. Duplicate calls are
+        # filtered in _run_canvas_refresh() using the refresh signature.
         self._schedule_canvas_refresh()
 
     def _sync_canvases_layers(self):
@@ -577,7 +694,15 @@ class QSgdSwmWindow(QMainWindow):
         repeated WMS requests during visibility toggles.
         """
         if self._layers_rolling_back:
+            self._trace("LAYER_SYNC: skipped (rollback active)")
             return
+
+        layers_signature = self._current_layers_sync_signature()
+        if self._last_layers_sync_signature == layers_signature:
+            self._trace("LAYER_SYNC: skipped (same layers signature)")
+            return
+        self._last_layers_sync_signature = layers_signature
+        self._trace(f"LAYER_SYNC: apply signature={layers_signature}")
 
         # Keep hooks aligned with currently active Z layers.
         self._update_digitizing_layer_hooks()
@@ -587,6 +712,9 @@ class QSgdSwmWindow(QMainWindow):
             self.canvas_left.sync_layers()
         if self.canvas_right:
             self.canvas_right.sync_layers()
+
+        # Layer ordering/visibility changes must invalidate refresh dedupe.
+        self._stereo_refresh_revision += 1
 
         # Layer visibility/type changes can update SWM service CRS availability.
         self._update_swm_service_crs_cache()
@@ -600,10 +728,58 @@ class QSgdSwmWindow(QMainWindow):
         This prevents duplicate sync_layers() calls for one user action.
         """
         if self._layers_rolling_back:
+            self._trace("LAYER_SYNC: schedule skipped (rollback active)")
             return
 
         if self._layer_sync_timer:
             self._layer_sync_timer.start()
+            self._trace("LAYER_SYNC: scheduled")
+
+    @staticmethod
+    def _extract_wms_request_brief(request_url: str) -> str:
+        """Extracts compact WMS request details from URL for diagnostics."""
+        try:
+            style_m = re.search(r'(?:[?&])STYLES=([^&]*)', request_url, flags=re.IGNORECASE)
+            bbox_m = re.search(r'(?:[?&])BBOX=([^&]+)', request_url, flags=re.IGNORECASE)
+            w_m = re.search(r'(?:[?&])WIDTH=(\d+)', request_url, flags=re.IGNORECASE)
+            h_m = re.search(r'(?:[?&])HEIGHT=(\d+)', request_url, flags=re.IGNORECASE)
+            style = style_m.group(1) if style_m else ""
+            bbox = bbox_m.group(1) if bbox_m else ""
+            w = w_m.group(1) if w_m else ""
+            h = h_m.group(1) if h_m else ""
+            return f"style={style} bbox={bbox} size={w}x{h}"
+        except Exception:
+            return "style=? bbox=? size=?"
+
+    @staticmethod
+    def _extract_wms_bbox(request_url: str) -> Optional[str]:
+        """Extract raw BBOX value from a WMS URL (encoded string)."""
+        try:
+            bbox_m = re.search(r'(?:[?&])BBOX=([^&]+)', request_url, flags=re.IGNORECASE)
+            if not bbox_m:
+                return None
+            return bbox_m.group(1)
+        except Exception:
+            return None
+
+    def _update_auto_rotation_for_matched_stereo_bbox(self) -> bool:
+        """
+        Applies strip auto-rotation once both LEFT/RIGHT replies are available
+        for the same BBOX. This guarantees we do not mix photo centers from
+        different requests.
+        """
+        bbox_left = self._last_photo_bbox_left
+        bbox_right = self._last_photo_bbox_right
+        if not bbox_left or not bbox_right:
+            return False
+        if bbox_left != bbox_right:
+            return False
+        if self._last_rotation_bbox_applied == bbox_left:
+            return False
+
+        self._last_rotation_bbox_applied = bbox_left
+        rotation_changed = self._update_auto_flight_rotation(apply_main_canvas=True)
+        return rotation_changed
 
     def _update_digitizing_layer_hooks(self):
         """
@@ -734,6 +910,7 @@ class QSgdSwmWindow(QMainWindow):
                 self.canvas_left.sync_layers()
             if self.canvas_right:
                 self.canvas_right.sync_layers()
+            self._stereo_refresh_revision += 1
             self._schedule_canvas_refresh()
         except Exception as e:
             QgsMessageLog.logMessage(f"STYLE_SYNC: Error in debounced sync: {str(e)}", "SWM-3D", Qgis.Warning)
@@ -1117,6 +1294,7 @@ class QSgdSwmWindow(QMainWindow):
         if not self.canvas_left and not self.canvas_right:
             return
         request_url = reply.request().url().toString()
+        self._trace(f"NET: finished {self._extract_wms_request_brief(request_url)}")
 
         # Check whether the reply belongs to SWM and is valid
         # Requests from the main QGIS screen come as PhotoRight or PhotoLeft.
@@ -1131,6 +1309,8 @@ class QSgdSwmWindow(QMainWindow):
         is_swm_reply &= reply.hasRawHeader(b'SIGRID_PhtTransPhotoToCanvas')
         if not is_swm_reply:
             return
+        self._trace(f"NET: accepted SWM {self._extract_wms_request_brief(request_url)}")
+        request_bbox = self._extract_wms_bbox(request_url)
         # Sure it is a SWM plugin WMS request layer
         if is_photo_left:
             # Get projection plane Z value from the reply headers. Only left, need not read twice
@@ -1148,7 +1328,8 @@ class QSgdSwmWindow(QMainWindow):
                 trf_left = self.canvas_left.trf_wld2prp
                 if trf_left:
                     self._photo_center_left = (trf_left.x0, trf_left.y0)
-                    self._update_auto_flight_rotation()
+            self._last_photo_bbox_left = request_bbox
+            self._update_auto_rotation_for_matched_stereo_bbox()
             if not self._has_received_swm_reply:
                 self._has_received_swm_reply = True
                 # This timer waits for the next Qt event-loop cycle
@@ -1159,7 +1340,8 @@ class QSgdSwmWindow(QMainWindow):
                 trf_right = self.canvas_right.trf_wld2prp
                 if trf_right:
                     self._photo_center_right = (trf_right.x0, trf_right.y0)
-                    self._update_auto_flight_rotation()
+            self._last_photo_bbox_right = request_bbox
+            self._update_auto_rotation_for_matched_stereo_bbox()
 
     def keyPressEvent(self, event):
         """Only used to exit FullScreen mode."""

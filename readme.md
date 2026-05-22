@@ -1,4 +1,4 @@
-﻿# SIGRID_SWM_3D - QGIS Plugin - Version 0.6.2
+﻿# SIGRID_SWM_3D - QGIS Plugin - Version 0.6.3
 
 ![Version](https://img.shields.io/badge/version-6.1-blue)
 ![QGIS](https://img.shields.io/badge/QGIS-4.x-green)
@@ -70,6 +70,9 @@ Expected behavior:
 - Depth adjustments are shown dynamically in the stereo view.
 
 ## 5. Changes
+
+### Version 0.6.3
+- Fixed error of repeated duplicate requests to the SWM service
 
 ### Version 0.6.2
 - Fixed bug with overlapping stereos (anaglyph and interlaced)

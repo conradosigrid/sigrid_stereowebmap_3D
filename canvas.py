@@ -124,6 +124,11 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         self.z_text = ""  # Z cursor text
         self._last_rendered_buffer: Optional[QImage] = None
         self._last_base_buffer: Optional[QImage] = None
+        # Deferred Z-layer update flag: set True when a WMS reply has been processed
+        # but _apply_current_transform_to_z_layers() hasn't been called yet.
+        # The actual triggerRepaint() is deferred to _on_own_canvas_refreshed so that
+        # the WMS layer image is already cached, preventing a second WMS request.
+        self._pending_z_update = False
 
         overlay_color = QColor(Qt.GlobalColor.white) if self.filter != self.FILTER_NONE else QColor(0, 0, 0, 0)
         self.setCanvasColor(overlay_color)
@@ -140,6 +145,10 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         if self.filter != self.FILTER_NONE:
             self.mapCanvasRefreshed.connect(self.update)
             self.mapCanvasRefreshed.connect(self._schedule_base_capture)
+
+        # Deferred Z update: apply geometry expressions after the WMS layer has
+        # finished rendering (cache populated), to avoid a second WMS GetMap request.
+        self.mapCanvasRefreshed.connect(self._on_own_canvas_refreshed)
 
     def _is_stereo_projection_active(self) -> bool:
         """Delegates stereo activation to the parent window when available."""
@@ -1471,6 +1480,10 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         result = QImage(arr.data, rgba.width(), rgba.height(), rgba.bytesPerLine(), QImage.Format.Format_RGBA8888)
         return result.copy()  # Important: .copy() to avoid memory issues 
     
+    def refresh(self):
+        """Override to intercept all refresh calls for duplicate-request deduplication."""
+        super().refresh()
+
     def render_complete(self):
         # Draws a rectangle corresponding to the main canvas extent in this canvas
         # TODO: Fails. Rubber band?
@@ -1703,6 +1716,18 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
 
         return expressions_updated
 
+    def _on_own_canvas_refreshed(self):
+        """
+        Called when this stereo canvas finishes a render cycle (mapCanvasRefreshed).
+        At this point the WMS layer image is already cached, so calling
+        triggerRepaint() on Z layers will NOT trigger a new WMS GetMap request.
+        This prevents the duplicate-request cascade caused by processing WMS reply
+        headers (update_data_from_wms_header) and immediately calling triggerRepaint().
+        """
+        if self._pending_z_update:
+            self._pending_z_update = False
+            self._apply_current_transform_to_z_layers()
+
     def update_data_from_wms_header(self, reply):
         """
         Update photogrammetric transformation parameters from a SWM WMS reply
@@ -1735,10 +1760,10 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             layer.setCustomProperty("swm_trf_pht2prp", txt_trf_pht2prp)
 
         # GeometryGenerator must be updated now that transformation is available.
-        # layer.triggerRepaint() (called inside _apply_current_transform_to_z_layers) is
-        # enough to re-render the Z vector layers with the new expression.
-        # Do NOT call self.refresh() here: that would issue a second WMS GetMap request
-        # immediately after the first one just completed, doubling network load per zoom.
-        self._apply_current_transform_to_z_layers()
-
+        # We defer triggerRepaint() to _on_own_canvas_refreshed (fired by mapCanvasRefreshed)
+        # so that the WMS layer image is already in the render cache by then.
+        # Calling triggerRepaint() immediately here would cause the canvas to re-render
+        # ALL layers (including WMS) BEFORE the cache is populated, issuing a second
+        # WMS GetMap request for every zoom/pan — which is exactly what we must prevent.
+        self._pending_z_update = True
         self.render_complete()

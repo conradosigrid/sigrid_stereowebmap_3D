@@ -229,23 +229,37 @@ def perspective_swm_transform(geometry, side, txt_trf_wrl2pht, txt_trf_pht2prp):
         
     # --------------------------------------------------
     # Polygon, PolygonZ, PolygonM, PolygonZM, MultiPolygon, MultiPolygonZ, MultiPolygonZM
-    # WkbType can be any of the previous ones, but polygon features are processed one by one.
     #
-    # IMPORTANT: geometry.vertices() iterates ALL vertices of ALL rings (exterior + interior)
-    # as a flat sequence. Building a single ring from that flat list causes bridge lines
-    # between the end of one ring and the start of the next.
-    # The fix: process the exterior ring and each interior ring (hole) independently,
-    # then reconstruct with QgsGeometry.fromPolygonXY([exterior, hole1, hole2, ...]).
+    # IMPORTANT: geometry.vertices() iterates a flat sequence for all rings/parts,
+    # so we must preserve multipart and ring boundaries explicitly.
     # --------------------------------------------------
     elif gtype == QgsWkbTypes.PolygonGeometry:
         const_geom = geometry.constGet()
         if const_geom is None:
             return geometry
 
-        def _transform_ring(ring_geom):
+        vertex_count = const_geom.vertexCount()
+        vertex_index = 0
+
+        def _next_vertex_z():
+            nonlocal vertex_index
+            if vertex_index >= vertex_count:
+                return float('nan')
+
+            p3 = geometry.vertexAt(vertex_index)
+            vertex_index += 1
+
+            z = p3.z()
+            if math.isfinite(z):
+                return z
+            if p3.isMeasure() and math.isfinite(p3.m()):
+                return p3.m()
+            return float('nan')
+
+        def _transform_ring(ring):
             pts = []
-            for p in ring_geom.vertices():
-                z = p.z()
+            for p in ring:
+                z = _next_vertex_z()
                 if not math.isfinite(z):
                     continue
                 res = world_to_photo(p.x(), p.y(), z, x0, y0, z0, df, r)
@@ -255,32 +269,37 @@ def perspective_swm_transform(geometry, side, txt_trf_wrl2pht, txt_trf_pht2prp):
                 if not res:
                     continue
                 pts.append(QgsPointXY(res[0], res[1]))
+
             if len(pts) >= 3 and pts[0] != pts[-1]:
                 pts.append(pts[0])
-            return pts
+            return pts if len(pts) >= 4 else []
 
-        all_rings = []
+        if QgsWkbTypes.isMultiType(geometry.wkbType()):
+            transformed_multi = []
+            source_multi = geometry.asMultiPolygon()
+            for polygon in source_multi:
+                transformed_polygon = []
+                for ring in polygon:
+                    transformed_ring = _transform_ring(ring)
+                    if transformed_ring:
+                        transformed_polygon.append(transformed_ring)
+                if transformed_polygon:
+                    transformed_multi.append(transformed_polygon)
 
-        # Exterior ring
-        ext_ring = const_geom.exteriorRing()
-        if ext_ring is not None:
-            pts = _transform_ring(ext_ring)
-            if len(pts) >= 4:
-                all_rings.append(pts)
+            if not transformed_multi:
+                return geometry
+            return QgsGeometry.fromMultiPolygonXY(transformed_multi)
 
-        # Interior rings (holes) — each one transformed independently
-        for i in range(const_geom.numInteriorRings()):
-            int_ring = const_geom.interiorRing(i)
-            if int_ring is None:
-                continue
-            pts = _transform_ring(int_ring)
-            if len(pts) >= 4:
-                all_rings.append(pts)
+        transformed_polygon = []
+        source_polygon = geometry.asPolygon()
+        for ring in source_polygon:
+            transformed_ring = _transform_ring(ring)
+            if transformed_ring:
+                transformed_polygon.append(transformed_ring)
 
-        if not all_rings:
+        if not transformed_polygon:
             return geometry
-
-        return QgsGeometry.fromPolygonXY(all_rings)
+        return QgsGeometry.fromPolygonXY(transformed_polygon)
 
     else:
         # Unsupported geometries

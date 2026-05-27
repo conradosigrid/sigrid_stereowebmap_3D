@@ -1538,7 +1538,15 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             if root:
                 for node in root.findLayers():
                     layer = node.layer()
-                    if layer and node.isVisible():
+                    if not layer:
+                        continue
+
+                    main_visible = bool(node.isVisible())
+                    stereo_visible = main_visible
+                    if self.parent and hasattr(self.parent, 'is_layer_visible_in_stereo'):
+                        stereo_visible = bool(self.parent.is_layer_visible_in_stereo(layer, main_visible))
+
+                    if stereo_visible:
                         layers_main.append(layer)
         if not layers_main:
             # Fallback to canvas layers if tree lookup is unavailable.

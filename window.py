@@ -33,6 +33,7 @@ from typing import Dict, Any, Set, Tuple, Optional, List, cast
 
 # SWM libraries
 from .canvas import QgsSgdSwmCanvas
+from .stereo_canvas_options import StereoCanvasOptions
 from .utils import is_z_layer, is_sgd_swm_layer
 try:
     from . import debug as _debug_module
@@ -97,8 +98,9 @@ class QSgdSwmWindow(QMainWindow):
         # Shared global Z; always assign through @z_cursor.setter to update everything
         self._z_proj_plane = 0.0
         self.z_cursor = 0.0
-        # Install global event filter for cursor Z control and click capture.
-        QApplication.instance().installEventFilter(self)
+        # Global filter can be removed on close and must be reinstalled on reopen.
+        self._global_event_filter_installed = False
+        self._install_global_event_filter()
 
         # Capturar eventos del canvas principal qgis
         self.iface.mapCanvas().xyCoordinates.connect(self._sync_canvases_cursor)      # mouse
@@ -140,6 +142,8 @@ class QSgdSwmWindow(QMainWindow):
         self._style_sync_timer.setSingleShot(True)
         self._style_sync_timer.setInterval(100)
         self._style_sync_timer.timeout.connect(self._run_pending_style_sync)
+        self._stereo_canvas_options = StereoCanvasOptions(self.iface, self._on_stereo_layer_visibility_changed)
+        self._stereo_canvas_options.setup_context_menu()
         self._update_digitizing_layer_hooks()
         self._update_style_layer_hooks()
 
@@ -153,6 +157,7 @@ class QSgdSwmWindow(QMainWindow):
         """
         Virtual method inherited from QWidget / QMainWindow.
         """
+        self._install_global_event_filter()
         super().showEvent(event)
         # Initial sync after the window is shown
         self._sync_canvases_destination_crs()
@@ -170,10 +175,35 @@ class QSgdSwmWindow(QMainWindow):
         self._keep_cursor_in_main_qgis_window()
         super().enterEvent(event)
 
+    def _install_global_event_filter(self):
+        """Installs the QApplication-level event filter exactly once."""
+        if self._global_event_filter_installed:
+            return
+        app = QApplication.instance()
+        if not app:
+            return
+        app.installEventFilter(self)
+        self._global_event_filter_installed = True
+
+    def _remove_global_event_filter(self):
+        """Removes the QApplication-level event filter when currently installed."""
+        if not self._global_event_filter_installed:
+            return
+        app = QApplication.instance()
+        if app:
+            try:
+                app.removeEventFilter(self)
+            except (RuntimeError, TypeError):
+                pass
+        self._global_event_filter_installed = False
+
     def closeEvent(self, event):
         try:
             # Clean up event filter
-            QApplication.instance().removeEventFilter(self)
+            self._remove_global_event_filter()
+
+            if self._stereo_canvas_options:
+                self._stereo_canvas_options.cleanup()
 
             # Restore original main-canvas rotation from before stereo session.
             self._restore_main_canvas_rotation()
@@ -310,10 +340,9 @@ class QSgdSwmWindow(QMainWindow):
 
         # Angle of baseline left->right photo center against horizontal
         strip_angle = self._normalize_signed_angle_deg(math.degrees(math.atan2(dy, dx)))
-        QgsMessageLog.logMessage(
+        self._trace(
             f"ROT: photo_center_L=({x_l:.1f},{y_l:.1f}) R=({x_r:.1f},{y_r:.1f}) "
-            f"strip_angle={strip_angle:.2f}°",
-            "SWM-3D", Qgis.Info
+            f"strip_angle={strip_angle:.2f}°"
         )
 
         delta_to_horizontal = self._signed_delta_to_nearest_horizontal(strip_angle)
@@ -509,7 +538,23 @@ class QSgdSwmWindow(QMainWindow):
             except Exception:
                 pass
 
-        return tuple(items)
+        stereo_fragment: Tuple[Any, ...] = ()
+        if self._stereo_canvas_options:
+            stereo_fragment = self._stereo_canvas_options.signature_fragment()
+
+        return (tuple(items), stereo_fragment)
+
+    def is_layer_visible_in_stereo(self, layer, main_visible: bool) -> bool:
+        """Returns layer visibility for stereo canvases using current override rules."""
+        if not self._stereo_canvas_options:
+            return bool(main_visible)
+        return self._stereo_canvas_options.is_layer_visible_in_stereo(layer, bool(main_visible))
+
+    def _on_stereo_layer_visibility_changed(self, layer_id: str, stereo_visible: bool):
+        """Re-sync stereo canvases after a per-layer visibility override change."""
+        self._trace(f"LAYER_SYNC: stereo override changed layer={layer_id} visible={stereo_visible}")
+        self._last_layers_sync_signature = None
+        self._schedule_layers_sync()
 
     def _run_canvas_refresh(self):
         """Refreshes both stereo canvases once after rapid state changes settle."""

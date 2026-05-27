@@ -1,4 +1,4 @@
-﻿# SIGRID_SWM_3D - QGIS Plugin - Version 0.6.3
+﻿# SIGRID_SWM_3D - QGIS Plugin - Version 0.6.4
 
 ![Version](https://img.shields.io/badge/version-6.1-blue)
 ![QGIS](https://img.shields.io/badge/QGIS-4.x-green)
@@ -71,8 +71,14 @@ Expected behavior:
 
 ## 5. Changes
 
+### Version 0.6.4
+- Fixed error where alt + mouse wheel fails the next few times the plugin is opened
+- Implemented layer visibility/invisibility on stereo canvases independently of the main canvas. It is implemented in the layer's floating menu.
+![visibility/invisibility layer stereo canvas](docs/images/080-visibility-layer-stereo-canvas.png)
+
 ### Version 0.6.3
 - Fixed error of repeated duplicate requests to the SWM service
+- Fixel error drawing in stereo canvas multipolygons
 
 ### Version 0.6.2
 - Fixed bug with overlapping stereos (anaglyph and interlaced)

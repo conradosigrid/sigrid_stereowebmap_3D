@@ -23,9 +23,10 @@ from qgis.core import QgsGeometry
 from qgis.core import QgsVectorLayer
 from qgis.core import QgsCoordinateTransform, QgsProject
 from qgis.PyQt.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QStackedLayout
-from qgis.PyQt.QtWidgets import QInputDialog, QLabel, QApplication
-from qgis.PyQt.QtGui import QTransform, QGuiApplication, QCursor
+from qgis.PyQt.QtWidgets import QInputDialog, QApplication, QLabel
+from qgis.PyQt.QtGui import QTransform, QGuiApplication, QCursor, QPixmap
 from qgis.PyQt.QtCore import Qt, QEvent, QTimer
+import os
 import re
 import math
 import time
@@ -33,7 +34,7 @@ from typing import Dict, Any, Set, Tuple, Optional, List, cast
 
 # SWM libraries
 from .canvas import QgsSgdSwmCanvas
-from .stereo_canvas_options import StereoCanvasOptions
+from .stereo_canvas_options import StereoCanvasOptions, StereoCanvasToolbar
 from .utils import is_z_layer, is_sgd_swm_layer
 try:
     from . import debug as _debug_module
@@ -75,6 +76,12 @@ class QSgdSwmWindow(QMainWindow):
         self._last_layers_sync_signature: Optional[Tuple[Any, ...]] = None
         self._trace_wms_debug = False
         self._trace_seq = 0
+        self._stereo_canvas_options = None
+        self._stereo_controls_toolbar = None
+        self._main_north_indicator_label = None
+        self._main_north_indicator_base_pixmap = QPixmap(
+            os.path.join(os.path.dirname(__file__), "icons", "north_arrow.svg")
+        )
         self._main_canvas_rotation_at_start = 0.0
         if self.qgis_main_canvas and hasattr(self.qgis_main_canvas, 'rotation'):
             self._main_canvas_rotation_at_start = float(self.qgis_main_canvas.rotation())
@@ -90,17 +97,13 @@ class QSgdSwmWindow(QMainWindow):
             self.iface.messageBar().pushCritical("SWM-3D", self.init_error)
             return
 
-        self.z_label = QLabel("Z=----")
-        # self.z_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        self.z_label.setMinimumWidth(60)
-        self.iface.mainWindow().statusBar().addPermanentWidget(self.z_label)
-
         # Shared global Z; always assign through @z_cursor.setter to update everything
         self._z_proj_plane = 0.0
         self.z_cursor = 0.0
         # Global filter can be removed on close and must be reinstalled on reopen.
         self._global_event_filter_installed = False
         self._install_global_event_filter()
+        self._setup_main_canvas_north_indicator()
 
         # Capturar eventos del canvas principal qgis
         self.iface.mapCanvas().xyCoordinates.connect(self._sync_canvases_cursor)      # mouse
@@ -144,6 +147,8 @@ class QSgdSwmWindow(QMainWindow):
         self._style_sync_timer.timeout.connect(self._run_pending_style_sync)
         self._stereo_canvas_options = StereoCanvasOptions(self.iface, self._on_stereo_layer_visibility_changed)
         self._stereo_canvas_options.setup_context_menu()
+        self._stereo_controls_toolbar = StereoCanvasToolbar(self)
+        self._stereo_controls_toolbar.install()
         self._update_digitizing_layer_hooks()
         self._update_style_layer_hooks()
 
@@ -159,6 +164,11 @@ class QSgdSwmWindow(QMainWindow):
         """
         self._install_global_event_filter()
         super().showEvent(event)
+        if self._stereo_canvas_options:
+            self._stereo_canvas_options.setup_context_menu()
+        if self._stereo_controls_toolbar:
+            self._stereo_controls_toolbar.install()
+        self._setup_main_canvas_north_indicator()
         # Initial sync after the window is shown
         self._sync_canvases_destination_crs()
         if self.canvas_left:
@@ -170,6 +180,8 @@ class QSgdSwmWindow(QMainWindow):
         # Route initial layer setup through the deduplicated sync path so later
         # startup layer-tree signals do not repeat the same SWM requests.
         self._sync_canvases_layers()
+        self._update_control_toolbar_state()
+        self._update_main_canvas_north_indicator()
 
     def enterEvent(self, event):
         self._keep_cursor_in_main_qgis_window()
@@ -202,8 +214,19 @@ class QSgdSwmWindow(QMainWindow):
             # Clean up event filter
             self._remove_global_event_filter()
 
+            if self.network_manager:
+                try:
+                    self.network_manager.finished.disconnect(self.network_reply_handle)
+                except (RuntimeError, TypeError):
+                    pass
+
             if self._stereo_canvas_options:
                 self._stereo_canvas_options.cleanup()
+
+            if self._stereo_controls_toolbar:
+                self._stereo_controls_toolbar.cleanup()
+
+            self._cleanup_main_canvas_north_indicator()
 
             # Restore original main-canvas rotation from before stereo session.
             self._restore_main_canvas_rotation()
@@ -231,12 +254,6 @@ class QSgdSwmWindow(QMainWindow):
             if self.canvas_right:
                 self.canvas_right.cleanup_canvas_items_sync()
             
-            # Remove Z label from the status bar
-            try:
-                self.iface.mainWindow().statusBar().removeWidget(self.z_label)
-            except Exception:
-                pass
-                
         except Exception as e:
             QgsMessageLog.logMessage(f"Cleanup error: {str(e)}", "SWM-3D")
         
@@ -274,12 +291,85 @@ class QSgdSwmWindow(QMainWindow):
                 self.canvas_right.setRotation(float(rotation_deg))
         except Exception as e:
             QgsMessageLog.logMessage(f"ROT: Error applying canvas rotation: {str(e)}", "SWM-3D", Qgis.Warning)
+        self._update_main_canvas_north_indicator()
+        self._update_control_toolbar_state()
 
     def _restore_main_canvas_rotation(self):
         """Restore the main QGIS canvas rotation that existed before opening SWM window."""
         try:
             if self.qgis_main_canvas and hasattr(self.qgis_main_canvas, 'setRotation'):
                 self.qgis_main_canvas.setRotation(float(self._main_canvas_rotation_at_start))
+        except Exception:
+            pass
+        self._update_main_canvas_north_indicator()
+
+    def _setup_main_canvas_north_indicator(self):
+        """Creates the north-indicator overlay on the main QGIS canvas viewport."""
+        if self._main_north_indicator_label is not None:
+            return
+        if not self.qgis_main_canvas or self._main_north_indicator_base_pixmap.isNull():
+            return
+
+        try:
+            viewport = self.qgis_main_canvas.viewport() if hasattr(self.qgis_main_canvas, 'viewport') else None
+            if viewport is None:
+                return
+
+            label = QLabel(viewport)
+            label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            label.setStyleSheet("background: transparent;")
+            label.hide()
+            self._main_north_indicator_label = label
+            self._update_main_canvas_north_indicator()
+        except Exception:
+            self._main_north_indicator_label = None
+
+    def _cleanup_main_canvas_north_indicator(self):
+        """Removes the north-indicator overlay from the main canvas viewport."""
+        label = self._main_north_indicator_label
+        if label is not None:
+            try:
+                label.hide()
+                label.deleteLater()
+            except Exception:
+                pass
+        self._main_north_indicator_label = None
+
+    def _update_main_canvas_north_indicator(self):
+        """Refreshes visibility, orientation and position of the main north indicator."""
+        label = self._main_north_indicator_label
+        if label is None or self._main_north_indicator_base_pixmap.isNull() or not self.qgis_main_canvas:
+            return
+
+        try:
+            rotation = float(self.qgis_main_canvas.rotation()) if hasattr(self.qgis_main_canvas, 'rotation') else 0.0
+            if abs(rotation) < 0.05:
+                label.hide()
+                return
+
+            viewport = self.qgis_main_canvas.viewport() if hasattr(self.qgis_main_canvas, 'viewport') else None
+            if viewport is None:
+                label.hide()
+                return
+
+            pix = self._main_north_indicator_base_pixmap.transformed(
+                QTransform().rotate(-rotation),
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            pix = pix.scaled(
+                44,
+                44,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            label.setPixmap(pix)
+
+            margin = 12
+            x = max(0, viewport.width() - label.width() - margin)
+            y = margin
+            label.move(x, y)
+            label.show()
+            label.raise_()
         except Exception:
             pass
 
@@ -314,18 +404,21 @@ class QSgdSwmWindow(QMainWindow):
         """
         if not self._auto_flight_rotation_enabled:
             if abs(self._flight_rotation_current_deg) < 0.05:
+                self._update_control_toolbar_state()
                 return False
             self._flight_rotation_current_deg = 0.0
             self._apply_rotation_to_all_canvases(0.0, apply_main_canvas=apply_main_canvas)
             return True
 
         if self._photo_center_left is None or self._photo_center_right is None:
+            self._update_control_toolbar_state()
             return False
 
         # Keep flight-strip auto-rotation disabled outside stereo-active scales.
         if not self._is_stereo_projection_active():
             target_rotation = 0.0
             if abs(target_rotation - self._flight_rotation_current_deg) < 0.05:
+                self._update_control_toolbar_state()
                 return False
             self._flight_rotation_current_deg = target_rotation
             self._apply_rotation_to_all_canvases(target_rotation, apply_main_canvas=apply_main_canvas)
@@ -353,6 +446,7 @@ class QSgdSwmWindow(QMainWindow):
 
         target_rotation = self._normalize_signed_angle_deg(target_rotation)
         if abs(target_rotation - self._flight_rotation_current_deg) < 0.05:
+            self._update_control_toolbar_state()
             return False
 
         self._flight_rotation_current_deg = target_rotation
@@ -373,6 +467,35 @@ class QSgdSwmWindow(QMainWindow):
             QCursor.setPos(x, y)
         except Exception:
             pass
+
+    def _update_control_toolbar_state(self):
+        if self._stereo_controls_toolbar:
+            self._stereo_controls_toolbar.refresh()
+
+    def _set_stereo_activation_scale_threshold(self, value: float):
+        try:
+            self._stereo_activation_scale_threshold = max(1.0, float(value))
+            self._update_control_toolbar_state()
+            self._update_auto_flight_rotation(apply_main_canvas=True)
+            self._schedule_layers_sync()
+            self._schedule_canvas_refresh()
+        except Exception as e:
+            QgsMessageLog.logMessage(f"SWM: Error updating stereo activation scale: {str(e)}", "SWM-3D", Qgis.Warning)
+
+    def _set_flight_rotation_threshold_deg(self, value: float):
+        try:
+            self._flight_rotation_threshold_deg = max(0.0, min(180.0, float(value)))
+            self._update_control_toolbar_state()
+            self._update_auto_flight_rotation(apply_main_canvas=True)
+            self._schedule_canvas_refresh()
+        except Exception as e:
+            QgsMessageLog.logMessage(f"SWM: Error updating flight rotation threshold: {str(e)}", "SWM-3D", Qgis.Warning)
+
+    def reset_stereo_visibility_overrides(self):
+        """Clears all stereo visibility overrides and refreshes stereo canvases."""
+        if self._stereo_canvas_options and self._stereo_canvas_options.clear_overrides():
+            self._last_layers_sync_signature = None
+            self._schedule_layers_sync()
 
     def configure_canvases(self):
         stereo_options = [
@@ -585,8 +708,10 @@ class QSgdSwmWindow(QMainWindow):
         self._update_z_label()  # Update Z text on stereo canvases
 
     def _update_z_label(self):
-        """Replicates canvas Z changes in the QGIS status bar."""
-        self.z_label.setText(f"Zbase={self._z_proj_plane:.1f} Zcurs={self._z_cursor:.1f}")
+        """Replicates canvas Z changes in the SWM-3D control toolbar."""
+        toolbar = self._stereo_controls_toolbar
+        if toolbar is not None:
+            toolbar.set_z_status(float(self._z_proj_plane), float(self._z_cursor))
         # Update text in canvases
         if self.canvas_left:
             self.canvas_left.update_z_text(self._z_cursor)
@@ -711,6 +836,7 @@ class QSgdSwmWindow(QMainWindow):
             self._trace("REPAINT: skipped (same main signature)")
             return
         self._last_main_repaint_signature = main_signature
+        self._update_main_canvas_north_indicator()
 
         self._sync_canvases_destination_crs()
         if self.canvas_left:
@@ -1256,6 +1382,15 @@ class QSgdSwmWindow(QMainWindow):
          Mouse wheel Z control (ALT + wheel).
         """
         try:
+            if event.type() == QEvent.Type.Resize:
+                try:
+                    main_canvas = self.iface.mapCanvas() if self.iface else None
+                    vp = main_canvas.viewport() if (main_canvas and hasattr(main_canvas, 'viewport')) else None
+                    if obj is main_canvas or (vp is not None and obj is vp):
+                        self._update_main_canvas_north_indicator()
+                except Exception:
+                    pass
+
             # Cursor entry control in the photogrammetric window.
             is_stereo_object = False
             if isinstance(obj, QWidget):

@@ -1,4 +1,4 @@
-﻿# SIGRID_SWM_3D - QGIS Plugin - Version 0.6.4
+﻿# SIGRID_SWM_3D - QGIS Plugin - Version 0.7.0
 
 ![Version](https://img.shields.io/badge/version-6.1-blue)
 ![QGIS](https://img.shields.io/badge/QGIS-4.x-green)
@@ -70,6 +70,13 @@ Expected behavior:
 - Depth adjustments are shown dynamically in the stereo view.
 
 ## 5. Changes
+
+### Version 0.7.0
+- Added taskbar with plugin-specific controls: Stereo activation scale, canvas rotation threshold, and labels with current canvas rotation, terrain Z, and cursor Z values. The latter two were moved from the QGIS status bar.
+![taskbar Sigrid_SWM_3D plugin](docs/images/090-taskbar-Sigrid_SWM_3D-plugin.png)
+- North indicator inserted in case of canvas rotation.
+- Highlighted SWM service layers.
+![Highlighted SWM service layers](docs/images/100-Highlighted-swm-service-layers.png)
 
 ### Version 0.6.4
 - Fixed error where alt + mouse wheel fails the next few times the plugin is opened
@@ -159,10 +166,7 @@ Expected behavior:
 
 ## 8. Future work
 
-The most immediate developments from this baseline version are:
 
-- Correct the issues pointed out in the previous section.
-- Test and refine the stereoscopic rendering on different hardware setups, especially the dual-screen with a 45-degree mirror.
 
 ---
 

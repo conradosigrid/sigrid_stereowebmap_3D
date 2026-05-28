@@ -38,7 +38,7 @@ from qgis.gui import QgsMapCanvas, QgsVertexMarker, QgsRubberBand, QgsMapCanvasI
 from qgis.core import QgsWkbTypes, QgsGeometry, QgsRasterLayer, QgsVectorLayer, QgsPoint, QgsPointXY, QgsFeatureRequest
 from qgis.core import QgsSymbol, QgsSingleSymbolRenderer, QgsGeometryGeneratorSymbolLayer
 from qgis.core import QgsCoordinateTransform, QgsCoordinateReferenceSystem, QgsProject
-from qgis.PyQt.QtGui import QColor, QWheelEvent, QImage, QPainter
+from qgis.PyQt.QtGui import QColor, QWheelEvent, QImage, QPainter, QPixmap
 from qgis.PyQt.QtCore import Qt, QTimer
 from typing import Optional, Any, Dict, List, Tuple
 import hashlib
@@ -129,6 +129,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         # The actual triggerRepaint() is deferred to _on_own_canvas_refreshed so that
         # the WMS layer image is already cached, preventing a second WMS request.
         self._pending_z_update = False
+        self._north_arrow_pixmap = QPixmap(os.path.join(os.path.dirname(__file__), "icons", "north_arrow.svg"))
 
         overlay_color = QColor(Qt.GlobalColor.white) if self.filter != self.FILTER_NONE else QColor(0, 0, 0, 0)
         self.setCanvasColor(overlay_color)
@@ -1292,10 +1293,10 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         elif self.filter == self.FILTER_NONE:
             super().paintEvent(e)
 
-            # Draw Z text without filter when filter mode is disabled.
-            if self.z_text:
+            # Draw plugin overlays without filter when filter mode is disabled.
+            if self.z_text or self._should_show_north_indicator():
                 painter = QPainter(self.viewport())
-                self._draw_z_text_with_painter(painter)
+                self._draw_overlays_with_painter(painter)
                 painter.end()
         else:
             rendered = self._render_canvas_buffer()
@@ -1310,8 +1311,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
 
         painter = QPainter(buffer)
         super().render(painter)
-        if self.z_text:
-            self._draw_z_text_with_painter(painter)
+        self._draw_overlays_with_painter(painter)
         painter.end()
         return buffer
 
@@ -1434,18 +1434,55 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         """
         from qgis.PyQt.QtGui import QFont
 
+        painter.save()
         self._apply_view_mirror_to_painter(painter)
 
         font = QFont()
         font.setPointSize(18)
         font.setBold(True)
         painter.setFont(font)
-        painter.setPen(QColor(255, 255, 255))
+        painter.setPen(QColor(128, 128, 128))
         painter.drawText(
             int(self.width() / 2 - painter.fontMetrics().horizontalAdvance(self.z_text) / 2),
             int(self.height() * 3 / 4),
             self.z_text,
         )
+        painter.restore()
+
+    def _draw_overlays_with_painter(self, painter: QPainter):
+        """Draws all screen overlays managed by this canvas."""
+        if self.z_text:
+            self._draw_z_text_with_painter(painter)
+        if self._should_show_north_indicator():
+            self._draw_north_indicator_with_painter(painter)
+
+    def _should_show_north_indicator(self) -> bool:
+        """Shows north indicator only when canvas rotation is effectively applied."""
+        try:
+            return abs(float(self.rotation())) >= 0.05
+        except Exception:
+            return False
+
+    def _draw_north_indicator_with_painter(self, painter: QPainter):
+        """Draws a north-arrow image rotated by current map rotation."""
+        if self._north_arrow_pixmap.isNull():
+            return
+
+        size = 44
+        margin = 12
+        x = int(self.width() - size - margin)
+        y = int(margin)
+        rotation_deg = float(self.rotation()) if hasattr(self, 'rotation') else 0.0
+
+        painter.save()
+        self._apply_view_mirror_to_painter(painter)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.translate(x + size / 2.0, y + size / 2.0)
+        # North on screen rotates opposite to map rotation.
+        painter.rotate(-rotation_deg)
+        painter.translate(-size / 2.0, -size / 2.0)
+        painter.drawPixmap(0, 0, size, size, self._north_arrow_pixmap)
+        painter.restore()
 
 
     def update_z_text(self, z_value):

@@ -75,10 +75,8 @@ Expected behavior:
 - Added taskbar with plugin-specific controls: Stereo activation scale, canvas rotation threshold, and labels with current canvas rotation, terrain Z, and cursor Z values. The latter two were moved from the QGIS status bar.
 ![taskbar Sigrid_SWM_3D plugin](docs/images/090-taskbar-Sigrid_SWM_3D-plugin.png)
 - North indicator inserted in case of canvas rotation.
-- Highlighted SWM service layers.
-![Highlighted SWM service layers](docs/images/100-Highlighted-swm-service-layers.png)
-- Double checkbox in layers. The one on the left controls visibility in stereo canvases and the one on the right in the main canvas.
-![110-leff-checkbox-stereocanvases-visibility](docs/images/110-leff-checkbox-stereocanvases-visibility.png)
+- Highlighted SWM service layers and double checkbox in layers. The one on the left controls visibility in stereo canvases and the one on the right in the main canvas.
+![Layers panel: double checkbox highlighted Swm layers ](docs/images/100-double-checkbox-highlighted-swm-layers.png)
 
 ### Version 0.6.4
 - Fixed error where alt + mouse wheel fails the next few times the plugin is opened

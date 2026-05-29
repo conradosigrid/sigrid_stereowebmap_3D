@@ -77,11 +77,11 @@ Expected behavior:
 - North indicator inserted in case of canvas rotation.
 - Highlighted SWM service layers.
 ![Highlighted SWM service layers](docs/images/100-Highlighted-swm-service-layers.png)
+- Double checkbox in layers. The one on the left controls visibility in stereo canvases and the one on the right in the main canvas.
+![110-leff-checkbox-stereocanvases-visibility](docs/images/110-leff-checkbox-stereocanvases-visibility.png)
 
 ### Version 0.6.4
 - Fixed error where alt + mouse wheel fails the next few times the plugin is opened
-- Implemented layer visibility/invisibility on stereo canvases independently of the main canvas. It is implemented in the layer's floating menu.
-![visibility/invisibility layer stereo canvas](docs/images/080-visibility-layer-stereo-canvas.png)
 
 ### Version 0.6.3
 - Fixed error of repeated duplicate requests to the SWM service

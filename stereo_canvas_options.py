@@ -12,8 +12,8 @@ import os
 import re
 from typing import Callable, Dict, Optional, Tuple
 
-from qgis.core import QgsProject
-from qgis.PyQt.QtCore import QSize, Qt, QSignalBlocker
+from qgis.core import QgsProject, QgsLayerTreeGroup, QgsLayerTreeLayer
+from qgis.PyQt.QtCore import QSize, Qt, QSignalBlocker, QRect, QEvent
 from qgis.PyQt.QtGui import QAction, QIcon, QColor
 from qgis.PyQt.QtWidgets import QLabel, QDoubleSpinBox, QHBoxLayout, QToolBar, QToolButton, QWidget, QSizePolicy, QStyledItemDelegate, QStyleOptionViewItem, QStyle
 
@@ -23,6 +23,13 @@ from .utils import is_sgd_swm_layer
 class SwmLayerHighlightDelegate(QStyledItemDelegate):
     """Paints a yellow background for SWM layers in the QGIS layer panel."""
 
+    # RETURN KEY (known-good baseline):
+    # SWM_STEREO_WMS_LEFT_CHECKBOX_BASELINE_2026_05_29
+    # Core idea:
+    # - left_checkbox rendering
+    # - viewport eventFilter capturing press/release on stereo checkbox hitbox
+    # - no geometry shifting to the right
+
     def __init__(
         self,
         layer_state_resolver: Optional[Callable[[str], Optional[Tuple[bool, bool, bool]]]] = None,
@@ -31,19 +38,26 @@ class SwmLayerHighlightDelegate(QStyledItemDelegate):
     ):
         super().__init__(parent)
         self._layer_state_resolver = layer_state_resolver
+        self._layer_toggle_handler = layer_toggle_handler
         self._highlight_color = QColor(255, 255, 128, 160)
         self._stereo_tint_color = QColor(0, 0, 255)
+        self._stereo_checkbox_size = 12
+        self._stereo_checkbox_gap = 3
+        self._layer_tree_view = None
+        self._pressed_on_stereo_checkbox = False
         # Stereo text marker mode:
+        # - "left_checkbox": stereo toggle at left of native checkbox (layers only)
         # - "strikeout": stable mode (recommended)
         # - "tint": color text when stereo is visible
         # - "box": experimental mode
         # To revert quickly, change only this value to "strikeout".
-        self._stereo_text_marker_mode = "strikeout"
+        # Working baseline key: SWM_STEREO_WMS_LEFT_CHECKBOX_BASELINE_2026_05_29
+        self._stereo_text_marker_mode = "left_checkbox"
 
     def paint(self, painter, option, index):
         opt = QStyleOptionViewItem(option)
         stereo_visible = False
-        draw_stereo_text_box = False
+        has_layer_row = False
         is_swm = False
         try:
             layer_name = str(index.data(Qt.ItemDataRole.DisplayRole) or "").strip()
@@ -51,6 +65,7 @@ class SwmLayerHighlightDelegate(QStyledItemDelegate):
             layer_state = self._resolve_layer_state(layer_name)
             if layer_state is not None:
                 is_swm, _main_visible, stereo_visible = layer_state
+                has_layer_row = bool(layer_name)
             else:
                 is_swm = bool(layer_name and layer_name in self._get_swm_layer_names())
 
@@ -59,28 +74,195 @@ class SwmLayerHighlightDelegate(QStyledItemDelegate):
                 painter.fillRect(option.rect, self._highlight_color)
                 painter.restore()
 
-            if layer_state is not None:
-                draw_stereo_text_box = bool(stereo_visible and layer_name)
         except Exception:
             pass
 
-        if draw_stereo_text_box and self._stereo_text_marker_mode == "strikeout":
+        if stereo_visible and self._stereo_text_marker_mode == "strikeout":
             font = opt.font
             font.setStrikeOut(True)
             opt.font = font
 
-        if draw_stereo_text_box and self._stereo_text_marker_mode == "tint":
+        if stereo_visible and self._stereo_text_marker_mode == "tint":
             # Some QGIS styles ignore delegate palette overrides for certain rows.
             # Keep default painting and force a deterministic blue text repaint below.
             pass
 
         super().paint(painter, opt, index)
 
-        if draw_stereo_text_box and self._stereo_text_marker_mode == "tint":
+        if has_layer_row and self._stereo_text_marker_mode == "left_checkbox":
+            self._draw_left_stereo_checkbox(painter, opt, index, bool(stereo_visible))
+
+        if stereo_visible and self._stereo_text_marker_mode == "tint":
             self._draw_stereo_tinted_text(painter, opt, index, is_swm)
 
-        if draw_stereo_text_box and self._stereo_text_marker_mode == "box":
+        if stereo_visible and self._stereo_text_marker_mode == "box":
             self._draw_stereo_text_box(painter, opt, index)
+
+    def editorEvent(self, event, model, option, index):
+        try:
+            if self._stereo_text_marker_mode != "left_checkbox":
+                return super().editorEvent(event, model, option, index)
+            if event.type() not in (event.Type.MouseButtonPress, event.Type.MouseButtonRelease):
+                return super().editorEvent(event, model, option, index)
+            if not hasattr(event, "button") or event.button() != Qt.MouseButton.LeftButton:
+                return super().editorEvent(event, model, option, index)
+
+            layer_name = str(index.data(Qt.ItemDataRole.DisplayRole) or "").strip()
+            layer_state = self._resolve_layer_state(layer_name)
+            if not layer_state:
+                return super().editorEvent(event, model, option, index)
+
+            _is_swm, _main_visible, stereo_visible = layer_state
+            box_rect = self._left_stereo_checkbox_rect(option, index)
+            hit_rect = box_rect.adjusted(-2, -2, 2, 2)
+
+            if hasattr(event, "position"):
+                click_pos = event.position().toPoint()
+            elif hasattr(event, "pos"):
+                click_pos = event.pos()
+            else:
+                return super().editorEvent(event, model, option, index)
+
+            if not hit_rect.contains(click_pos):
+                return super().editorEvent(event, model, option, index)
+
+            # Consume press so the tree view does not interpret this click as
+            # a disclosure-triangle expand/collapse action.
+            if event.type() == event.Type.MouseButtonPress:
+                return True
+
+            if self._layer_toggle_handler:
+                changed = self._layer_toggle_handler(layer_name, not bool(stereo_visible))
+                if changed and option.widget:
+                    option.widget.update()
+            return True
+        except Exception:
+            return super().editorEvent(event, model, option, index)
+
+    def attach_to_layer_tree(self, layer_tree_view):
+        """Installs viewport-level click handling for stereo checkbox interaction."""
+        self.detach_from_layer_tree()
+        self._layer_tree_view = layer_tree_view
+        try:
+            viewport = layer_tree_view.viewport() if layer_tree_view else None
+            if viewport is not None:
+                viewport.installEventFilter(self)
+        except Exception:
+            pass
+
+    def detach_from_layer_tree(self):
+        try:
+            if self._layer_tree_view is not None:
+                viewport = self._layer_tree_view.viewport()
+                if viewport is not None:
+                    viewport.removeEventFilter(self)
+        except Exception:
+            pass
+        self._layer_tree_view = None
+        self._pressed_on_stereo_checkbox = False
+
+    def eventFilter(self, watched, event):
+        try:
+            if self._stereo_text_marker_mode != "left_checkbox":
+                return super().eventFilter(watched, event)
+            if self._layer_tree_view is None:
+                return super().eventFilter(watched, event)
+            viewport = self._layer_tree_view.viewport()
+            if watched is not viewport:
+                return super().eventFilter(watched, event)
+
+            if event.type() not in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease):
+                return super().eventFilter(watched, event)
+            if not hasattr(event, "button") or event.button() != Qt.MouseButton.LeftButton:
+                return super().eventFilter(watched, event)
+
+            if hasattr(event, "position"):
+                pos = event.position().toPoint()
+            elif hasattr(event, "pos"):
+                pos = event.pos()
+            else:
+                return super().eventFilter(watched, event)
+
+            index = self._layer_tree_view.indexAt(pos)
+            if not index.isValid():
+                self._pressed_on_stereo_checkbox = False
+                return super().eventFilter(watched, event)
+
+            layer_name = str(index.data(Qt.ItemDataRole.DisplayRole) or "").strip()
+            layer_state = self._resolve_layer_state(layer_name)
+            if not layer_state:
+                self._pressed_on_stereo_checkbox = False
+                return super().eventFilter(watched, event)
+
+            _is_swm, _main_visible, stereo_visible = layer_state
+            opt = QStyleOptionViewItem()
+            opt.rect = self._layer_tree_view.visualRect(index)
+            opt.widget = self._layer_tree_view
+            box_rect = self._left_stereo_checkbox_rect(opt, index)
+            hit_rect = box_rect.adjusted(-2, -2, 2, 2)
+            if not hit_rect.contains(pos):
+                self._pressed_on_stereo_checkbox = False
+                return super().eventFilter(watched, event)
+
+            if event.type() == QEvent.Type.MouseButtonPress:
+                self._pressed_on_stereo_checkbox = True
+                return True
+
+            if event.type() == QEvent.Type.MouseButtonRelease:
+                if not self._pressed_on_stereo_checkbox:
+                    return True
+                self._pressed_on_stereo_checkbox = False
+                if self._layer_toggle_handler:
+                    changed = self._layer_toggle_handler(layer_name, not bool(stereo_visible))
+                    if changed:
+                        viewport.update(opt.rect)
+                return True
+        except Exception:
+            self._pressed_on_stereo_checkbox = False
+
+        return super().eventFilter(watched, event)
+
+    def _left_stereo_checkbox_rect(self, option, index) -> QRect:
+        widget = option.widget
+        style = widget.style() if widget else None
+        y = int(option.rect.center().y() - (self._stereo_checkbox_size // 2))
+        if style is None:
+            x = int(option.rect.left() + 2)
+            return QRect(x, y, self._stereo_checkbox_size, self._stereo_checkbox_size)
+
+        # Force a style option with check-indicator feature so geometry is reliable.
+        native_opt = QStyleOptionViewItem(option)
+        native_opt.features = native_opt.features | QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator
+        check_state = index.data(Qt.ItemDataRole.CheckStateRole)
+        if isinstance(check_state, int):
+            native_opt.checkState = Qt.CheckState(check_state)
+        elif check_state in (Qt.CheckState.Checked, Qt.CheckState.Unchecked, Qt.CheckState.PartiallyChecked):
+            native_opt.checkState = check_state
+
+        check_rect = style.subElementRect(QStyle.SubElement.SE_ItemViewItemCheckIndicator, native_opt, widget)
+        if check_rect.isValid() and check_rect.width() > 0:
+            x = int(check_rect.left() - self._stereo_checkbox_size - self._stereo_checkbox_gap)
+        else:
+            x = int(option.rect.left() + 2)
+        return QRect(x, y, self._stereo_checkbox_size, self._stereo_checkbox_size)
+
+    def _draw_left_stereo_checkbox(self, painter, option, index, stereo_visible: bool):
+        box_rect = self._left_stereo_checkbox_rect(option, index)
+        painter.save()
+        # Allow painting into the left tree margin so the stereo checkbox can stay
+        # strictly at the left of the native checkbox without overlap.
+        painter.setClipping(False)
+        painter.setRenderHint(painter.RenderHint.Antialiasing, False)
+        painter.setPen(QColor(60, 60, 60))
+        painter.setBrush(QColor(255, 255, 255, 220))
+        painter.drawRect(box_rect)
+
+        if stereo_visible:
+            painter.setPen(QColor(0, 90, 0))
+            painter.drawLine(box_rect.left() + 3, box_rect.center().y(), box_rect.left() + 6, box_rect.bottom() - 3)
+            painter.drawLine(box_rect.left() + 6, box_rect.bottom() - 3, box_rect.right() - 2, box_rect.top() + 3)
+
+        painter.restore()
 
     def _draw_stereo_tinted_text(self, painter, option, index, is_swm: bool):
         try:
@@ -251,10 +433,13 @@ class StereoCanvasOptions:
             base_name = re.sub(r"\s*\[\d+\]\s*$", "", name).strip()
             if base_name and base_name != name:
                 layers = project.mapLayersByName(base_name)
-        if not layers:
-            return None
 
-        layer = layers[0]
+        if not layers:
+            layer = self._resolve_single_layer_from_group_name(name)
+            if layer is None:
+                return None
+        else:
+            layer = layers[0]
         main_visible = self._is_layer_visible_in_main_tree(layer)
         stereo_visible = self.is_layer_visible_in_stereo(layer, main_visible)
         return (bool(is_sgd_swm_layer(layer)), bool(main_visible), bool(stereo_visible))
@@ -275,11 +460,16 @@ class StereoCanvasOptions:
             base_name = re.sub(r"\s*\[\d+\]\s*$", "", name).strip()
             if base_name and base_name != name:
                 layers = project.mapLayersByName(base_name)
+
         if not layers:
-            return False
+            layer = self._resolve_single_layer_from_group_name(name)
+            if layer is None:
+                return False
+        else:
+            layer = layers[0]
 
         before_signature = self.signature_fragment()
-        self._on_toggle_layer_stereo_visibility(layers[0], bool(stereo_visible))
+        self._on_toggle_layer_stereo_visibility(layer, bool(stereo_visible))
         return before_signature != self.signature_fragment()
 
     def setup_context_menu(self):
@@ -298,6 +488,7 @@ class StereoCanvasOptions:
                 self._toggle_layer_stereo_visibility_by_name,
                 layer_tree_view,
             )
+            self._swm_highlight_delegate.attach_to_layer_tree(layer_tree_view)
             layer_tree_view.setItemDelegate(self._swm_highlight_delegate)
             self._highlight_delegate_installed = True
             try:
@@ -307,9 +498,9 @@ class StereoCanvasOptions:
             except Exception:
                 pass
 
-        if not self._context_menu_connected and hasattr(layer_tree_view, "contextMenuAboutToShow"):
-            layer_tree_view.contextMenuAboutToShow.connect(self._on_context_menu_about_to_show)
-            self._context_menu_connected = True
+        # Stereo visibility is now controlled from the layer-row stereo checkbox.
+        # Keep context-menu toggle disabled to avoid duplicated controls.
+        self._context_menu_connected = False
 
     def cleanup(self):
         """Disconnect hooks and clear local state."""
@@ -331,6 +522,7 @@ class StereoCanvasOptions:
                 pass
             try:
                 if self._swm_highlight_delegate is not None:
+                    self._swm_highlight_delegate.detach_from_layer_tree()
                     self._swm_highlight_delegate.deleteLater()
             except Exception:
                 pass
@@ -342,7 +534,7 @@ class StereoCanvasOptions:
         self._visibility_overrides.clear()
 
     def clear_overrides(self):
-        """Removes all stereo visibility overrides and persists the empty state."""
+        """Removes all persisted stereo visibility states and persists the empty state."""
         if not self._visibility_overrides:
             return False
 
@@ -354,14 +546,18 @@ class StereoCanvasOptions:
         return bool(self._visibility_overrides)
 
     def is_layer_visible_in_stereo(self, layer, main_visible: bool) -> bool:
-        """Return effective stereo visibility for a layer."""
+        """Return persisted stereo visibility for a layer, independent from main canvas toggles."""
         if not layer or not hasattr(layer, "id"):
             return bool(main_visible)
 
         layer_id = str(layer.id())
-        if layer_id in self._visibility_overrides:
-            return bool(self._visibility_overrides[layer_id])
+        stored = self._visibility_overrides.get(layer_id)
+        if stored is not None:
+            return bool(stored)
 
+        # First time a layer is seen, seed stereo state from main visibility.
+        # From this point on, stereo remains independent.
+        self._visibility_overrides[layer_id] = bool(main_visible)
         return bool(main_visible)
 
     def signature_fragment(self) -> Tuple[Tuple[str, bool], ...]:
@@ -401,19 +597,10 @@ class StereoCanvasOptions:
             return
 
         layer_id = str(layer.id())
-        main_visible = self._is_layer_visible_in_main_tree(layer)
-
-        # If user sets the same state as main visibility, clear override and go back to default behavior.
-        changed = False
-        if bool(stereo_visible) == bool(main_visible):
-            if layer_id in self._visibility_overrides:
-                self._visibility_overrides.pop(layer_id, None)
-                changed = True
-        else:
-            previous = self._visibility_overrides.get(layer_id)
-            if previous is None or bool(previous) != bool(stereo_visible):
-                self._visibility_overrides[layer_id] = bool(stereo_visible)
-                changed = True
+        previous = self._visibility_overrides.get(layer_id)
+        changed = previous is None or bool(previous) != bool(stereo_visible)
+        if changed:
+            self._visibility_overrides[layer_id] = bool(stereo_visible)
 
         if changed:
             self._save_to_project()
@@ -506,6 +693,48 @@ class StereoCanvasOptions:
             return bool(node.isVisible())
         except Exception:
             return True
+
+    def _resolve_single_layer_from_group_name(self, group_name: str):
+        """If a tree group has a single layer child, return that layer; otherwise None."""
+        name = str(group_name or "").strip()
+        if not name:
+            return None
+
+        project = QgsProject.instance()
+        if not project:
+            return None
+
+        root = project.layerTreeRoot()
+        if not root:
+            return None
+
+        group = root.findGroup(name)
+        if group is None:
+            return None
+
+        layer = self._first_layer_in_group(group)
+        return layer
+
+    def _first_layer_in_group(self, group):
+        """Recursively returns the first layer child found under a group if it is unique."""
+        if not isinstance(group, QgsLayerTreeGroup):
+            return None
+
+        layer_children = []
+        for child in group.children():
+            if isinstance(child, QgsLayerTreeLayer):
+                layer_children.append(child.layer())
+            elif isinstance(child, QgsLayerTreeGroup):
+                nested_layer = self._first_layer_in_group(child)
+                if nested_layer is not None:
+                    layer_children.append(nested_layer)
+
+            if len(layer_children) > 1:
+                return None
+
+        if len(layer_children) == 1:
+            return layer_children[0]
+        return None
 
 
 class StereoCanvasToolbar:

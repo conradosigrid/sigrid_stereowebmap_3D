@@ -74,6 +74,7 @@ class QSgdSwmWindow(QMainWindow):
         self._last_applied_stereo_refresh_signature: Optional[Tuple[Any, ...]] = None
         self._last_main_repaint_signature: Optional[Tuple[Any, ...]] = None
         self._last_layers_sync_signature: Optional[Tuple[Any, ...]] = None
+        self._last_main_scale_for_layer_sync: Optional[float] = None
         self._trace_wms_debug = False
         self._trace_seq = 0
         self._stereo_canvas_options = None
@@ -129,6 +130,8 @@ class QSgdSwmWindow(QMainWindow):
         except Exception:
             self._layer_tree_model = None
         self.iface.mapCanvas().extentsChanged.connect(self._sync_canvases_repaint)    # zoom and pan
+        if hasattr(self.iface.mapCanvas(), 'scaleChanged'):
+            self.iface.mapCanvas().scaleChanged.connect(self._on_main_canvas_scale_changed)
         if hasattr(self.iface.mapCanvas(), 'destinationCrsChanged'):
             self.iface.mapCanvas().destinationCrsChanged.connect(self._on_main_canvas_crs_changed)
 
@@ -247,6 +250,12 @@ class QSgdSwmWindow(QMainWindow):
                         root.visibilityChanged.disconnect(self._schedule_layers_sync)
                     except (RuntimeError, TypeError):
                         pass
+
+            if hasattr(self.iface.mapCanvas(), 'scaleChanged'):
+                try:
+                    self.iface.mapCanvas().scaleChanged.disconnect(self._on_main_canvas_scale_changed)
+                except (RuntimeError, TypeError):
+                    pass
             
             # Clean up synchronization in secondary canvases
             if self.canvas_left:
@@ -455,8 +464,8 @@ class QSgdSwmWindow(QMainWindow):
 
     def _keep_cursor_in_main_qgis_window(self):
         """Prevents the cursor from staying over the stereo window (cross-platform)."""
-        # if _debug_module is not None and _debug_module.DEBUG:
-        if True:
+        if _debug_module is not None and _debug_module.DEBUG:
+        # if True:
             return
 
         try:
@@ -642,6 +651,7 @@ class QSgdSwmWindow(QMainWindow):
     def _current_layers_sync_signature(self) -> Tuple[Any, ...]:
         """Returns a stable signature for current layer stack relevant to stereo sync."""
         items: List[Tuple[str, bool]] = []
+        scale_visibility_fragment: Tuple[Tuple[str, bool], ...] = ()
         try:
             project = QgsProject.instance()
             if project:
@@ -654,6 +664,44 @@ class QSgdSwmWindow(QMainWindow):
         except Exception:
             items = []
 
+        try:
+            project = QgsProject.instance()
+            root = project.layerTreeRoot() if project else None
+            main_scale = None
+            if self.iface and self.iface.mapCanvas() and hasattr(self.iface.mapCanvas(), 'scale'):
+                scale_getter = getattr(self.iface.mapCanvas(), 'scale')
+                if callable(scale_getter):
+                    main_scale = float(cast(Any, scale_getter()))
+
+            if root and main_scale is not None:
+                scale_items: List[Tuple[str, bool]] = []
+                for node in root.findLayers():
+                    layer = node.layer()
+                    if not layer or not bool(node.isVisible()):
+                        continue
+
+                    has_scale_visibility = getattr(layer, 'hasScaleBasedVisibility', None)
+                    if not (callable(has_scale_visibility) and bool(has_scale_visibility())):
+                        continue
+
+                    in_range = True
+                    in_range_getter = getattr(layer, 'isInScaleRange', None)
+                    if callable(in_range_getter):
+                        in_range = bool(in_range_getter(main_scale))
+                    else:
+                        min_scale_getter = getattr(layer, 'minimumScale', None)
+                        max_scale_getter = getattr(layer, 'maximumScale', None)
+                        min_scale = float(cast(Any, min_scale_getter())) if callable(min_scale_getter) else 0.0
+                        max_scale = float(cast(Any, max_scale_getter())) if callable(max_scale_getter) else 0.0
+                        above_min = (min_scale <= 0.0) or (main_scale <= min_scale)
+                        below_max = (max_scale <= 0.0) or (main_scale >= max_scale)
+                        in_range = bool(above_min and below_max)
+                    scale_items.append((str(layer.id()), in_range))
+
+                scale_visibility_fragment = tuple(sorted(scale_items))
+        except Exception:
+            scale_visibility_fragment = ()
+
         if not items:
             try:
                 for layer in self.iface.mapCanvas().layers():
@@ -665,7 +713,7 @@ class QSgdSwmWindow(QMainWindow):
         if self._stereo_canvas_options:
             stereo_fragment = self._stereo_canvas_options.signature_fragment()
 
-        return (tuple(items), stereo_fragment)
+        return (tuple(items), scale_visibility_fragment, stereo_fragment)
 
     def is_layer_visible_in_stereo(self, layer, main_visible: bool) -> bool:
         """Returns layer visibility for stereo canvases using current override rules."""
@@ -678,6 +726,8 @@ class QSgdSwmWindow(QMainWindow):
         self._trace(f"LAYER_SYNC: stereo override changed layer={layer_id} visible={stereo_visible}")
         self._last_layers_sync_signature = None
         self._schedule_layers_sync()
+        # Refresh is triggered after _sync_canvases_layers() completes so repaint
+        # always reflects the new layer stack and avoids timer-race stale frames.
 
     def _run_canvas_refresh(self):
         """Refreshes both stereo canvases once after rapid state changes settle."""
@@ -786,6 +836,33 @@ class QSgdSwmWindow(QMainWindow):
         self._sync_canvases_destination_crs()
         self._sync_canvases_repaint()
 
+    def _on_main_canvas_scale_changed(self, *args):
+        """Re-evaluates stereo layer visibility immediately after scale changes."""
+        scale_changed = False
+        try:
+            if args:
+                current_scale = float(cast(Any, args[0]))
+            else:
+                scale_getter = getattr(self.iface.mapCanvas(), 'scale', None)
+                current_scale = float(cast(Any, scale_getter())) if callable(scale_getter) else None
+
+            if current_scale is not None:
+                scale_changed = (
+                    self._last_main_scale_for_layer_sync is None
+                    or abs(float(current_scale) - float(self._last_main_scale_for_layer_sync)) > 1e-6
+                )
+                if scale_changed:
+                    self._last_main_scale_for_layer_sync = float(current_scale)
+                    self._last_layers_sync_signature = None
+        except Exception:
+            pass
+
+        if scale_changed:
+            self._sync_canvases_layers()
+        else:
+            self._schedule_layers_sync()
+        self._schedule_canvas_refresh()
+
     def _reproject_extent_to_stereo_crs(self, extent, target_canvas):
         """
         Reprojects an extent from main canvas CRS to the provided stereo canvas CRS (if different).
@@ -837,6 +914,26 @@ class QSgdSwmWindow(QMainWindow):
             return
         self._last_main_repaint_signature = main_signature
         self._update_main_canvas_north_indicator()
+
+        # Some environments do not emit a reliable scaleChanged signal during wheel zoom.
+        # Detect scale transitions here and force one layer-sync pass when scale changed.
+        try:
+            current_scale = None
+            scale_getter = getattr(self.qgis_main_canvas, 'scale', None)
+            if callable(scale_getter):
+                current_scale = float(cast(Any, scale_getter()))
+
+            if current_scale is not None:
+                changed = (
+                    self._last_main_scale_for_layer_sync is None
+                    or abs(float(current_scale) - float(self._last_main_scale_for_layer_sync)) > 1e-6
+                )
+                if changed:
+                    self._last_main_scale_for_layer_sync = float(current_scale)
+                    self._last_layers_sync_signature = None
+                    self._sync_canvases_layers()
+        except Exception:
+            pass
 
         self._sync_canvases_destination_crs()
         if self.canvas_left:
@@ -890,8 +987,9 @@ class QSgdSwmWindow(QMainWindow):
         # Layer visibility/type changes can update SWM service CRS availability.
         self._update_swm_service_crs_cache()
         self._sync_canvases_destination_crs()
-        # Do not force an immediate repaint here: sync_layers() already triggers
-        # render passes and forcing repaint duplicates WMS GetMap requests.
+        # Run one debounced refresh after layer sync so visibility toggles apply
+        # immediately even when no pan/zoom occurs next.
+        self._schedule_canvas_refresh()
 
     def _schedule_layers_sync(self, *args):
         """

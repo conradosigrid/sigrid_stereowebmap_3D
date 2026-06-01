@@ -40,7 +40,7 @@ from qgis.core import QgsSymbol, QgsSingleSymbolRenderer, QgsGeometryGeneratorSy
 from qgis.core import QgsCoordinateTransform, QgsCoordinateReferenceSystem, QgsProject
 from qgis.PyQt.QtGui import QColor, QWheelEvent, QImage, QPainter, QPixmap
 from qgis.PyQt.QtCore import Qt, QTimer
-from typing import Optional, Any, Dict, List, Tuple
+from typing import Optional, Any, Dict, List, Tuple, cast
 import hashlib
 
 import re
@@ -1441,12 +1441,42 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         font.setPointSize(18)
         font.setBold(True)
         painter.setFont(font)
-        painter.setPen(QColor(128, 128, 128))
-        painter.drawText(
-            int(self.width() / 2 - painter.fontMetrics().horizontalAdvance(self.z_text) / 2),
-            int(self.height() * 3 / 4),
-            self.z_text,
-        )
+
+        metrics = painter.fontMetrics()
+        text_x = int(self.width() / 2 - metrics.horizontalAdvance(self.z_text) / 2)
+        text_baseline_y = int(self.height() * 3 / 4)
+
+        text_top = text_baseline_y - metrics.ascent()
+        text_rect_x = text_x
+        text_rect_y = text_top
+        text_rect_w = metrics.horizontalAdvance(self.z_text)
+        text_rect_h = metrics.height()
+
+        pad_x = 10
+        pad_y = 6
+        bg_x = text_rect_x - pad_x
+        bg_y = text_rect_y - pad_y
+        bg_w = text_rect_w + pad_x * 2
+        bg_h = text_rect_h + pad_y * 2
+
+        text_color = QColor(255, 255, 255, 255)
+        halo_color = QColor(0, 0, 0, 230)
+        bg_color = QColor(0, 0, 0, 120)
+
+        # Stable high-contrast pill background.
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(bg_color)
+        painter.drawRoundedRect(bg_x, bg_y, bg_w, bg_h, 6, 6)
+
+        # Draw an outline via offsets (safer than custom pen hint paths on some Qt builds).
+        painter.setPen(halo_color)
+        painter.drawText(text_x - 1, text_baseline_y, self.z_text)
+        painter.drawText(text_x + 1, text_baseline_y, self.z_text)
+        painter.drawText(text_x, text_baseline_y - 1, self.z_text)
+        painter.drawText(text_x, text_baseline_y + 1, self.z_text)
+
+        painter.setPen(text_color)
+        painter.drawText(text_x, text_baseline_y, self.z_text)
         painter.restore()
 
     def _draw_overlays_with_painter(self, painter: QPainter):
@@ -1569,23 +1599,31 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         # Get visible layers from the project layer tree (canonical visibility state).
         # This avoids stale snapshots that can happen around legend toggle events.
         layers_main = []
+
+        tree_lookup_available = False
         project = QgsProject.instance()
         if project:
             root = project.layerTreeRoot()
             if root:
+                tree_lookup_available = True
                 for node in root.findLayers():
                     layer = node.layer()
                     if not layer:
                         continue
 
-                    main_visible = bool(node.isVisible())
-                    stereo_visible = main_visible
+                    tree_visible = bool(node.isVisible())
+
+                    # Stereo overrides are independent from the main tree toggle.
+                    # This allows layers hidden in main canvas to remain visible in stereo.
+                    stereo_visible = tree_visible
                     if self.parent and hasattr(self.parent, 'is_layer_visible_in_stereo'):
-                        stereo_visible = bool(self.parent.is_layer_visible_in_stereo(layer, main_visible))
+                        stereo_visible = bool(self.parent.is_layer_visible_in_stereo(layer, tree_visible))
+                    stereo_visible = bool(stereo_visible)
 
                     if stereo_visible:
                         layers_main.append(layer)
-        if not layers_main:
+
+        if not tree_lookup_available:
             # Fallback to canvas layers if tree lookup is unavailable.
             layers_main = self.qgis_main_canvas.layers()
 

@@ -14,7 +14,7 @@ from typing import Callable, Dict, Optional, Tuple
 
 from qgis.core import QgsProject, QgsLayerTreeGroup, QgsLayerTreeLayer
 from qgis.PyQt.QtCore import QSize, Qt, QSignalBlocker, QRect, QEvent
-from qgis.PyQt.QtGui import QAction, QIcon, QColor
+from qgis.PyQt.QtGui import QIcon, QColor
 from qgis.PyQt.QtWidgets import QLabel, QDoubleSpinBox, QHBoxLayout, QToolBar, QToolButton, QWidget, QSizePolicy, QStyledItemDelegate, QStyleOptionViewItem, QStyle
 
 from .utils import is_sgd_swm_layer
@@ -411,7 +411,6 @@ class StereoCanvasOptions:
         self.iface = iface
         self._on_visibility_changed = on_visibility_changed
         self._visibility_overrides: Dict[str, bool] = {}
-        self._context_menu_connected = False
         self._highlight_delegate_installed = False
         self._original_item_delegate = None
         self._swm_highlight_delegate = None
@@ -498,19 +497,9 @@ class StereoCanvasOptions:
             except Exception:
                 pass
 
-        # Stereo visibility is now controlled from the layer-row stereo checkbox.
-        # Keep context-menu toggle disabled to avoid duplicated controls.
-        self._context_menu_connected = False
-
     def cleanup(self):
         """Disconnect hooks and clear local state."""
         layer_tree_view = self.iface.layerTreeView() if self.iface else None
-        if layer_tree_view and self._context_menu_connected and hasattr(layer_tree_view, "contextMenuAboutToShow"):
-            try:
-                layer_tree_view.contextMenuAboutToShow.disconnect(self._on_context_menu_about_to_show)
-            except (RuntimeError, TypeError):
-                pass
-
         if layer_tree_view and self._highlight_delegate_installed:
             try:
                 if self._original_item_delegate is not None:
@@ -527,7 +516,6 @@ class StereoCanvasOptions:
             except Exception:
                 pass
 
-        self._context_menu_connected = False
         self._highlight_delegate_installed = False
         self._original_item_delegate = None
         self._swm_highlight_delegate = None
@@ -564,33 +552,6 @@ class StereoCanvasOptions:
         """Stable, hashable fragment to include in layer-sync dedupe signature."""
         items = sorted((str(layer_id), bool(visible)) for layer_id, visible in self._visibility_overrides.items())
         return tuple(items)
-
-    def _on_context_menu_about_to_show(self, menu):
-        """Injects the stereo visibility toggle into layer context menu."""
-        if menu is None:
-            return
-
-        layer = self._get_current_layer()
-        if not layer:
-            return
-
-        for existing_action in menu.actions():
-            if existing_action and existing_action.text() == "Visible in stereo canvases":
-                return
-
-        main_visible = self._is_layer_visible_in_main_tree(layer)
-        current_visible = self.is_layer_visible_in_stereo(layer, main_visible)
-
-        action = QAction("Visible in stereo canvases", menu)
-        action.setCheckable(True)
-        action.setChecked(bool(current_visible))
-        action.toggled.connect(lambda checked, lyr=layer: self._on_toggle_layer_stereo_visibility(lyr, bool(checked)))
-
-        existing_actions = menu.actions()
-        if existing_actions:
-            menu.insertAction(existing_actions[0], action)
-        else:
-            menu.addAction(action)
 
     def _on_toggle_layer_stereo_visibility(self, layer, stereo_visible: bool):
         if not layer or not hasattr(layer, "id"):

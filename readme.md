@@ -72,6 +72,7 @@ Expected behavior:
 ## 5. Changes
 
 ### Version 0.7.0
+- Layer visibility scaling has been incorporated. Visibility by scaling is adjusted in stereo canvases to match that of the main canvas.
 - Added taskbar with plugin-specific controls: Stereo activation scale, canvas rotation threshold, and labels with current canvas rotation, terrain Z, and cursor Z values. The latter two were moved from the QGIS status bar.
 ![taskbar Sigrid_SWM_3D plugin](docs/images/090-taskbar-Sigrid_SWM_3D-plugin.png)
 - North indicator inserted in case of canvas rotation.

@@ -122,8 +122,11 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         self._z_layer_cache: Dict[str, QgsVectorLayer] = {}
         self.limits = None
         self.z_text = ""  # Z cursor text
+        self.show_z_text_overlay = True  # Whether the Z label overlay is drawn
+        self._z_text_world_anchor_xy: Optional[QgsPointXY] = None
         self._last_rendered_buffer: Optional[QImage] = None
         self._last_base_buffer: Optional[QImage] = None
+        self._last_composed_overlay_buffer: Optional[QImage] = None
         # Deferred Z-layer update flag: set True when a WMS reply has been processed
         # but _apply_current_transform_to_z_layers() hasn't been called yet.
         # The actual triggerRepaint() is deferred to _on_own_canvas_refreshed so that
@@ -144,12 +147,16 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         # every completed render ensures the filter (interlaced / anaglyph) is
         # always applied.
         if self.filter != self.FILTER_NONE:
-            self.mapCanvasRefreshed.connect(self.update)
             self.mapCanvasRefreshed.connect(self._schedule_base_capture)
 
         # Deferred Z update: apply geometry expressions after the WMS layer has
         # finished rendering (cache populated), to avoid a second WMS GetMap request.
         self.mapCanvasRefreshed.connect(self._on_own_canvas_refreshed)
+
+        # Keep a cached world anchor for z_text insertion at zoom/pan/resize changes.
+        self.extentsChanged.connect(self._update_z_text_world_anchor)
+        self.scaleChanged.connect(self._update_z_text_world_anchor)
+        QTimer.singleShot(0, self._update_z_text_world_anchor)
 
     def _is_stereo_projection_active(self) -> bool:
         """Delegates stereo activation to the parent window when available."""
@@ -172,7 +179,11 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 return
             pix = viewport.grab()
             if pix and not pix.isNull():
-                self._last_base_buffer = pix.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+                base = pix.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+                self._last_base_buffer = base
+                self._last_rendered_buffer = base
+                # Repaint after capture so filters/composition use a stable source frame.
+                self.update()
         except Exception:
             pass
 
@@ -211,6 +222,68 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         self.cursor_marker_inner.show()
         if self.filter != self.FILTER_NONE:
             self.update()
+
+    def _z_text_insertion_pixel(self) -> Tuple[int, int]:
+        """
+        Screen insertion anchor for z_text before 3D projection:
+        centered horizontally and at 1/10 of viewport height from the bottom.
+        """
+        x_px = int(self.width() / 2)
+        y_px = int(self.height() * 9 / 10)
+        return x_px, y_px
+
+    def _update_z_text_world_anchor(self, *_args):
+        """
+        Updates cached world XY for z_text insertion when scale/extent changes.
+        """
+        self._z_text_world_anchor_xy = None
+        if self.width() <= 0 or self.height() <= 0:
+            return
+
+        try:
+            coord_transform = self.getCoordinateTransform()
+            if not coord_transform:
+                return
+
+            x_px, y_px = self._z_text_insertion_pixel()
+            map_anchor_xy = coord_transform.toMapCoordinates(x_px, y_px)
+            self._z_text_world_anchor_xy = self._reproject_point_to_world(map_anchor_xy)
+        except Exception:
+            self._z_text_world_anchor_xy = None
+
+    def _project_z_text_baseline(self, metrics) -> Tuple[int, int]:
+        """
+        Projects cached (X,Y,Zcursor) for z_text and returns clamped screen baseline.
+        """
+        x_px, y_px = self._z_text_insertion_pixel()
+
+        move_zlabel_in_3D = bool(getattr(self.parent, 'move_zlabel_in_3D', True)) if self.parent else True
+        if move_zlabel_in_3D and self._z_text_world_anchor_xy and self.trf_wld2prp and self.parent and self._is_stereo_projection_active():
+            try:
+                z_cursor = float(getattr(self.parent, 'z_cursor', 0.0))
+                pnt_wrl = QgsPoint(self._z_text_world_anchor_xy.x(), self._z_text_world_anchor_xy.y(), z_cursor)
+                pnt_prj = self.trf_wld2prp.execute_wrl2prp(pnt_wrl)
+                if pnt_prj:
+                    coord_transform = self.getCoordinateTransform()
+                    if coord_transform:
+                        canvas_point = coord_transform.transform(QgsPointXY(pnt_prj.x(), pnt_prj.y()))
+                        x_px = int(canvas_point.x())
+                        y_px = int(canvas_point.y())
+            except Exception:
+                pass
+
+        text_w = metrics.horizontalAdvance(self.z_text)
+        text_x = int(x_px - text_w / 2)
+        text_baseline_y = int(y_px)
+
+        min_x = 8
+        max_x = int(max(min_x, self.width() - text_w - 8))
+        min_baseline = int(metrics.ascent() + 8)
+        max_baseline = int(max(min_baseline, self.height() - metrics.descent() - 8))
+
+        text_x = max(min_x, min(max_x, text_x))
+        text_baseline_y = max(min_baseline, min(max_baseline, text_baseline_y))
+        return text_x, text_baseline_y
 
     # ============================================================================
     # == Map Canvas Item Synchronization ==
@@ -1274,21 +1347,27 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         event.accept()   # consume the event
         return           # do not call super()
 
+    def resizeEvent(self, event):
+        """Keeps z_text world anchor in sync with viewport geometry changes."""
+        super().resizeEvent(event)
+        self._update_z_text_world_anchor()
+
     # ============================================================================
     # == End of cursor handling in stereo canvas ==
     # ============================================================================
 
     def paintEvent(self, e):
         if self._is_overlay_mode():
-            rendered = self._render_canvas_buffer()
+            rendered = self._current_stable_source_buffer()
             self._last_rendered_buffer = rendered
             composed = self._compose_overlay_image()
             if composed is None:
-                # Fallback while opposite eye catches up.
-                if self.parent and self.parent.stereo_id == 1:
-                    composed = rendered
-                else:
-                    composed = self.apply_filter(rendered.copy())
+                # Keep previous valid composition to avoid transient blanks/transparent rows.
+                composed = self._last_composed_overlay_buffer.copy() if self._last_composed_overlay_buffer is not None else rendered.copy()
+            else:
+                self._last_composed_overlay_buffer = composed.copy()
+
+            self._draw_overlays_on_image(composed)
             self._paint_image_to_viewport(composed, replace=True)
         elif self.filter == self.FILTER_NONE:
             super().paintEvent(e)
@@ -1299,15 +1378,44 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 self._draw_overlays_with_painter(painter)
                 painter.end()
         else:
-            rendered = self._render_canvas_buffer()
+            rendered = self._current_stable_source_buffer()
             self._last_rendered_buffer = rendered
             filtered = self.apply_filter(rendered.copy())
+            self._draw_overlays_on_image(filtered)
             self._paint_image_to_viewport(filtered)
+
+    def _current_stable_source_buffer(self) -> QImage:
+        """Returns the most recent stable canvas image for filtered/overlay painting."""
+        if self._last_base_buffer is not None:
+            return self._last_base_buffer.copy()
+        if self._last_rendered_buffer is not None:
+            return self._last_rendered_buffer.copy()
+
+        # Last-resort stable source: current viewport pixels (already on screen).
+        try:
+            viewport = self.viewport()
+            if viewport is not None:
+                pix = viewport.grab()
+                if pix and not pix.isNull():
+                    return pix.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+        except Exception:
+            pass
+
+        return self._render_canvas_buffer()
+
+    def _draw_overlays_on_image(self, image: QImage):
+        """Draw plugin overlays on an already prepared image buffer."""
+        if not (self.z_text or self._should_show_north_indicator()):
+            return
+        painter = QPainter(image)
+        self._draw_overlays_with_painter(painter)
+        painter.end()
 
     def _render_canvas_buffer(self) -> QImage:
         """Render this canvas content, including Z text, into an off-screen image."""
         buffer = QImage(self.size(), QImage.Format.Format_ARGB32)
-        buffer.fill(QColor(Qt.GlobalColor.white) if self._is_overlay_mode() else QColor(0, 0, 0, 0))
+        # Keep fallback background transparent to avoid white flashes between frames.
+        buffer.fill(QColor(0, 0, 0, 0))
 
         painter = QPainter(buffer)
         super().render(painter)
@@ -1328,9 +1436,9 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             return None
 
         if left_canvas._last_rendered_buffer is None:
-            left_canvas._last_rendered_buffer = left_canvas._render_canvas_buffer()
+            left_canvas._last_rendered_buffer = left_canvas._current_stable_source_buffer()
         if right_canvas._last_rendered_buffer is None:
-            right_canvas._last_rendered_buffer = right_canvas._render_canvas_buffer()
+            right_canvas._last_rendered_buffer = right_canvas._current_stable_source_buffer()
 
         left_image = left_canvas._last_rendered_buffer
         right_image = right_canvas._last_rendered_buffer
@@ -1443,8 +1551,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         painter.setFont(font)
 
         metrics = painter.fontMetrics()
-        text_x = int(self.width() / 2 - metrics.horizontalAdvance(self.z_text) / 2)
-        text_baseline_y = int(self.height() * 3 / 4)
+        text_x, text_baseline_y = self._project_z_text_baseline(metrics)
 
         text_top = text_baseline_y - metrics.ascent()
         text_rect_x = text_x
@@ -1479,9 +1586,14 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         painter.drawText(text_x, text_baseline_y, self.z_text)
         painter.restore()
 
+    def set_show_z_text_overlay(self, visible: bool):
+        """Show or hide the Z label overlay."""
+        self.show_z_text_overlay = bool(visible)
+        self.update()
+
     def _draw_overlays_with_painter(self, painter: QPainter):
         """Draws all screen overlays managed by this canvas."""
-        if self.z_text:
+        if self.z_text and self.show_z_text_overlay:
             self._draw_z_text_with_painter(painter)
         if self._should_show_north_indicator():
             self._draw_north_indicator_with_painter(painter)
@@ -1595,6 +1707,57 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         # Just update position, don't sync properties on every mouse move (too expensive)
         self.update_cursor()
 
+    def _is_layer_visible_at_main_canvas_scale(self, layer) -> bool:
+        """
+        Evaluates layer scale visibility using the main canvas scale, not this stereo canvas.
+        """
+        try:
+            if not layer or not hasattr(layer, 'hasScaleBasedVisibility'):
+                return True
+            if not layer.hasScaleBasedVisibility():
+                return True
+
+            if not self.qgis_main_canvas or not hasattr(self.qgis_main_canvas, 'scale'):
+                return True
+
+            main_scale = float(self.qgis_main_canvas.scale())
+            if not math.isfinite(main_scale) or main_scale <= 0.0:
+                return True
+
+            if hasattr(layer, 'isInScaleRange'):
+                return bool(layer.isInScaleRange(main_scale))
+
+            # Fallback for API variants where isInScaleRange is unavailable.
+            minimum_scale = float(layer.minimumScale()) if hasattr(layer, 'minimumScale') else 0.0
+            maximum_scale = float(layer.maximumScale()) if hasattr(layer, 'maximumScale') else 0.0
+
+            if minimum_scale > 0.0 and main_scale < minimum_scale:
+                return False
+            if maximum_scale > 0.0 and main_scale > maximum_scale:
+                return False
+            return True
+        except Exception:
+            return True
+
+    @staticmethod
+    def _is_hidden_by_unchecked_parent_group(node) -> bool:
+        """Returns True when a layer-tree node has any unchecked parent group."""
+        try:
+            parent_node = node.parent() if hasattr(node, 'parent') else None
+            while parent_node is not None:
+                checked_getter = getattr(parent_node, 'itemVisibilityChecked', None)
+                if callable(checked_getter):
+                    try:
+                        if not bool(checked_getter()):
+                            return True
+                    except Exception:
+                        pass
+                parent_getter = getattr(parent_node, 'parent', None)
+                parent_node = parent_getter() if callable(parent_getter) else None
+        except Exception:
+            return False
+        return False
+
     def sync_layers(self):
         # Get visible layers from the project layer tree (canonical visibility state).
         # This avoids stale snapshots that can happen around legend toggle events.
@@ -1612,20 +1775,29 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                         continue
 
                     tree_visible = bool(node.isVisible())
+                    hidden_by_parent_group = self._is_hidden_by_unchecked_parent_group(node)
 
                     # Stereo overrides are independent from the main tree toggle.
                     # This allows layers hidden in main canvas to remain visible in stereo.
                     stereo_visible = tree_visible
                     if self.parent and hasattr(self.parent, 'is_layer_visible_in_stereo'):
                         stereo_visible = bool(self.parent.is_layer_visible_in_stereo(layer, tree_visible))
+                    # Parent/group visibility is authoritative only for unchecked groups.
+                    # A layer unchecked in main tree may still be explicitly visible in stereo.
+                    if hidden_by_parent_group:
+                        stereo_visible = False
                     stereo_visible = bool(stereo_visible)
 
-                    if stereo_visible:
+                    if stereo_visible and self._is_layer_visible_at_main_canvas_scale(layer):
                         layers_main.append(layer)
 
         if not tree_lookup_available:
             # Fallback to canvas layers if tree lookup is unavailable.
-            layers_main = self.qgis_main_canvas.layers()
+            layers_main = [
+                layer
+                for layer in self.qgis_main_canvas.layers()
+                if self._is_layer_visible_at_main_canvas_scale(layer)
+            ]
 
         layers_self = []  # Get the layers from this canvas
         self.layer_swm = None
@@ -1654,6 +1826,9 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                     # This triggers an initial server request (GETCAPABILITIES)
                     self.layer_swm = QgsRasterLayer(sigrid_layer_self_url, style_value, 'wms')
                     self._swm_layer_cache[sigrid_layer_self_url] = self.layer_swm
+                # Visibility by scale is evaluated against the main canvas above.
+                # Disable local stereo-canvas scale checks to avoid VR/device drift.
+                self.layer_swm.setScaleBasedVisibility(False)
                 layers_self.append(self.layer_swm)  
             elif is_z_layer(layer_main):
                 active_z_layer_ids.add(layer_main.id())
@@ -1712,8 +1887,8 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 # 5) Assign renderer
                 renderer = QgsSingleSymbolRenderer(final_symbol)
                 layer_copy.setRenderer(renderer) 
-                # Stereo canvases use a synthetic render context; scale-based visibility
-                # from the main layer can hide features unexpectedly after CRS changes.
+                # Scale visibility is resolved with the main canvas scale in sync_layers.
+                # Keep stereo copies independent from their local render-context scale.
                 layer_copy.setScaleBasedVisibility(False)
                 self.layers_z.append(layer_copy)
                 layers_self.append(layer_copy)

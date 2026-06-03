@@ -13,9 +13,9 @@ import re
 from typing import Callable, Dict, Optional, Tuple
 
 from qgis.core import QgsProject, QgsLayerTreeGroup, QgsLayerTreeLayer
-from qgis.PyQt.QtCore import QSize, Qt, QSignalBlocker, QRect, QEvent
+from qgis.PyQt.QtCore import QSize, Qt, QSignalBlocker, QRect, QEvent, QTimer
 from qgis.PyQt.QtGui import QIcon, QColor
-from qgis.PyQt.QtWidgets import QLabel, QDoubleSpinBox, QHBoxLayout, QToolBar, QToolButton, QWidget, QSizePolicy, QStyledItemDelegate, QStyleOptionViewItem, QStyle
+from qgis.PyQt.QtWidgets import QLabel, QDoubleSpinBox, QHBoxLayout, QMenu, QAction, QWidgetAction, QToolBar, QToolButton, QWidget, QSizePolicy, QStyledItemDelegate, QStyleOptionViewItem, QStyle, QStyleOptionButton
 
 from .utils import is_sgd_swm_layer
 
@@ -246,21 +246,34 @@ class SwmLayerHighlightDelegate(QStyledItemDelegate):
             x = int(option.rect.left() + 2)
         return QRect(x, y, self._stereo_checkbox_size, self._stereo_checkbox_size)
 
-    def _draw_left_stereo_checkbox(self, painter, option, index, stereo_visible: bool):
+    def _draw_left_stereo_checkbox(self, painter, option, index, stereo_visible: bool, disabled_by_parent: bool = False):
         box_rect = self._left_stereo_checkbox_rect(option, index)
         painter.save()
         # Allow painting into the left tree margin so the stereo checkbox can stay
         # strictly at the left of the native checkbox without overlap.
         painter.setClipping(False)
-        painter.setRenderHint(painter.RenderHint.Antialiasing, False)
-        painter.setPen(QColor(60, 60, 60))
-        painter.setBrush(QColor(255, 255, 255, 220))
-        painter.drawRect(box_rect)
+        widget = option.widget
+        style = widget.style() if widget else None
+        if style is not None:
+            checkbox_opt = QStyleOptionButton()
+            checkbox_opt.rect = box_rect
+            checkbox_opt.state = option.state
+            if disabled_by_parent:
+                checkbox_opt.state &= ~QStyle.StateFlag.State_Enabled
+            if option.state & QStyle.StateFlag.State_MouseOver:
+                checkbox_opt.state |= QStyle.StateFlag.State_MouseOver
+            checkbox_opt.state |= QStyle.StateFlag.State_On if stereo_visible else QStyle.StateFlag.State_Off
+            style.drawPrimitive(QStyle.PrimitiveElement.PE_IndicatorCheckBox, checkbox_opt, painter, widget)
+        else:
+            painter.setRenderHint(painter.RenderHint.Antialiasing, False)
+            painter.setPen(QColor(30, 30, 30))
+            painter.setBrush(QColor(255, 255, 255, 255))
+            painter.drawRect(box_rect)
 
-        if stereo_visible:
-            painter.setPen(QColor(0, 90, 0))
-            painter.drawLine(box_rect.left() + 3, box_rect.center().y(), box_rect.left() + 6, box_rect.bottom() - 3)
-            painter.drawLine(box_rect.left() + 6, box_rect.bottom() - 3, box_rect.right() - 2, box_rect.top() + 3)
+            if stereo_visible:
+                painter.setPen(QColor(0, 70, 0))
+                painter.drawLine(box_rect.left() + 3, box_rect.center().y(), box_rect.left() + 6, box_rect.bottom() - 3)
+                painter.drawLine(box_rect.left() + 6, box_rect.bottom() - 3, box_rect.right() - 2, box_rect.top() + 3)
 
         painter.restore()
 
@@ -414,6 +427,8 @@ class StereoCanvasOptions:
         self._highlight_delegate_installed = False
         self._original_item_delegate = None
         self._swm_highlight_delegate = None
+        self._tree_root_visibility_hooked = False
+        self._hooked_tree_root = None
         self._load_from_project()
 
     def _resolve_layer_state_by_name(self, layer_name: str) -> Optional[Tuple[bool, bool, bool]]:
@@ -475,6 +490,7 @@ class StereoCanvasOptions:
         """Connect layer-tree hooks once."""
         layer_tree_view = self.iface.layerTreeView() if self.iface else None
         if not layer_tree_view:
+            self._install_tree_root_visibility_hook()
             return
 
         if not self._highlight_delegate_installed:
@@ -496,6 +512,8 @@ class StereoCanvasOptions:
                     viewport.update()
             except Exception:
                 pass
+
+        self._install_tree_root_visibility_hook()
 
     def cleanup(self):
         """Disconnect hooks and clear local state."""
@@ -519,7 +537,136 @@ class StereoCanvasOptions:
         self._highlight_delegate_installed = False
         self._original_item_delegate = None
         self._swm_highlight_delegate = None
+        self._remove_tree_root_visibility_hook()
         self._visibility_overrides.clear()
+
+    def _install_tree_root_visibility_hook(self):
+        """Hooks project layer-tree visibility changes to mirror group checks into stereo overrides."""
+        try:
+            project = QgsProject.instance()
+            root = project.layerTreeRoot() if project else None
+            if root is None or not hasattr(root, "visibilityChanged"):
+                self._remove_tree_root_visibility_hook()
+                return
+
+            if self._tree_root_visibility_hooked and self._hooked_tree_root is root:
+                return
+
+            self._remove_tree_root_visibility_hook()
+            root.visibilityChanged.connect(self._on_tree_root_visibility_changed)
+            self._tree_root_visibility_hooked = True
+            self._hooked_tree_root = root
+        except Exception:
+            self._tree_root_visibility_hooked = False
+            self._hooked_tree_root = None
+
+    def _remove_tree_root_visibility_hook(self):
+        try:
+            root = self._hooked_tree_root
+            if root is not None and hasattr(root, "visibilityChanged"):
+                root.visibilityChanged.disconnect(self._on_tree_root_visibility_changed)
+        except Exception:
+            pass
+        self._tree_root_visibility_hooked = False
+        self._hooked_tree_root = None
+
+    def _on_tree_root_visibility_changed(self, node):
+        """Mirror recursive group check/uncheck actions into stereo child overrides only."""
+        try:
+            if not isinstance(node, QgsLayerTreeGroup):
+                return
+            # Defer evaluation one event loop step so QGIS has already applied
+            # recursive child check-state updates (if any).
+            QTimer.singleShot(0, lambda grp=node: self._apply_recursive_group_action_if_needed(grp))
+        except Exception:
+            pass
+
+    def _apply_recursive_group_action_if_needed(self, group):
+        if not isinstance(group, QgsLayerTreeGroup):
+            return
+
+        layer_nodes = list(self._iter_group_layer_nodes(group))
+        if not layer_nodes:
+            return
+
+        group_state = self._node_checkbox_checked(group)
+
+        # Heuristic: recursive actions set every child checkbox to the same
+        # value as the group; plain group visibility toggle preserves child
+        # own check states and should not alter stereo overrides.
+        all_children_match_group = all(
+            self._node_checkbox_checked(layer_node) == group_state
+            for layer_node in layer_nodes
+        )
+        if not all_children_match_group:
+            return
+
+        self._apply_group_visibility_to_stereo_children(group)
+
+    def _iter_group_layer_nodes(self, group):
+        if not isinstance(group, QgsLayerTreeGroup):
+            return
+
+        for child in group.children():
+            if isinstance(child, QgsLayerTreeLayer):
+                yield child
+            elif isinstance(child, QgsLayerTreeGroup):
+                yield from self._iter_group_layer_nodes(child)
+
+    @staticmethod
+    def _node_checkbox_checked(node) -> bool:
+        """Returns the node own checkbox state (independent from parent/group visibility)."""
+        try:
+            getter = getattr(node, "itemVisibilityChecked", None)
+            if callable(getter):
+                return bool(getter())
+        except Exception:
+            pass
+
+        try:
+            return bool(node.isVisible())
+        except Exception:
+            return True
+
+    def _apply_group_visibility_to_stereo_children(self, group):
+        """Copies each child own checkbox state into stereo overrides for a group."""
+        changed_layer_id = None
+        changed_layer_visible = False
+        changed = False
+
+        for layer_node in self._iter_group_layer_nodes(group):
+            layer = layer_node.layer()
+            if not layer or not hasattr(layer, "id"):
+                continue
+
+            layer_id = str(layer.id())
+            stereo_visible = self._node_checkbox_checked(layer_node)
+            previous = self._visibility_overrides.get(layer_id)
+            if previous is not None and bool(previous) == stereo_visible:
+                continue
+
+            self._visibility_overrides[layer_id] = stereo_visible
+            if changed_layer_id is None:
+                changed_layer_id = layer_id
+                changed_layer_visible = stereo_visible
+            changed = True
+
+        if not changed:
+            return
+
+        self._save_to_project()
+
+        layer_tree_view = self.iface.layerTreeView() if self.iface else None
+        if layer_tree_view and hasattr(layer_tree_view, "viewport"):
+            try:
+                viewport = layer_tree_view.viewport()
+                if viewport is not None:
+                    viewport.update()
+            except Exception:
+                pass
+
+        if changed_layer_id and self._on_visibility_changed:
+            self._on_visibility_changed(changed_layer_id, changed_layer_visible)
 
     def clear_overrides(self):
         """Removes all persisted stereo visibility states and persists the empty state."""
@@ -710,6 +857,13 @@ class StereoCanvasToolbar:
         self._rotation_threshold_spin = None
         self._current_rotation_label = None
         self._z_status_label = None
+        self._params_button = None
+        self._options_button = None
+        self._action_show_z_text = None
+        self._action_z_project_plain = None
+        self._action_move_zlabel_in_3D = None
+        self._action_prevent_cursor_from_stereo_display = None
+        self._action_restore_defaults = None
         self._build()
 
     def _build(self):
@@ -732,42 +886,9 @@ class StereoCanvasToolbar:
         toolbar.addWidget(icon_label)
         toolbar.addSeparator()
 
-        activation_widget = QWidget()
-        activation_layout = QHBoxLayout(activation_widget)
-        activation_layout.setContentsMargins(0, 0, 0, 0)
-        activation_layout.setSpacing(4)
-        activation_layout.addWidget(QLabel("Stereo active scale"))
-
-        activation_spin = QDoubleSpinBox()
-        activation_spin.setDecimals(0)
-        activation_spin.setRange(1.0, 1000000000.0)
-        activation_spin.setSingleStep(1000.0)
-        activation_spin.setFixedWidth(120)
-        activation_spin.valueChanged.connect(self._on_activation_scale_changed)
-        activation_layout.addWidget(activation_spin)
-        toolbar.addWidget(activation_widget)
-
-        toolbar.addSeparator()
-
-        rotation_widget = QWidget()
-        rotation_layout = QHBoxLayout(rotation_widget)
-        rotation_layout.setContentsMargins(0, 0, 0, 0)
-        rotation_layout.setSpacing(4)
-        rotation_layout.addWidget(QLabel("Rotate canvas level"))
-
-        rotation_spin = QDoubleSpinBox()
-        rotation_spin.setDecimals(1)
-        rotation_spin.setRange(0.0, 180.0)
-        rotation_spin.setSingleStep(0.5)
-        rotation_spin.setSuffix(" deg")
-        rotation_spin.setFixedWidth(100)
-        rotation_spin.valueChanged.connect(self._on_rotation_threshold_changed)
-        rotation_layout.addWidget(rotation_spin)
-
         current_rotation_label = QLabel("Current rot: 0.0°")
         current_rotation_label.setMinimumWidth(120)
-        rotation_layout.addWidget(current_rotation_label)
-        toolbar.addWidget(rotation_widget)
+        toolbar.addWidget(current_rotation_label)
 
         toolbar.addSeparator()
         z_status_label = QLabel("Zbase=---- Zcurs=----")
@@ -777,6 +898,97 @@ class StereoCanvasToolbar:
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         toolbar.addWidget(spacer)
+
+        # Params dropdown button with numeric parameters
+        params_menu = QMenu()
+
+        activation_param_widget = QWidget()
+        activation_param_layout = QHBoxLayout(activation_param_widget)
+        activation_param_layout.setContentsMargins(8, 4, 8, 4)
+        activation_param_layout.setSpacing(8)
+        activation_lbl = QLabel("Stereo active scale")
+        activation_lbl.setMinimumWidth(160)
+        activation_param_layout.addWidget(activation_lbl)
+        activation_spin = QDoubleSpinBox()
+        activation_spin.setDecimals(0)
+        activation_spin.setRange(1.0, 1000000000.0)
+        activation_spin.setSingleStep(1000.0)
+        activation_spin.setFixedWidth(120)
+        activation_spin.valueChanged.connect(self._on_activation_scale_changed)
+        activation_param_layout.addWidget(activation_spin)
+        activation_param_action = QWidgetAction(params_menu)
+        activation_param_action.setDefaultWidget(activation_param_widget)
+        params_menu.addAction(activation_param_action)
+
+        rotation_param_widget = QWidget()
+        rotation_param_layout = QHBoxLayout(rotation_param_widget)
+        rotation_param_layout.setContentsMargins(8, 4, 8, 4)
+        rotation_param_layout.setSpacing(8)
+        rotation_lbl = QLabel("Rotate canvas level")
+        rotation_lbl.setMinimumWidth(160)
+        rotation_param_layout.addWidget(rotation_lbl)
+        rotation_spin = QDoubleSpinBox()
+        rotation_spin.setDecimals(1)
+        rotation_spin.setRange(0.0, 180.0)
+        rotation_spin.setSingleStep(0.5)
+        rotation_spin.setSuffix(" deg")
+        rotation_spin.setFixedWidth(100)
+        rotation_spin.valueChanged.connect(self._on_rotation_threshold_changed)
+        rotation_param_layout.addWidget(rotation_spin)
+        rotation_param_action = QWidgetAction(params_menu)
+        rotation_param_action.setDefaultWidget(rotation_param_widget)
+        params_menu.addAction(rotation_param_action)
+
+        params_menu.addSeparator()
+        action_restore_defaults_params = QAction("Restore parameter defaults", params_menu)
+        action_restore_defaults_params.triggered.connect(self._on_restore_default_params)
+        params_menu.addAction(action_restore_defaults_params)
+
+        params_button = QToolButton()
+        params_button.setText("Configuration parameters")
+        params_button.setMenu(params_menu)
+        params_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        params_button.setToolTip("Configurable parameters")
+        toolbar.addWidget(params_button)
+
+        # Options dropdown button with checkable settings
+        options_menu = QMenu()
+        action_show_z_text = QAction("Show Z label", options_menu)
+        action_show_z_text.setCheckable(True)
+        action_show_z_text.setChecked(True)
+        action_show_z_text.toggled.connect(self._on_show_z_text_toggled)
+        options_menu.addAction(action_show_z_text)
+
+        action_z_project_plain = QAction("Z cursor to projection plane", options_menu)
+        action_z_project_plain.setCheckable(True)
+        action_z_project_plain.setChecked(True)
+        action_z_project_plain.toggled.connect(self._on_z_project_plain_toggled)
+        options_menu.addAction(action_z_project_plain)
+
+        action_move_zlabel_in_3D = QAction("Move Z label in 3D", options_menu)
+        action_move_zlabel_in_3D.setCheckable(True)
+        action_move_zlabel_in_3D.setChecked(True)
+        action_move_zlabel_in_3D.toggled.connect(self._on_move_zlabel_in_3D_toggled)
+        options_menu.addAction(action_move_zlabel_in_3D)
+
+        action_prevent_cursor_from_stereo_display = QAction("Prevent cursor from stereo display", options_menu)
+        action_prevent_cursor_from_stereo_display.setCheckable(True)
+        action_prevent_cursor_from_stereo_display.setChecked(True)
+        action_prevent_cursor_from_stereo_display.toggled.connect(self._on_prevent_cursor_from_stereo_display_toggled)
+        options_menu.addAction(action_prevent_cursor_from_stereo_display)
+
+        options_menu.addSeparator()
+        action_restore_defaults = QAction("Restore default options", options_menu)
+        action_restore_defaults.triggered.connect(self._on_restore_default_options)
+        options_menu.addAction(action_restore_defaults)
+
+        options_button = QToolButton()
+        options_button.setText("Configuration checkboxes")
+        options_button.setMenu(options_menu)
+        options_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        options_button.setToolTip("Display options")
+        toolbar.addWidget(options_button)
+        toolbar.addSeparator()
 
         close_button = QToolButton()
         close_icon = toolbar.style().standardIcon(toolbar.style().StandardPixmap.SP_DockWidgetCloseButton)
@@ -793,6 +1005,13 @@ class StereoCanvasToolbar:
         self._rotation_threshold_spin = rotation_spin
         self._current_rotation_label = current_rotation_label
         self._z_status_label = z_status_label
+        self._params_button = params_button
+        self._options_button = options_button
+        self._action_show_z_text = action_show_z_text
+        self._action_z_project_plain = action_z_project_plain
+        self._action_move_zlabel_in_3D = action_move_zlabel_in_3D
+        self._action_prevent_cursor_from_stereo_display = action_prevent_cursor_from_stereo_display
+        self._action_restore_defaults = action_restore_defaults
         self.refresh()
 
     def install(self):
@@ -822,6 +1041,13 @@ class StereoCanvasToolbar:
             self._rotation_threshold_spin = None
             self._current_rotation_label = None
             self._z_status_label = None
+            self._params_button = None
+            self._options_button = None
+            self._action_show_z_text = None
+            self._action_z_project_plain = None
+            self._action_move_zlabel_in_3D = None
+            self._action_prevent_cursor_from_stereo_display = None
+            self._action_restore_defaults = None
             return
 
         main_window = self.window.iface.mainWindow()
@@ -840,6 +1066,13 @@ class StereoCanvasToolbar:
         self._rotation_threshold_spin = None
         self._current_rotation_label = None
         self._z_status_label = None
+        self._params_button = None
+        self._options_button = None
+        self._action_show_z_text = None
+        self._action_z_project_plain = None
+        self._action_move_zlabel_in_3D = None
+        self._action_prevent_cursor_from_stereo_display = None
+        self._action_restore_defaults = None
 
     def refresh(self):
         if not self.window or self.toolbar is None:
@@ -860,6 +1093,26 @@ class StereoCanvasToolbar:
                 f"Current rot: {float(self.window._flight_rotation_current_deg):.1f}°"
             )
 
+        if self._action_show_z_text is not None:
+            blocker = QSignalBlocker(self._action_show_z_text)
+            self._action_show_z_text.setChecked(bool(self.window.canvas_left and getattr(self.window.canvas_left, 'show_z_text_overlay', True)))
+            del blocker
+
+        if self._action_z_project_plain is not None:
+            blocker = QSignalBlocker(self._action_z_project_plain)
+            self._action_z_project_plain.setChecked(bool(self.window.z_project_plain))
+            del blocker
+
+        if self._action_move_zlabel_in_3D is not None:
+            blocker = QSignalBlocker(self._action_move_zlabel_in_3D)
+            self._action_move_zlabel_in_3D.setChecked(bool(self.window.move_zlabel_in_3D))
+            del blocker
+
+        if self._action_prevent_cursor_from_stereo_display is not None:
+            blocker = QSignalBlocker(self._action_prevent_cursor_from_stereo_display)
+            self._action_prevent_cursor_from_stereo_display.setChecked(bool(self.window.prevent_cursor_from_stereo_display))
+            del blocker
+
         self.set_z_status(float(self.window._z_proj_plane), float(self.window._z_cursor))
 
     def set_z_status(self, z_base: float, z_cursor: float):
@@ -873,6 +1126,30 @@ class StereoCanvasToolbar:
     def _on_rotation_threshold_changed(self, value):
         if self.window:
             self.window._set_flight_rotation_threshold_deg(float(value))
+
+    def _on_show_z_text_toggled(self, checked: bool):
+        if self.window:
+            self.window.set_show_z_text(checked)
+
+    def _on_z_project_plain_toggled(self, checked: bool):
+        if self.window:
+            self.window.set_z_project_plain(checked)
+
+    def _on_move_zlabel_in_3D_toggled(self, checked: bool):
+        if self.window:
+            self.window.set_move_zlabel_in_3D(checked)
+
+    def _on_prevent_cursor_from_stereo_display_toggled(self, checked: bool):
+        if self.window:
+            self.window.set_prevent_cursor_from_stereo_display(checked)
+
+    def _on_restore_default_options(self):
+        if self.window:
+            self.window.reset_ui_option_states()
+
+    def _on_restore_default_params(self):
+        if self.window:
+            self.window.reset_parameter_defaults()
 
     def _close_plugin(self):
         if self.window:

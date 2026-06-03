@@ -4,9 +4,8 @@
 ![QGIS](https://img.shields.io/badge/QGIS-4.x-green)
 ![OS](https://img.shields.io/badge/OS-Windows-0078D6)
 
-
-**Status:** Active development  
-**Scope:** Stereoscopic visualization of SWM photogrammetric flight WMS services in QGIS 4.x  
+**Status:** Active development
+**Scope:** Stereoscopic visualization of SWM photogrammetric flight WMS services in QGIS 4.x
 **Documentation language:** English ([readme.md](readme.md))
 
 ## Table of Contents
@@ -33,25 +32,26 @@ The plugin renders the stereoscopic pair in a secondary window synchronized with
 
 Use **ALT + mouse wheel** in the main window to adjust the **cursor Z** value, which is immediately reflected in the stereoscopic visualization. Each mouse-wheel step moves the cursor up or down by 1 meter. To move the cursor by 10 meters, press and hold **ALT + SHIFT + mouse wheel**. To move the cursor by 0.1 meters, press and hold **ALT + CTRL + mouse wheel**.
 
-
 ---
 
 ## 2. Requirements
 
 ### 2.1 Mandatory
-- **QGIS 4.x** (based on Qt 6).  
+
+- **QGIS 4.x** (based on Qt 6).
 - **Windows** operating system.
 - **Two or more monitors**.
 
 ### 2.2 Recommended
+
 - One of the monitors should support stereoscopic system.
 - Access to the SWM photogrammetric WMS service. Currently available endpoints:
 - **If you are working on an intranet, change 'https://' to 'http://'**
-  - https://fenix3d-des.tragsatec.es:8083/ (testing)
-  - https://fenix3d-des.tragsatec.es:8084/ (development)
-
+  - [https://fenix3d-des.tragsatec.es:8083/](https://fenix3d-des.tragsatec.es:8083/) (testing)
+  - [https://fenix3d-des.tragsatec.es:8084/](https://fenix3d-des.tragsatec.es:8084/) (development)
 
 ## 3. Installation and/or updating
+
 - Menu path: Plugins -> Manage and Install Plugins -> Install from ZIP -> ZIP file.
 - Use the ZIP package of the latest plugin version: *sigrid_stereowebmap_3D_x_x_x.zip*.
 - Configure access to a StereoWebMap service.
@@ -59,19 +59,27 @@ Use **ALT + mouse wheel** in the main window to adjust the **cursor Z** value, w
 ## 4. Quick Start
 
 1. Install the plugin from ZIP in QGIS.
-2. Load the required layers into the main window. One of them must be a **StereowebMap® photogrammetric flight WMS** service. Example: https://fenix3d-des.tragsatec.es:8083/
+2. Load the required layers into the main window. One of them must be a **StereowebMap® photogrammetric flight WMS** service. Example: [https://fenix3d-des.tragsatec.es:8083/](https://fenix3d-des.tragsatec.es:8083/).
 3. Launch the plugin and open the stereo window on a second monitor. If you have more than two monitors, it will ask you which one to open the photogrammetry window on. If you only have two, it will open it directly on the monitor where QGIS is not open.
 4. Select stereo mode: Anaglyph, Interlaced, side by side, Mirror right, Mirror up.
 5. Navigate in the main QGIS canvas (pan, zoom, tools).
 6. Adjust cursor depth with **ALT + mouse wheel**.
 
 Expected behavior:
+
 - Main canvas and stereo window remain synchronized.
 - Depth adjustments are shown dynamically in the stereo view.
 
 ## 5. Changes
 
+### Version 0.7.1
+
+- Included in the plugin toolbar drop-down lists for configuration parameters and checkboxes.
+![taskbar configuration parameters](docs/images/110-configuration-parameters.png)
+![taskbar configuration checkboxes](docs/images/120-configuration-checkboxes.png)
+
 ### Version 0.7.0
+
 - Layer visibility scaling has been incorporated. Visibility by scaling is adjusted in stereo canvases to match that of the main canvas.
 - Added taskbar with plugin-specific controls: Stereo activation scale, canvas rotation threshold, and labels with current canvas rotation, terrain Z, and cursor Z values. The latter two were moved from the QGIS status bar.
 ![taskbar Sigrid_SWM_3D plugin](docs/images/090-taskbar-Sigrid_SWM_3D-plugin.png)
@@ -80,23 +88,28 @@ Expected behavior:
 ![Layers panel: double checkbox highlighted Swm layers ](docs/images/100-double-checkbox-highlighted-swm-layers.png)
 
 ### Version 0.6.4
+
 - Fixed error where alt + mouse wheel fails the next few times the plugin is opened
 
 ### Version 0.6.3
+
 - Fixed error of repeated duplicate requests to the SWM service
 - Fixel error drawing in stereo canvas multipolygons
 
 ### Version 0.6.2
+
 - Fixed bug with overlapping stereos (anaglyph and interlaced)
 - Fixed issue with oblique flights. When the pass angle (α) exceeds 10º, all canvases (stereo and main) are rotated -αº
 - A minimum scale (1/100,000) is set for 3D projection on stereo canvas. 3D projection is not applicable for smaller scales.
 
 ### Version 0.6.1
+
 - Incorporated overlapping stereos (anaglyph and interlaced).
 - Automatic transmission of symbology changes to the stereo canvases.
-- Visible-invisible switching on main canvas 
+- Visible-invisible switching on main canvas
 
 ### Version 0.6.0
+
 - Corrected vertex displacement in polyline.
 - Automatic transmission of symbology changes to the stereo canvases.
 - Visible-invisible switching on main canvas instantly reflected on stereo canvas
@@ -107,23 +120,25 @@ Expected behavior:
 - Solved problem of drawing connection lines in the case of multiple figures (points, lines or polygons).
 
 ### Version 0.5.1
+
 - Prevent the cursor from entering the photogrammetric window.
 - Translate all code comments into English.
 - Improve this README document.
 
 ### Version 0.5.0
-- Reorganization of existing classes into a file structure that better reflects the script architecture, with clearer separation of components and responsibilities.  
+
+- Reorganization of existing classes into a file structure that better reflects the script architecture, with clearer separation of components and responsibilities.
   Guiding principles:
   - Consistency
   - Robustness
   - Scalability
   - *QGIS-native* approach
   - Long-term maintainability
-- Code adapted to **Qt 6**, the new standard in **QGIS 4**.  
+- Code adapted to **Qt 6**, the new standard in **QGIS 4**.
   Although this is not the current LTR release, **SWM-3D** development targets this version,
   which is expected to become LTR in the future. The improvements introduced in the Qt 6
   libraries justify this decision.
-- Introduction of additional error handling to prevent unexpected *crashes* and  
+- Introduction of additional error handling to prevent unexpected *crashes* and
   ensure that failures are reported explicitly and in a controlled manner.
 
 ---
@@ -131,20 +146,24 @@ Expected behavior:
 ## 6. Troubleshooting
 
 ### Plugin does not appear in QGIS
+
 - Verify you are using **QGIS 4.x**.
 - Reinstall from the latest plugin ZIP package.
 - Check that plugin installation is enabled in QGIS Plugin Manager.
 
 ### Stereo window does not update
+
 - Confirm all interaction is performed in the main QGIS window.
 - Ensure the secondary monitor is active and visible to the OS.
 - Check that the selected WMS service is reachable.
 
 ### No stereoscopic effect is visible
+
 - Verify your display hardware supports stereoscopic output.
 - Confirm your monitor or display pipeline is configured for stereo mode.
 
 ### Cursor Z changes are not reflected
+
 - Use **ALT + mouse wheel** over the main canvas.
 - Ensure the stereo window is open and synchronized.
 
@@ -152,27 +171,26 @@ Expected behavior:
 
 ## 7. Known Issues
 
-### The last segment is not visible in the stereo canvases during line and segment digitization tasks. 
+### The last segment is not visible in the stereo canvases during line and segment digitization tasks
+
 - This segment connects the last digitized vertex to the cursor position and is visible in the main canvas but not in the stereo canvases.
 - It could not be implemented in the stereo canvases because its handling is contained within QGIS's C++ code and is not accessible from Python. This is a purely graphical feature, so it was decided not to include it in the stereo canvases because it would complicate the stability and ease of tracking of the plugin's code.
 
 ### The SWM server is experiencing problems with the quality of JPEG images
+
 - The JPEG images are being served in very low quality.
 - Request the images from the StereoWebMap server in **png** format instead of JPEG.
-
 
 ---
 
 ## 8. Future work
-
-
 
 ---
 
 ## 9. Compatibility Matrix
 
 | Component | Supported | Notes |
-|---|---|---|
+| --- | --- | --- |
 | QGIS | 4.x | Based on Qt 6 |
 | Operating system | Windows | Primary target platform |
 | Monitor setup | 2+ monitors | One monitor can be stereo-capable |
@@ -184,27 +202,35 @@ Expected behavior:
 ## 10. Visual Walkthrough
 
 ### Configure StereoWebMap Service Connection
+
 ![Configure StereoWebMap Service Connection](docs/images/010-configure-stereoWebMap-service-connection.png)
 
 ### Add WMS StereoWebMap Layer
+
 ![Add WMS StereoWebMap Layer](docs/images/020-add-wms-stereowebmap-layer.png)
 
 ### Result main canvas
+
 ![Result main canvas](docs/images/030-result-main-canvas.png)
 
 ### Zoomed area main canvas
+
 ![Zoomed area main canvas](docs/images/040-zoomed-area-main-canvas.png)
 
 ### Throw Sigrid StereoWebMap Plugin
+
 ![Throw Sigrid StereoWebMap Plugin](docs/images/045-throw-sigrid-stereowebmap-plugin.png)
 
 ### Select Stereo Screen (only if more than two displays)
+
 ![Select Stereo Screen](docs/images/050-select-stereo-screen.png)
 
 ### Select Stereo Mode
+
 ![Select Stereo Mode](docs/images/060-select-stereo-mode.png)
 
 ### Stereo Windows Result
+
 ![Stereo Windows Result](docs/images/070-stereo-windows-result.png)
 
 ---
@@ -218,12 +244,13 @@ This plugin is provided under the terms of the LICENSE file included in this rep
 ## 12. Authors and Contributors
 
 **Main Authors:**
-- Conrado Sánchez López (conradosanchez@sigrid.es)
+
+- Conrado Sánchez López ([conradosanchez@sigrid.es](mailto:conradosanchez@sigrid.es))
 - Javier Herrero
 - Tragsatec
 
-**Repository:** https://github.com/conradosigrid/sigrid_stereowebmap_3D  
-**Issue Tracker:** https://github.com/conradosigrid/sigrid_stereowebmap_3D/issues
+**Repository:** [https://github.com/conradosigrid/sigrid_stereowebmap_3D](https://github.com/conradosigrid/sigrid_stereowebmap_3D)
+**Issue Tracker:** [https://github.com/conradosigrid/sigrid_stereowebmap_3D/issues](https://github.com/conradosigrid/sigrid_stereowebmap_3D/issues)
 
 ## 13. Technical notes
 
@@ -232,21 +259,25 @@ This plugin is provided under the terms of the LICENSE file included in this rep
 This plugin uses two different geometry paths, and they do not behave the same internally.
 
 Path A: layer rendering (QGIS renderer + expressions)
+
 - Used for normal map layers.
 - QGIS applies the renderer pipeline, including Geometry Generator expressions.
 - Geometry structure (multipart, rings, holes) is handled by the layer rendering engine.
 
 Path B: canvas items (rubber bands, vertex markers)
+
 - Used for interactive temporary items from tools.
 - These are not rendered by the layer renderer pipeline.
 - The plugin clones/transforms geometry directly in Python before assigning it to the stereo canvases.
 
 Why explicit ring/part handling is required in Path B
+
 - A MultiPolygon is not just a list of points; it is a set of polygon parts, each with one outer ring and optional inner rings.
 - If vertices are flattened into one sequence, the last vertex of one part can be connected to the first vertex of another part.
 - The visible effect is a false bridge line between polygons (same risk for multiline/multipoint shape integrity).
 
 What a regression test means here
+
 - A regression test is a permanent check to ensure a fixed bug does not return later.
 - In this project, the multipart regression check verifies that transformed output keeps:
   - MultiPoint as multi-point with same part count.
@@ -255,8 +286,8 @@ What a regression test means here
 
 ### 13.2 Geometry structure
 
-_Reserved for future notes about multipart geometry handling, ring preservation, and related rendering details._
+*Reserved for future notes about multipart geometry handling, ring preservation, and related rendering details.*
 
 ### 13.3 Regression checks
 
-_Reserved for future notes about manual smoke tests, reproduction steps, and validation checks._
+*Reserved for future notes about manual smoke tests, reproduction steps, and validation checks.*

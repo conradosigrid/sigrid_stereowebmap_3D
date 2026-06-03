@@ -25,7 +25,8 @@ from qgis.core import QgsCoordinateTransform, QgsProject
 from qgis.PyQt.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QStackedLayout
 from qgis.PyQt.QtWidgets import QInputDialog, QApplication, QLabel
 from qgis.PyQt.QtGui import QTransform, QGuiApplication, QCursor, QPixmap
-from qgis.PyQt.QtCore import Qt, QEvent, QTimer
+from qgis.PyQt.QtCore import Qt, QEvent, QTimer, QSettings
+import json
 import os
 import re
 import math
@@ -36,10 +37,6 @@ from typing import Dict, Any, Set, Tuple, Optional, List, cast
 from .canvas import QgsSgdSwmCanvas
 from .stereo_canvas_options import StereoCanvasOptions, StereoCanvasToolbar
 from .utils import is_z_layer, is_sgd_swm_layer
-try:
-    from . import debug as _debug_module
-except ImportError:
-    _debug_module = None
 
 
 # Class Sigrid Swm Window
@@ -101,6 +98,14 @@ class QSgdSwmWindow(QMainWindow):
         # Shared global Z; always assign through @z_cursor.setter to update everything
         self._z_proj_plane = 0.0
         self.z_cursor = 0.0
+        # When True, z_cursor snaps to projection plane Z on each zoom/WMS refresh.
+        self.z_project_plain = True
+        # When True, the Z label is projected in 3D using the current cursor Z.
+        self.move_zlabel_in_3D = True
+        # When True, the cursor is kept out of the stereo display area.
+        self.prevent_cursor_from_stereo_display = True
+
+        self._load_ui_option_states()
         # Global filter can be removed on close and must be reinstalled on reopen.
         self._global_event_filter_installed = False
         self._install_global_event_filter()
@@ -182,7 +187,11 @@ class QSgdSwmWindow(QMainWindow):
             self.canvas_right.setExtent(extent_right)
         # Route initial layer setup through the deduplicated sync path so later
         # startup layer-tree signals do not repeat the same SWM requests.
-        self._sync_canvases_layers()
+        # Defer to the next event loop tick: creating WMS raster layers
+        # (QgsRasterLayer with 'wms' provider) inside showEvent triggers nested
+        # Qt event processing which causes a fatal access violation on some QGIS
+        # builds (ref: Windows fatal exception in QgsRasterLayer::setDataProvider).
+        QTimer.singleShot(0, self._sync_canvases_layers)
         self._update_control_toolbar_state()
         self._update_main_canvas_north_indicator()
 
@@ -464,9 +473,8 @@ class QSgdSwmWindow(QMainWindow):
 
     def _keep_cursor_in_main_qgis_window(self):
         """Prevents the cursor from staying over the stereo window (cross-platform)."""
-        if _debug_module is not None and _debug_module.DEBUG:
-        # if True:
-            return
+        if not self.prevent_cursor_from_stereo_display:
+            return  # Prevent cursor from staying over the stereo display
 
         try:
             main_rect = self.iface.mainWindow().frameGeometry()
@@ -484,6 +492,7 @@ class QSgdSwmWindow(QMainWindow):
     def _set_stereo_activation_scale_threshold(self, value: float):
         try:
             self._stereo_activation_scale_threshold = max(1.0, float(value))
+            self._save_ui_option_states()
             self._update_control_toolbar_state()
             self._update_auto_flight_rotation(apply_main_canvas=True)
             self._schedule_layers_sync()
@@ -494,6 +503,7 @@ class QSgdSwmWindow(QMainWindow):
     def _set_flight_rotation_threshold_deg(self, value: float):
         try:
             self._flight_rotation_threshold_deg = max(0.0, min(180.0, float(value)))
+            self._save_ui_option_states()
             self._update_control_toolbar_state()
             self._update_auto_flight_rotation(apply_main_canvas=True)
             self._schedule_canvas_refresh()
@@ -541,7 +551,8 @@ class QSgdSwmWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         if self.stereo_id <= 3:
             # Overlayed stereo modes share the same viewport.
-            central_widget.setStyleSheet("background-color: white;")
+            # Prevent white flashes between stacked-canvas frames.
+            central_widget.setStyleSheet("background: transparent;")
             layout = QStackedLayout()
             layout.setStackingMode(QStackedLayout.StackingMode.StackAll)
             layout.setCurrentIndex(1)
@@ -757,6 +768,15 @@ class QSgdSwmWindow(QMainWindow):
             self.canvas_right.update_cursor()
         self._update_z_label()  # Update Z text on stereo canvases
 
+    def set_show_z_text(self, visible: bool):
+        """Show or hide the Z label overlay on both stereo canvases."""
+        if self.canvas_left:
+            self.canvas_left.set_show_z_text_overlay(visible)
+        if self.canvas_right:
+            self.canvas_right.set_show_z_text_overlay(visible)
+        self._save_ui_option_states()
+        self._update_control_toolbar_state()
+
     def _update_z_label(self):
         """Replicates canvas Z changes in the SWM-3D control toolbar."""
         toolbar = self._stereo_controls_toolbar
@@ -774,7 +794,140 @@ class QSgdSwmWindow(QMainWindow):
         This defines the reference Z used by the canvas.
         """
         self._z_proj_plane = z
-        self.z_cursor = z  # @z_cursor.setter already propagates cursor update to canvases
+        if self.z_project_plain:
+            self.z_cursor = z  # @z_cursor.setter already propagates cursor update to canvases
+        else:
+            self._update_z_label()  # still refresh toolbar display with new z_proj_plane value
+
+    def set_z_project_plain(self, value: bool):
+        """Toggle whether z_cursor follows the projection plane Z on each zoom."""
+        self.z_project_plain = bool(value)
+        self._save_ui_option_states()
+        self._update_control_toolbar_state()
+
+    def set_move_zlabel_in_3D(self, value: bool):
+        """Toggle whether the Z label is projected with the current cursor Z."""
+        self.move_zlabel_in_3D = bool(value)
+        self._save_ui_option_states()
+        self._update_control_toolbar_state()
+        self._update_z_label()
+
+    def set_prevent_cursor_from_stereo_display(self, value: bool):
+        """Toggle whether the cursor is forced back to the main QGIS window."""
+        self.prevent_cursor_from_stereo_display = bool(value)
+        self._save_ui_option_states()
+        self._update_control_toolbar_state()
+        if self.prevent_cursor_from_stereo_display:
+            self._keep_cursor_in_main_qgis_window()
+
+    def _ui_option_state(self) -> Dict[str, Any]:
+        return {
+            "show_z_text": bool(self.canvas_left and getattr(self.canvas_left, "show_z_text_overlay", True)),
+            "z_project_plain": bool(self.z_project_plain),
+            "move_zlabel_in_3D": bool(self.move_zlabel_in_3D),
+            "prevent_cursor_from_stereo_display": bool(self.prevent_cursor_from_stereo_display),
+            "stereo_activation_scale": float(self._stereo_activation_scale_threshold),
+            "flight_rotation_threshold": float(self._flight_rotation_threshold_deg),
+        }
+
+    def _apply_ui_option_state_to_canvases(self):
+        if self.canvas_left:
+            self.canvas_left.set_show_z_text_overlay(bool(self._ui_option_state()["show_z_text"]))
+        if self.canvas_right:
+            self.canvas_right.set_show_z_text_overlay(bool(self._ui_option_state()["show_z_text"]))
+        if self.prevent_cursor_from_stereo_display:
+            self._keep_cursor_in_main_qgis_window()
+
+    def _save_ui_option_states(self):
+        try:
+            data = json.dumps(self._ui_option_state(), separators=(",", ":"), sort_keys=True)
+            settings = QSettings()
+            settings.setValue("SigridSWM/ui_options", data)
+
+            project = QgsProject.instance()
+            if project:
+                project.writeEntry("SWM-3D", "ui_options", data)
+        except Exception:
+            pass
+
+    def reset_ui_option_states(self):
+        """Restores checkbox UI options to defaults and saves the updated state."""
+        try:
+            self.z_project_plain = True
+            self.move_zlabel_in_3D = True
+            self.prevent_cursor_from_stereo_display = True
+            if self.canvas_left:
+                self.canvas_left.set_show_z_text_overlay(True)
+            if self.canvas_right:
+                self.canvas_right.set_show_z_text_overlay(True)
+
+            if self.prevent_cursor_from_stereo_display:
+                self._keep_cursor_in_main_qgis_window()
+
+            self._save_ui_option_states()
+            self._update_control_toolbar_state()
+            self._update_z_label()
+        except Exception:
+            pass
+
+    def reset_parameter_defaults(self):
+        """Restores numeric parameters to defaults and saves the updated state."""
+        try:
+            self._stereo_activation_scale_threshold = 100000.0
+            self._flight_rotation_threshold_deg = 10.0
+            self._save_ui_option_states()
+            self._update_control_toolbar_state()
+            self._update_auto_flight_rotation(apply_main_canvas=True)
+            self._schedule_layers_sync()
+            self._schedule_canvas_refresh()
+        except Exception:
+            pass
+
+    def _load_ui_option_states(self):
+        try:
+            data = ""
+            project = QgsProject.instance()
+            if project:
+                txt, ok = project.readEntry("SWM-3D", "ui_options", "")
+                if ok and txt:
+                    data = txt
+
+            if not data:
+                settings = QSettings()
+                data = settings.value("SigridSWM/ui_options", "", type=str) or ""
+
+            if not data:
+                self._apply_ui_option_state_to_canvases()
+                return
+
+            parsed = json.loads(data)
+            if not isinstance(parsed, dict):
+                self._apply_ui_option_state_to_canvases()
+                return
+
+            self._apply_loaded_bool("show_z_text", parsed.get("show_z_text"), default=True)
+            self._apply_loaded_bool("z_project_plain", parsed.get("z_project_plain"), default=True)
+            self._apply_loaded_bool("move_zlabel_in_3D", parsed.get("move_zlabel_in_3D"), default=True)
+            self._apply_loaded_bool("prevent_cursor_from_stereo_display", parsed.get("prevent_cursor_from_stereo_display"), default=True)
+            self._apply_loaded_float("_stereo_activation_scale_threshold", parsed.get("stereo_activation_scale"), default=100000.0, min_val=1.0)
+            self._apply_loaded_float("_flight_rotation_threshold_deg", parsed.get("flight_rotation_threshold"), default=10.0, min_val=0.0, max_val=180.0)
+            self._apply_ui_option_state_to_canvases()
+        except Exception:
+            self._apply_ui_option_state_to_canvases()
+
+    def _apply_loaded_bool(self, attr_name: str, value, default: bool):
+        setattr(self, attr_name, bool(default if value is None else value))
+
+    def _apply_loaded_float(self, attr_name: str, value, default: float, min_val: Optional[float] = None, max_val: Optional[float] = None):
+        try:
+            v = float(default if value is None else value)
+            if min_val is not None:
+                v = max(min_val, v)
+            if max_val is not None:
+                v = min(max_val, v)
+            setattr(self, attr_name, v)
+        except (TypeError, ValueError):
+            setattr(self, attr_name, float(default))
 
     def _sync_canvases_destination_crs(self):
         """
@@ -935,25 +1088,29 @@ class QSgdSwmWindow(QMainWindow):
         except Exception:
             pass
 
+        extent_changed = False
+
         self._sync_canvases_destination_crs()
         if self.canvas_left:
             extent_left = self._reproject_extent_to_stereo_crs(self.qgis_main_canvas.extent(), self.canvas_left)
             current_left_extent = self.canvas_left.extent()
             if current_left_extent != extent_left:
                 self.canvas_left.setExtent(extent_left)
+                extent_changed = True
         if self.canvas_right:
             extent_right = self._reproject_extent_to_stereo_crs(self.qgis_main_canvas.extent(), self.canvas_right)
             current_right_extent = self.canvas_right.extent()
             if current_right_extent != extent_right:
                 self.canvas_right.setExtent(extent_right)
+                extent_changed = True
 
         # Re-evaluate strip rotation in the same zoom/pan cycle.
         rotation_changed = self._update_auto_flight_rotation()
         self._trace(f"REPAINT: post-update rotation_changed={rotation_changed}")
 
-        # Always request stereo refresh for zoom/pan. Duplicate calls are
-        # filtered in _run_canvas_refresh() using the refresh signature.
-        self._schedule_canvas_refresh()
+        # Avoid redundant explicit refresh when extent/rotation already triggered render.
+        if (not extent_changed) and (not rotation_changed):
+            self._schedule_canvas_refresh()
 
     def _sync_canvases_layers(self):
         """

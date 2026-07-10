@@ -108,11 +108,14 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         # Per-rubber-band fixed-vertex Z values for stereo visualization.
         # The dynamic last vertex (if any) uses current cursor Z.
         self.rubber_band_fixed_z: Dict[QgsMapCanvasItem, List[float]] = {}
+        self.rubber_band_fixed_xy: Dict[QgsMapCanvasItem, List[QgsPointXY]] = {}
+        self.rubber_band_projected_fixed_xy: Dict[QgsMapCanvasItem, List[QgsPointXY]] = {}
         self.rubber_band_last_dynamic_z: Dict[QgsMapCanvasItem, float] = {}
         self.rubber_band_z_by_geom_hash: Dict[str, List[float]] = {}
         self.vertex_marker_fixed_z: Dict[QgsMapCanvasItem, float] = {}
         self.vertex_marker_last_center: Dict[QgsMapCanvasItem, QgsPointXY] = {}
         self.vertex_marker_rb_match: Dict[QgsMapCanvasItem, Tuple[QgsRubberBand, int]] = {}
+        self._canvas_items_sync_active = True
         
         self._setup_canvas_items_sync()
 
@@ -127,6 +130,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         self._last_rendered_buffer: Optional[QImage] = None
         self._last_base_buffer: Optional[QImage] = None
         self._last_composed_overlay_buffer: Optional[QImage] = None
+        self._in_paint_event = False
         # Deferred Z-layer update flag: set True when a WMS reply has been processed
         # but _apply_current_transform_to_z_layers() hasn't been called yet.
         # The actual triggerRepaint() is deferred to _on_own_canvas_refreshed so that
@@ -312,6 +316,19 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         """
         Handles changes in the main canvas scene.
         """
+        if not self._canvas_items_sync_active:
+            return
+
+        # Ignore queued scene signals from stale/tearing-down scenes.
+        try:
+            current_scene = self.qgis_main_canvas.scene() if self.qgis_main_canvas and hasattr(self.qgis_main_canvas, 'scene') else None
+            if current_scene is None:
+                return
+            if self.sender() is not current_scene:
+                return
+        except Exception:
+            return
+
         # Synchronize only when there are meaningful changes
         if regions:  # Changed regions exist
             self._sync_canvas_items()
@@ -320,6 +337,9 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         """
         Synchronizes all map canvas items from the main canvas with this canvas.
         """
+        if not self._canvas_items_sync_active:
+            return
+
         # Prevent concurrent synchronization
         if self.sync_in_progress:
             return
@@ -353,6 +373,10 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
 
                     if main_item in self.rubber_band_fixed_z:
                         del self.rubber_band_fixed_z[main_item]
+                    if main_item in self.rubber_band_fixed_xy:
+                        del self.rubber_band_fixed_xy[main_item]
+                    if main_item in self.rubber_band_projected_fixed_xy:
+                        del self.rubber_band_projected_fixed_xy[main_item]
                     if main_item in self.rubber_band_last_dynamic_z:
                         del self.rubber_band_last_dynamic_z[main_item]
                     if main_item in self.vertex_marker_fixed_z:
@@ -623,19 +647,13 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 return None
 
             rb_source, idx = match
-            rb_synced = self.synced_items.get(rb_source)
-            if not isinstance(rb_synced, QgsRubberBand):
+            projected_vertices = self.rubber_band_projected_fixed_xy.get(rb_source)
+            if not projected_vertices:
+                return None
+            if idx < 0 or idx >= len(projected_vertices):
                 return None
 
-            geom_synced = rb_synced.asGeometry()
-            if not geom_synced or geom_synced.isEmpty():
-                return None
-            const_geom = geom_synced.constGet()
-            if not const_geom or idx < 0 or idx >= const_geom.vertexCount():
-                return None
-
-            v = geom_synced.vertexAt(idx)
-            return QgsPointXY(v.x(), v.y())
+            return projected_vertices[idx]
         except Exception:
             return None
 
@@ -654,12 +672,9 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             if existing:
                 rb_item, idx = existing
                 fixed_z = self.rubber_band_fixed_z.get(rb_item)
-                geom = rb_item.asGeometry() if isinstance(rb_item, QgsRubberBand) else None
-                if not geom or geom.isEmpty():
-                    geom = None
-                const_geom = geom.constGet() if geom and not geom.isEmpty() else None
-                if fixed_z and geom and const_geom and idx < min(len(fixed_z), const_geom.vertexCount()):
-                    v = geom.vertexAt(idx)
+                fixed_xy = self.rubber_band_fixed_xy.get(rb_item)
+                if fixed_z and fixed_xy and idx < min(len(fixed_z), len(fixed_xy)):
+                    v = fixed_xy[idx]
                     dx = v.x() - center.x()
                     dy = v.y() - center.y()
                     if (dx * dx + dy * dy) <= (tol2 * 4.0):
@@ -669,18 +684,12 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             best_match: Optional[Tuple[QgsRubberBand, int]] = None
 
             for rb_item, fixed_z in self.rubber_band_fixed_z.items():
-                if not isinstance(rb_item, QgsRubberBand) or not fixed_z:
+                fixed_xy = self.rubber_band_fixed_xy.get(rb_item)
+                if not isinstance(rb_item, QgsRubberBand) or not fixed_z or not fixed_xy:
                     continue
-                geom = rb_item.asGeometry()
-                if not geom or geom.isEmpty():
-                    continue
-                const_geom = geom.constGet()
-                if not const_geom:
-                    continue
-
-                fixed_count = min(len(fixed_z), const_geom.vertexCount())
+                fixed_count = min(len(fixed_z), len(fixed_xy))
                 for i in range(fixed_count):
-                    v = geom.vertexAt(i)
+                    v = fixed_xy[i]
                     dx = v.x() - center.x()
                     dy = v.y() - center.y()
                     d2 = dx * dx + dy * dy
@@ -770,16 +779,13 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             if existing:
                 rb_item, idx = existing
                 fixed_z = self.rubber_band_fixed_z.get(rb_item)
-                if fixed_z and idx < len(fixed_z):
-                    geom = rb_item.asGeometry()
-                    if geom and not geom.isEmpty():
-                        const_geom = geom.constGet()
-                        if const_geom and idx < const_geom.vertexCount():
-                            v = geom.vertexAt(idx)
-                            dx = v.x() - center.x()
-                            dy = v.y() - center.y()
-                            if (dx * dx + dy * dy) <= (tol2 * 4.0):
-                                return float(fixed_z[idx])
+                fixed_xy = self.rubber_band_fixed_xy.get(rb_item)
+                if fixed_z and fixed_xy and idx < min(len(fixed_z), len(fixed_xy)):
+                    v = fixed_xy[idx]
+                    dx = v.x() - center.x()
+                    dy = v.y() - center.y()
+                    if (dx * dx + dy * dy) <= (tol2 * 4.0):
+                        return float(fixed_z[idx])
 
             # Find best new match among all fixed rubber-band vertices.
             best_d2 = float('inf')
@@ -788,18 +794,12 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             best_z: Optional[float] = None
 
             for rb_item, fixed_z in self.rubber_band_fixed_z.items():
-                if not isinstance(rb_item, QgsRubberBand) or not fixed_z:
+                fixed_xy = self.rubber_band_fixed_xy.get(rb_item)
+                if not isinstance(rb_item, QgsRubberBand) or not fixed_z or not fixed_xy:
                     continue
-                geom = rb_item.asGeometry()
-                if not geom or geom.isEmpty():
-                    continue
-                const_geom = geom.constGet()
-                if not const_geom:
-                    continue
-
-                fixed_count = min(len(fixed_z), const_geom.vertexCount())
+                fixed_count = min(len(fixed_z), len(fixed_xy))
                 for i in range(fixed_count):
-                    v = geom.vertexAt(i)
+                    v = fixed_xy[i]
                     dx = v.x() - center.x()
                     dy = v.y() - center.y()
                     d2 = dx * dx + dy * dy
@@ -831,20 +831,12 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             best_z: Optional[float] = None
 
             for rb_item, fixed_z in self.rubber_band_fixed_z.items():
-                if not isinstance(rb_item, QgsRubberBand) or not fixed_z:
+                fixed_xy = self.rubber_band_fixed_xy.get(rb_item)
+                if not isinstance(rb_item, QgsRubberBand) or not fixed_z or not fixed_xy:
                     continue
-
-                geom = rb_item.asGeometry()
-                if not geom or geom.isEmpty():
-                    continue
-
-                const_geom = geom.constGet()
-                if not const_geom:
-                    continue
-
-                fixed_count = min(len(fixed_z), const_geom.vertexCount())
+                fixed_count = min(len(fixed_z), len(fixed_xy))
                 for i in range(fixed_count):
-                    v = geom.vertexAt(i)
+                    v = fixed_xy[i]
                     dx = v.x() - center.x()
                     dy = v.y() - center.y()
                     d2 = dx * dx + dy * dy
@@ -878,6 +870,8 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             if geom and not geom.isEmpty():
                 geom_for_render = QgsGeometry(geom)
                 const_geom = geom_for_render.constGet()
+                transformed_geom = None
+                output_geom = geom_for_render
                 if const_geom:
                     vertex_count = const_geom.vertexCount()
                     if vertex_count > 0 and self.parent:
@@ -886,10 +880,13 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                         fixed_vertex_count = vertex_count - 1 if (dynamic_last and vertex_count > 1) else vertex_count
 
                         tracked_fixed_z = self.rubber_band_fixed_z.setdefault(source, [])
+                        tracked_fixed_xy = self.rubber_band_fixed_xy.setdefault(source, [])
 
                         # Trim tracker if geometry shrank.
                         if len(tracked_fixed_z) > fixed_vertex_count:
                             tracked_fixed_z[:] = tracked_fixed_z[:fixed_vertex_count]
+                        if len(tracked_fixed_xy) > fixed_vertex_count:
+                            tracked_fixed_xy[:] = tracked_fixed_xy[:fixed_vertex_count]
 
                         # Capture Z for newly fixed vertices only.
                         while len(tracked_fixed_z) < fixed_vertex_count:
@@ -905,6 +902,12 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                                 tracked_fixed_z.append(float(self.rubber_band_last_dynamic_z[source]))
                             else:
                                 tracked_fixed_z.append(cursor_z)
+                            tracked_fixed_xy.append(QgsPointXY(src_v.x(), src_v.y()))
+
+                        # Refresh XY tracker for already-known fixed vertices.
+                        for i in range(min(fixed_vertex_count, len(tracked_fixed_xy))):
+                            src_v = geom.vertexAt(i)
+                            tracked_fixed_xy[i] = QgsPointXY(src_v.x(), src_v.y())
 
                         # Apply fixed-vertex Z values.
                         for i in range(min(fixed_vertex_count, len(tracked_fixed_z))):
@@ -932,15 +935,32 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                                     del self.rubber_band_z_by_geom_hash[oldest_key]
 
                 geom_world = self._reproject_geometry_to_world(geom_for_render)
+                output_geom = geom_world
                 
                 if self.trf_wld2prp and self._is_stereo_projection_active():
                     transformed_geom = self._transform_geometry(geom_world, source)
                     if transformed_geom:
+                        output_geom = transformed_geom
                         target.setToGeometry(transformed_geom, None)
                     else:
                         target.setToGeometry(geom_world, None)
                 else:
                     target.setToGeometry(geom_world, None)
+
+                # Keep a deterministic projected-vertex snapshot for marker placement
+                # without touching potentially destroyed rubber-band objects.
+                try:
+                    projected_fixed: List[QgsPointXY] = []
+                    source_fixed_xy = self.rubber_band_fixed_xy.get(source, [])
+                    out_const = output_geom.constGet() if output_geom else None
+                    if out_const and source_fixed_xy:
+                        fixed_count = min(len(source_fixed_xy), out_const.vertexCount())
+                        for i in range(fixed_count):
+                            v = output_geom.vertexAt(i)
+                            projected_fixed.append(QgsPointXY(v.x(), v.y()))
+                    self.rubber_band_projected_fixed_xy[source] = projected_fixed
+                except Exception:
+                    self.rubber_band_projected_fixed_xy[source] = []
             
         except Exception as e:
             QgsMessageLog.logMessage(f"Error synchronizing rubber band: {str(e)}", 
@@ -1246,9 +1266,11 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         Enables or disables automatic map canvas item synchronization.
         """
         if enabled:
+            self._canvas_items_sync_active = True
             # Reconnect signals if needed
             self._setup_canvas_items_sync()
         else:
+            self._canvas_items_sync_active = False
             # Disconnect signals to disable synchronization
             try:
                 if hasattr(self.qgis_main_canvas, 'mapCanvasRefreshed'):
@@ -1266,6 +1288,8 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         Cleans up all resources related to canvas-item synchronization.
         Must be called when closing or destroying the canvas.
         """
+        self._canvas_items_sync_active = False
+
         # Disconnect signals
         try:
             if hasattr(self.qgis_main_canvas, 'mapCanvasRefreshed'):
@@ -1290,6 +1314,8 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         self.synced_items.clear()
         self.geometry_cache.clear()
         self.rubber_band_fixed_z.clear()
+        self.rubber_band_fixed_xy.clear()
+        self.rubber_band_projected_fixed_xy.clear()
         self.rubber_band_last_dynamic_z.clear()
         self.rubber_band_z_by_geom_hash.clear()
         self.vertex_marker_fixed_z.clear()
@@ -1357,32 +1383,37 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
     # ============================================================================
 
     def paintEvent(self, e):
-        if self._is_overlay_mode():
-            rendered = self._current_stable_source_buffer()
-            self._last_rendered_buffer = rendered
-            composed = self._compose_overlay_image()
-            if composed is None:
-                # Keep previous valid composition to avoid transient blanks/transparent rows.
-                composed = self._last_composed_overlay_buffer.copy() if self._last_composed_overlay_buffer is not None else rendered.copy()
+        self._in_paint_event = True
+        try:
+            if self._is_overlay_mode():
+                rendered = self._current_stable_source_buffer()
+                self._last_rendered_buffer = rendered
+                composed = self._compose_overlay_image()
+                if composed is None:
+                    # Keep previous valid composition to avoid transient blanks/transparent rows.
+                    composed = self._last_composed_overlay_buffer.copy() if self._last_composed_overlay_buffer is not None else rendered.copy()
+                else:
+                    self._last_composed_overlay_buffer = composed.copy()
+
+                self._draw_overlays_on_image(composed)
+                self._paint_image_to_viewport(composed, replace=True)
+            elif self.filter == self.FILTER_NONE:
+                super().paintEvent(e)
+
+                # Draw plugin overlays without filter when filter mode is disabled.
+                if self.z_text or self._should_show_north_indicator():
+                    painter = QPainter(self.viewport())
+                    if painter.isActive():
+                        self._draw_overlays_with_painter(painter)
+                    painter.end()
             else:
-                self._last_composed_overlay_buffer = composed.copy()
-
-            self._draw_overlays_on_image(composed)
-            self._paint_image_to_viewport(composed, replace=True)
-        elif self.filter == self.FILTER_NONE:
-            super().paintEvent(e)
-
-            # Draw plugin overlays without filter when filter mode is disabled.
-            if self.z_text or self._should_show_north_indicator():
-                painter = QPainter(self.viewport())
-                self._draw_overlays_with_painter(painter)
-                painter.end()
-        else:
-            rendered = self._current_stable_source_buffer()
-            self._last_rendered_buffer = rendered
-            filtered = self.apply_filter(rendered.copy())
-            self._draw_overlays_on_image(filtered)
-            self._paint_image_to_viewport(filtered)
+                rendered = self._current_stable_source_buffer()
+                self._last_rendered_buffer = rendered
+                filtered = self.apply_filter(rendered.copy())
+                self._draw_overlays_on_image(filtered)
+                self._paint_image_to_viewport(filtered)
+        finally:
+            self._in_paint_event = False
 
     def _current_stable_source_buffer(self) -> QImage:
         """Returns the most recent stable canvas image for filtered/overlay painting."""
@@ -1390,6 +1421,13 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             return self._last_base_buffer.copy()
         if self._last_rendered_buffer is not None:
             return self._last_rendered_buffer.copy()
+
+        # Never capture viewport pixels while we are inside a paint cycle,
+        # otherwise Qt can recurse into repaint on QWidget/QAbstractScrollArea.
+        if self._in_paint_event:
+            empty = QImage(self.size(), QImage.Format.Format_ARGB32)
+            empty.fill(QColor(0, 0, 0, 0))
+            return empty
 
         # Last-resort stable source: current viewport pixels (already on screen).
         try:
@@ -1435,10 +1473,9 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         if not left_canvas or not right_canvas:
             return None
 
-        if left_canvas._last_rendered_buffer is None:
-            left_canvas._last_rendered_buffer = left_canvas._current_stable_source_buffer()
-        if right_canvas._last_rendered_buffer is None:
-            right_canvas._last_rendered_buffer = right_canvas._current_stable_source_buffer()
+        if left_canvas._last_rendered_buffer is None or right_canvas._last_rendered_buffer is None:
+            # Wait for one completed capture cycle before composing.
+            return None
 
         left_image = left_canvas._last_rendered_buffer
         right_image = right_canvas._last_rendered_buffer
@@ -1507,6 +1544,9 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
 
     def _clear_viewport(self):
         viewport_painter = QPainter(self.viewport())
+        if not viewport_painter.isActive():
+            viewport_painter.end()
+            return
         viewport_painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         viewport_painter.fillRect(self.viewport().rect(), QColor(0, 0, 0, 0))
         viewport_painter.end()
@@ -1514,6 +1554,9 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
     def _paint_image_to_viewport(self, image: QImage, replace: bool = False):
         """Paint one already-composed image to the viewport."""
         viewport_painter = QPainter(self.viewport())
+        if not viewport_painter.isActive():
+            viewport_painter.end()
+            return
         if replace:
             viewport_painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         else:

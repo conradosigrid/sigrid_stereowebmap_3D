@@ -72,6 +72,11 @@ Expected behavior:
 
 ## 5. Changes
 
+### Version 0.7.2
+
+- Included beamsplitter stereo mode.
+- Forces to redraw stereo canvases every time settings (parameters or checkboxes) change
+
 ### Version 0.7.1
 
 - Included in the plugin toolbar drop-down lists for configuration parameters and checkboxes.

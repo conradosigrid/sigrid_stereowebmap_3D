@@ -172,10 +172,6 @@ class QSgdSwmWindow(QMainWindow):
         """
         self._install_global_event_filter()
         super().showEvent(event)
-        if self._stereo_canvas_options:
-            self._stereo_canvas_options.setup_context_menu()
-        if self._stereo_controls_toolbar:
-            self._stereo_controls_toolbar.install()
         self._setup_main_canvas_north_indicator()
         # Initial sync after the window is shown
         self._sync_canvases_destination_crs()
@@ -492,21 +488,20 @@ class QSgdSwmWindow(QMainWindow):
     def _set_stereo_activation_scale_threshold(self, value: float):
         try:
             self._stereo_activation_scale_threshold = max(1.0, float(value))
-            self._save_ui_option_states()
+            self._commit_configuration_change()
             self._update_control_toolbar_state()
             self._update_auto_flight_rotation(apply_main_canvas=True)
-            self._schedule_layers_sync()
-            self._schedule_canvas_refresh()
+            self._hard_redraw_stereo_canvases()
         except Exception as e:
             QgsMessageLog.logMessage(f"SWM: Error updating stereo activation scale: {str(e)}", "SWM-3D", Qgis.Warning)
 
     def _set_flight_rotation_threshold_deg(self, value: float):
         try:
             self._flight_rotation_threshold_deg = max(0.0, min(180.0, float(value)))
-            self._save_ui_option_states()
+            self._commit_configuration_change()
             self._update_control_toolbar_state()
             self._update_auto_flight_rotation(apply_main_canvas=True)
-            self._schedule_canvas_refresh()
+            self._hard_redraw_stereo_canvases()
         except Exception as e:
             QgsMessageLog.logMessage(f"SWM: Error updating flight rotation threshold: {str(e)}", "SWM-3D", Qgis.Warning)
 
@@ -522,8 +517,9 @@ class QSgdSwmWindow(QMainWindow):
             "2 Interlaced even",
             "3 Interlaced odd",
             "4 Side by side",
-            "5 Mirror right",
-            "6 Mirror up",
+            "5 Beam splitter",
+            "6 Mirror right",
+            "7 Mirror up",
         ]
         stereo_choice, ok = QInputDialog.getItem(self.iface.mainWindow(), "Stereo mode", "Select stereo mode for SWM-3D plugin:", stereo_options, 3, False)
         if not ok:
@@ -557,17 +553,18 @@ class QSgdSwmWindow(QMainWindow):
             layout.setStackingMode(QStackedLayout.StackingMode.StackAll)
             layout.setCurrentIndex(1)
             self._configure_overlay_canvases()
-        elif self.stereo_id <= 5:
+        elif self.stereo_id in (4, 6):
             # Side-by-side mode.
             central_widget.setStyleSheet("")
             layout = QHBoxLayout()
-            if self.stereo_id == 5:
+            if self.stereo_id == 6:
                 self._apply_horizontal_mirror(self.canvas_right)
-        elif self.stereo_id == 6:
-            # Mirror-right / mirror-up layout.
+        elif self.stereo_id in (5, 7):
+            # Top/bottom mode. Mirror-up keeps right-eye horizontal mirror.
             central_widget.setStyleSheet("")
             layout = QVBoxLayout()
-            self._apply_horizontal_mirror(self.canvas_right)
+            if self.stereo_id == 7:
+                self._apply_horizontal_mirror(self.canvas_right)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         central_widget.setLayout(layout)
@@ -600,6 +597,42 @@ class QSgdSwmWindow(QMainWindow):
         if self._canvas_refresh_timer:
             self._canvas_refresh_timer.start()
             self._trace("REFRESH: scheduled")
+
+    def _hard_redraw_stereo_canvases(self):
+        """
+        Forces a full stereo redraw, including new WMS provider fetch cycles.
+        Use this for configuration parameters that require a fresh WMS response.
+        """
+        try:
+            # Invalidate all dedupe signatures so the next sync/refresh is guaranteed.
+            self._last_layers_sync_signature = None
+            self._last_main_repaint_signature = None
+            self._last_applied_stereo_refresh_signature = None
+            self._stereo_refresh_revision += 1
+
+            # Ask SWM providers to drop cached content and repaint.
+            for canvas in (self.canvas_left, self.canvas_right):
+                if not canvas:
+                    continue
+                layer_swm = getattr(canvas, 'layer_swm', None)
+                if layer_swm:
+                    try:
+                        provider = layer_swm.dataProvider() if hasattr(layer_swm, 'dataProvider') else None
+                        if provider and hasattr(provider, 'reloadData'):
+                            provider.reloadData()
+                    except Exception:
+                        pass
+                    try:
+                        layer_swm.triggerRepaint()
+                    except Exception:
+                        pass
+
+            # Apply immediately instead of waiting for debounce timers.
+            self._sync_canvases_layers()
+            self._sync_canvases_repaint()
+            self._schedule_canvas_refresh()
+        except Exception as e:
+            QgsMessageLog.logMessage(f"REFRESH: Error in hard stereo redraw: {str(e)}", "SWM-3D", Qgis.Warning)
 
     def _trace(self, message: str):
         """Structured troubleshooting log for request-flow diagnostics."""
@@ -774,7 +807,7 @@ class QSgdSwmWindow(QMainWindow):
             self.canvas_left.set_show_z_text_overlay(visible)
         if self.canvas_right:
             self.canvas_right.set_show_z_text_overlay(visible)
-        self._save_ui_option_states()
+        self._commit_configuration_change()
         self._update_control_toolbar_state()
 
     def _update_z_label(self):
@@ -802,20 +835,20 @@ class QSgdSwmWindow(QMainWindow):
     def set_z_project_plain(self, value: bool):
         """Toggle whether z_cursor follows the projection plane Z on each zoom."""
         self.z_project_plain = bool(value)
-        self._save_ui_option_states()
+        self._commit_configuration_change()
         self._update_control_toolbar_state()
 
     def set_move_zlabel_in_3D(self, value: bool):
         """Toggle whether the Z label is projected with the current cursor Z."""
         self.move_zlabel_in_3D = bool(value)
-        self._save_ui_option_states()
+        self._commit_configuration_change()
         self._update_control_toolbar_state()
         self._update_z_label()
 
     def set_prevent_cursor_from_stereo_display(self, value: bool):
         """Toggle whether the cursor is forced back to the main QGIS window."""
         self.prevent_cursor_from_stereo_display = bool(value)
-        self._save_ui_option_states()
+        self._commit_configuration_change()
         self._update_control_toolbar_state()
         if self.prevent_cursor_from_stereo_display:
             self._keep_cursor_in_main_qgis_window()
@@ -837,6 +870,22 @@ class QSgdSwmWindow(QMainWindow):
             self.canvas_right.set_show_z_text_overlay(bool(self._ui_option_state()["show_z_text"]))
         if self.prevent_cursor_from_stereo_display:
             self._keep_cursor_in_main_qgis_window()
+
+    def _on_configuration_changed(self):
+        """
+        Centralized post-config-change hook.
+        Forces one stereo redraw even if map-state signatures did not change.
+        """
+        self._last_applied_stereo_refresh_signature = None
+        self._schedule_canvas_refresh()
+
+    def _commit_configuration_change(self):
+        """
+        Persists configuration and guarantees visual application in stereo canvases.
+        Use this helper for any checkbox/parameter change.
+        """
+        self._save_ui_option_states()
+        self._on_configuration_changed()
 
     def _save_ui_option_states(self):
         try:
@@ -864,7 +913,7 @@ class QSgdSwmWindow(QMainWindow):
             if self.prevent_cursor_from_stereo_display:
                 self._keep_cursor_in_main_qgis_window()
 
-            self._save_ui_option_states()
+            self._commit_configuration_change()
             self._update_control_toolbar_state()
             self._update_z_label()
         except Exception:
@@ -875,11 +924,10 @@ class QSgdSwmWindow(QMainWindow):
         try:
             self._stereo_activation_scale_threshold = 100000.0
             self._flight_rotation_threshold_deg = 10.0
-            self._save_ui_option_states()
+            self._commit_configuration_change()
             self._update_control_toolbar_state()
             self._update_auto_flight_rotation(apply_main_canvas=True)
             self._schedule_layers_sync()
-            self._schedule_canvas_refresh()
         except Exception:
             pass
 

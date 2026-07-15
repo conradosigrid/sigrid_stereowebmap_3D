@@ -1,11 +1,11 @@
-﻿# SIGRID_SWM_3D - QGIS Plugin - Version 0.7.1
+﻿# SIGRID_SWM_3D - QGIS Plugin - Version 0.7.3
 
 ![Version](https://img.shields.io/badge/version-6.1-blue)
 ![QGIS](https://img.shields.io/badge/QGIS-4.x-green)
 ![OS](https://img.shields.io/badge/OS-Windows-0078D6)
 
 **Status:** Active development
-**Scope:** Stereoscopic visualization of SWM photogrammetric flight WMS services in QGIS 4.x
+**Scope:** Stereoscopic visualization of SWM photogrammetric flight WMS services in QGIS 4.x (stability target: QGIS 4.2 stable)
 **Documentation language:** English ([readme.md](readme.md))
 
 ## Table of Contents
@@ -38,12 +38,13 @@ Use **ALT + mouse wheel** in the main window to adjust the **cursor Z** value, w
 
 ### 2.1 Mandatory
 
-- **QGIS 4.x** (based on Qt 6).
+- **QGIS 4.0 or higher** (based on Qt 6).
 - **Windows** operating system.
 - **Two or more monitors**.
 
 ### 2.2 Recommended
 
+- **QGIS 4.2 stable** as the preferred production baseline.
 - One of the monitors should support stereoscopic system.
 - Access to the SWM photogrammetric WMS service. Currently available endpoints:
 - **If you are working on an intranet, change 'https://' to 'http://'**
@@ -71,6 +72,10 @@ Expected behavior:
 - Depth adjustments are shown dynamically in the stereo view.
 
 ## 5. Changes
+
+### Version 0.7.3
+
+- Plugin toolbox problems resolved.
 
 ### Version 0.7.2
 
@@ -153,6 +158,7 @@ Expected behavior:
 ### Plugin does not appear in QGIS
 
 - Verify you are using **QGIS 4.x**.
+- For production/stability-sensitive use, prefer **QGIS 4.2 stable**.
 - Reinstall from the latest plugin ZIP package.
 - Check that plugin installation is enabled in QGIS Plugin Manager.
 
@@ -196,7 +202,7 @@ Expected behavior:
 
 | Component | Supported | Notes |
 | --- | --- | --- |
-| QGIS | 4.x | Based on Qt 6 |
+| QGIS | 4.x | Compatible on 4.x; stability target is 4.2 stable. Validated manually on 4.0, 4.1, 4.2; verify 4.3 regressions when needed |
 | Operating system | Windows | Primary target platform |
 | Monitor setup | 2+ monitors | One monitor can be stereo-capable |
 | Stereo hardware | Recommended | Required for full stereoscopic experience |

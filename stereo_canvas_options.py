@@ -13,9 +13,9 @@ import re
 from typing import Callable, Dict, Optional, Tuple
 
 from qgis.core import QgsProject, QgsLayerTreeGroup, QgsLayerTreeLayer, Qgis, QgsMessageLog
-from qgis.PyQt.QtCore import QSize, Qt, QSignalBlocker, QRect, QEvent, QTimer, QPoint, QSettings, QT_VERSION_STR
+from qgis.PyQt.QtCore import QSize, Qt, QSignalBlocker, QRect, QEvent, QTimer, QSettings, QT_VERSION_STR
 from qgis.PyQt.QtGui import QIcon, QColor
-from qgis.PyQt.QtWidgets import QLabel, QDoubleSpinBox, QHBoxLayout, QMenu, QAction, QWidgetAction, QToolBar, QToolButton, QWidget, QSizePolicy, QStyledItemDelegate, QStyleOptionViewItem, QStyle, QStyleOptionButton, QDockWidget, QFrame
+from qgis.PyQt.QtWidgets import QLabel, QDoubleSpinBox, QHBoxLayout, QMenu, QAction, QWidgetAction, QToolButton, QWidget, QSizePolicy, QStyledItemDelegate, QStyleOptionViewItem, QStyle, QStyleOptionButton, QFrame, QToolBar
 
 from .utils import is_sgd_swm_layer
 
@@ -790,7 +790,7 @@ class StereoCanvasOptions:
             return True
 
         root = project.layerTreeRoot()
-        if not root:
+        if root is None:
             return True
 
         node = root.findLayer(layer.id())
@@ -813,7 +813,7 @@ class StereoCanvasOptions:
             return None
 
         root = project.layerTreeRoot()
-        if not root:
+        if root is None:
             return None
 
         group = root.findGroup(name)
@@ -846,7 +846,7 @@ class StereoCanvasOptions:
 
 
 class StereoCanvasToolbar:
-    """Compact toolbar row to control the stereo plugin."""
+    """Compact control strip hosted in the main QGIS window."""
 
     _CONTAINER_MODE_AUTO = "auto"
     _CONTAINER_MODE_FLOATING = "floating"
@@ -856,7 +856,6 @@ class StereoCanvasToolbar:
         self.window = window
         self.toolbar = None
         self._installed = False
-        self._container_mode = self._resolve_container_mode()
         self._icon_label = None
         self._activation_scale_spin = None
         self._rotation_threshold_spin = None
@@ -875,77 +874,20 @@ class StereoCanvasToolbar:
     def _settings_key_container_mode() -> str:
         return "SigridSWM/controls_container_mode"
 
-    @staticmethod
-    def _settings_key_auto_dock_min_qt_qgis4() -> str:
-        return "SigridSWM/controls_auto_dock_min_qt_qgis4"
-
-    @staticmethod
-    def _parse_version_tuple(version_text: str) -> Tuple[int, int, int]:
-        parts = [p for p in str(version_text).strip().split('.') if p != ""]
-        ints = []
-        for part in parts[:3]:
-            number = ""
-            for ch in part:
-                if ch.isdigit():
-                    number += ch
-                else:
-                    break
-            ints.append(int(number) if number else 0)
-        while len(ints) < 3:
-            ints.append(0)
-        return ints[0], ints[1], ints[2]
-
     def _qgis_version_int(self) -> int:
         try:
             return int(getattr(Qgis, "QGIS_VERSION_INT", 0) or 0)
         except Exception:
             return 0
 
-    def _auto_dock_min_qt_qgis4(self) -> Optional[Tuple[int, int, int]]:
-        # Default is disabled: until upstream fix is confirmed, QGIS 4 runs floating mode.
-        # To enable auto-dock on newer Qt builds, set this value in QSettings, for example:
-        #   SigridSWM/controls_auto_dock_min_qt_qgis4 = "6.12.2"
-        try:
-            settings = QSettings()
-            raw = settings.value(self._settings_key_auto_dock_min_qt_qgis4(), "", type=str) or ""
-            raw = raw.strip()
-            if not raw:
-                return None
-            return self._parse_version_tuple(raw)
-        except Exception:
-            return None
-
-    def _is_auto_dock_safe(self) -> bool:
-        qgis_int = self._qgis_version_int()
-        qt_tuple = self._parse_version_tuple(QT_VERSION_STR)
-
-        # QGIS 4 + Qt 6 has shown access violations in dynamic main-window control show() paths.
-        # Stay floating unless a validated minimum Qt threshold is explicitly configured.
-        if qgis_int >= 40000:
-            min_qt = self._auto_dock_min_qt_qgis4()
-            return bool(min_qt is not None and qt_tuple >= min_qt)
-
-        # QGIS 3 branch did not exhibit this regression in this plugin path.
-        return True
-
     def _resolve_container_mode(self) -> str:
-        try:
-            settings = QSettings()
-            raw = (settings.value(self._settings_key_container_mode(), self._CONTAINER_MODE_AUTO, type=str) or self._CONTAINER_MODE_AUTO).strip().lower()
-        except Exception:
-            raw = self._CONTAINER_MODE_AUTO
-
-        if raw in ("dock", "docked", "panel"):
-            return self._CONTAINER_MODE_DOCK
-        if raw in ("float", "floating", "toolbar"):
-            return self._CONTAINER_MODE_FLOATING
-        return self._CONTAINER_MODE_DOCK if self._is_auto_dock_safe() else self._CONTAINER_MODE_FLOATING
+        return "qgis-main-toolbar"
 
     def _log_container_mode(self):
         try:
             QgsMessageLog.logMessage(
                 (
-                    f"Controls container mode={self._container_mode}; "
+                    f"Controls container mode=qgis-main-toolbar; "
                     f"QGIS_INT={self._qgis_version_int()}; Qt={QT_VERSION_STR}; "
                     f"setting={QSettings().value(self._settings_key_container_mode(), self._CONTAINER_MODE_AUTO, type=str)}"
                 ),
@@ -960,10 +902,14 @@ class StereoCanvasToolbar:
         if not main_window:
             return
 
-        if self._container_mode == self._CONTAINER_MODE_DOCK:
-            self._build_as_dock(main_window)
-        else:
-            self._build_as_floating_toolbar(main_window)
+        toolbar = QToolBar("SWM-3D Controls", main_window)
+        toolbar.setObjectName("SWM3DControlsMainToolbar")
+        toolbar.setMovable(True)
+        toolbar.setFloatable(False)
+        toolbar.setIconSize(QSize(24, 24))
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        toolbar.addWidget(self._build_control_content(toolbar))
+        self.toolbar = toolbar
 
         self._log_container_mode()
 
@@ -1107,40 +1053,6 @@ class StereoCanvasToolbar:
 
         return content_widget
 
-    def _build_as_floating_toolbar(self, main_window):
-        toolbar = QToolBar("SWM-3D Controls", main_window)
-        toolbar.setObjectName("SWM3DControlsToolbar")
-        toolbar.setWindowTitle("SWM-3D Controls")
-        toolbar.setWindowFlag(Qt.WindowType.Tool, True)
-        toolbar.setWindowFlag(Qt.WindowType.CustomizeWindowHint, True)
-        toolbar.setWindowFlag(Qt.WindowType.WindowTitleHint, True)
-        toolbar.setMovable(False)
-        toolbar.setFloatable(False)
-        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        toolbar.setIconSize(QSize(24, 24))
-
-        toolbar.addWidget(self._build_control_content(toolbar))
-        self.toolbar = toolbar
-        self.refresh()
-
-    def _build_as_dock(self, main_window):
-        dock = QDockWidget("SWM-3D Controls", main_window)
-        dock.setObjectName("SWM3DControlsDock")
-        dock.setAllowedAreas(
-            Qt.DockWidgetArea.TopDockWidgetArea
-            | Qt.DockWidgetArea.BottomDockWidgetArea
-            | Qt.DockWidgetArea.LeftDockWidgetArea
-            | Qt.DockWidgetArea.RightDockWidgetArea
-        )
-        dock.setFeatures(
-            QDockWidget.DockWidgetFeature.DockWidgetMovable
-            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
-            | QDockWidget.DockWidgetFeature.DockWidgetClosable
-        )
-        dock.setWidget(self._build_control_content(dock))
-        self.toolbar = dock
-        self.refresh()
-
     @staticmethod
     def _settings_key_pos_x() -> str:
         return "SigridSWM/controls_toolbar_pos_x"
@@ -1174,8 +1086,7 @@ class StereoCanvasToolbar:
     def install(self):
         if self._installed:
             if self.toolbar is not None:
-                self.toolbar.show()
-                self.toolbar.raise_()
+                self.toolbar.setVisible(True)
             return
 
         if not self.toolbar:
@@ -1184,16 +1095,25 @@ class StereoCanvasToolbar:
         if not self.toolbar or not self.window or not self.window.iface:
             return
 
-        if self._container_mode == self._CONTAINER_MODE_DOCK:
-            self._install_as_dock()
-        else:
-            self._place_near_main_window()
-        self.toolbar.show()
-        self.toolbar.raise_()
+        main_window = self.window.iface.mainWindow()
+        if not main_window:
+            return
+
+        was_animated = bool(main_window.isAnimated()) if hasattr(main_window, 'isAnimated') else False
+        if hasattr(main_window, 'setAnimated'):
+            main_window.setAnimated(False)
+        try:
+            if main_window.toolBarArea(self.toolbar) == Qt.ToolBarArea.NoToolBarArea:
+                main_window.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.toolbar)
+            self.toolbar.setVisible(True)
+        finally:
+            if hasattr(main_window, 'setAnimated'):
+                main_window.setAnimated(was_animated)
+
         self._installed = True
 
     def cleanup(self):
-        if not self.toolbar or not self.window or not self.window.iface:
+        if not self.toolbar:
             self._icon_label = None
             self._activation_scale_spin = None
             self._rotation_threshold_spin = None
@@ -1209,16 +1129,20 @@ class StereoCanvasToolbar:
             return
 
         try:
-            self._save_toolbar_position()
-            if isinstance(self.toolbar, QDockWidget):
-                main_window = self.window.iface.mainWindow() if self.window and self.window.iface else None
+            if self.window and self.window.iface:
+                main_window = self.window.iface.mainWindow()
                 if main_window:
-                    main_window.removeDockWidget(self.toolbar)
-            self.toolbar.hide()
-            self.toolbar.close()
+                    was_animated = bool(main_window.isAnimated()) if hasattr(main_window, 'isAnimated') else False
+                    if hasattr(main_window, 'setAnimated'):
+                        main_window.setAnimated(False)
+                    try:
+                        main_window.removeToolBar(self.toolbar)
+                    finally:
+                        if hasattr(main_window, 'setAnimated'):
+                            main_window.setAnimated(was_animated)
+            self.toolbar.deleteLater()
         except Exception:
             pass
-        self.toolbar.deleteLater()
         self.toolbar = None
         self._installed = False
         self._icon_label = None
@@ -1233,56 +1157,6 @@ class StereoCanvasToolbar:
         self._action_move_zlabel_in_3D = None
         self._action_prevent_cursor_from_stereo_display = None
         self._action_restore_defaults = None
-
-    def _place_near_main_window(self):
-        if not self.toolbar or not self.window or not self.window.iface:
-            return
-
-        if isinstance(self.toolbar, QDockWidget):
-            return
-
-        try:
-            main_window = self.window.iface.mainWindow()
-            if not main_window:
-                return
-
-            main_rect = main_window.frameGeometry()
-            size_hint = self.toolbar.sizeHint()
-            x = main_rect.left() + 32
-            y = main_rect.top() + 64
-
-            saved_pos = self._load_toolbar_position()
-            if saved_pos is not None:
-                x, y = saved_pos
-
-            screen = main_window.screen()
-            if screen is not None:
-                available = screen.availableGeometry()
-                max_x = max(available.left(), available.right() - size_hint.width())
-                max_y = max(available.top(), available.bottom() - size_hint.height())
-                x = max(available.left(), min(max_x, x))
-                y = max(available.top(), min(max_y, y))
-
-            self.toolbar.move(QPoint(int(x), int(y)))
-        except Exception:
-            pass
-
-    def _install_as_dock(self):
-        if not self.toolbar or not self.window or not self.window.iface:
-            return
-
-        if not isinstance(self.toolbar, QDockWidget):
-            return
-
-        try:
-            main_window = self.window.iface.mainWindow()
-            if not main_window:
-                return
-
-            if main_window.dockWidgetArea(self.toolbar) == Qt.DockWidgetArea.NoDockWidgetArea:
-                main_window.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, self.toolbar)
-        except Exception:
-            pass
 
     @staticmethod
     def _add_separator(layout, parent_widget):

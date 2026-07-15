@@ -1,5 +1,4 @@
 import os
-import numpy as np
 """
 canvas.py
 
@@ -38,7 +37,7 @@ from qgis.gui import QgsMapCanvas, QgsVertexMarker, QgsRubberBand, QgsMapCanvasI
 from qgis.core import QgsWkbTypes, QgsGeometry, QgsRasterLayer, QgsVectorLayer, QgsPoint, QgsPointXY, QgsFeatureRequest
 from qgis.core import QgsSymbol, QgsSingleSymbolRenderer, QgsGeometryGeneratorSymbolLayer
 from qgis.core import QgsCoordinateTransform, QgsCoordinateReferenceSystem, QgsProject
-from qgis.PyQt.QtGui import QColor, QWheelEvent, QImage, QPainter, QPixmap
+from qgis.PyQt.QtGui import QColor, QWheelEvent, QImage, QPainter, QPixmap, QPen
 from qgis.PyQt.QtCore import Qt, QTimer
 from typing import Optional, Any, Dict, List, Tuple, cast
 import hashlib
@@ -181,15 +180,122 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             viewport = self.viewport()
             if viewport is None:
                 return
-            pix = viewport.grab()
-            if pix and not pix.isNull():
-                base = pix.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+
+            # Deterministic per-eye source: render this canvas off-screen.
+            # Avoid viewport.grab() in stacked overlay layouts because it can
+            # capture the already-composited stack instead of this eye frame.
+            base = self._render_base_canvas_buffer()
+
+            # Conservative fallback when off-screen render fails.
+            if base.isNull() or base.width() <= 0 or base.height() <= 0 or not self._image_has_visible_pixels(base):
+                visibility_state = self._stash_cursor_marker_visibility(False)
+                try:
+                    pix = viewport.grab()
+                finally:
+                    self._restore_cursor_marker_visibility(visibility_state)
+                if pix and not pix.isNull():
+                    grabbed = pix.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+                    if self._image_has_visible_pixels(grabbed):
+                        base = grabbed
+
+            if not base.isNull() and base.width() > 0 and base.height() > 0:
                 self._last_base_buffer = base
                 self._last_rendered_buffer = base
                 # Repaint after capture so filters/composition use a stable source frame.
+                # In stacked stereo modes the top compositor must repaint when either eye
+                # receives a fresh buffer; otherwise it can stay stuck showing only one eye.
+                if self._is_overlay_mode() and self.parent:
+                    compositor = None
+                    if hasattr(self.parent, 'canvas_right') and self.parent.canvas_right is not None:
+                        compositor = self.parent.canvas_right
+                    elif hasattr(self.parent, 'canvas_left') and self.parent.canvas_left is not None:
+                        compositor = self.parent.canvas_left
+
+                    if compositor is not None and compositor is not self:
+                        compositor.update()
                 self.update()
         except Exception:
             pass
+
+    def _image_has_visible_pixels(self, image: QImage) -> bool:
+        """Returns True when the image contains at least some visible non-transparent content."""
+        try:
+            rgba = image.convertToFormat(QImage.Format.Format_RGBA8888)
+            ptr = rgba.bits()
+            ptr.setsize(rgba.sizeInBytes())
+            arr = np.frombuffer(ptr, np.uint8).reshape(rgba.height(), rgba.width(), 4)
+            return bool(np.any(arr[:, :, 3] > 0))
+        except Exception:
+            return True
+
+    def _render_base_canvas_buffer(self) -> QImage:
+        """Render base map content off-screen without plugin overlays."""
+        buffer = QImage(self.size(), QImage.Format.Format_ARGB32)
+        buffer.fill(QColor(0, 0, 0, 0))
+        visibility_state = self._stash_cursor_marker_visibility(False)
+        try:
+            painter = QPainter(buffer)
+            super().render(painter)
+            painter.end()
+        finally:
+            self._restore_cursor_marker_visibility(visibility_state)
+        return buffer
+
+    def _stash_cursor_marker_visibility(self, visible: bool) -> Tuple[bool, bool]:
+        """Temporarily toggles live cursor-marker visibility and returns the previous state."""
+        outer_visible = False
+        inner_visible = False
+        try:
+            outer_visible = bool(self.cursor_marker.isVisible())
+        except Exception:
+            outer_visible = False
+        try:
+            inner_visible = bool(self.cursor_marker_inner.isVisible())
+        except Exception:
+            inner_visible = False
+
+        try:
+            self.cursor_marker.setVisible(visible)
+        except Exception:
+            pass
+        try:
+            self.cursor_marker_inner.setVisible(visible)
+        except Exception:
+            pass
+
+        return (outer_visible, inner_visible)
+
+    def _restore_cursor_marker_visibility(self, visibility_state: Tuple[bool, bool]):
+        """Restores live cursor-marker visibility after a temporary capture change."""
+        outer_visible, inner_visible = visibility_state
+        try:
+            self.cursor_marker.setVisible(bool(outer_visible))
+        except Exception:
+            pass
+        try:
+            self.cursor_marker_inner.setVisible(bool(inner_visible))
+        except Exception:
+            pass
+
+    def _best_available_base_buffer(self) -> Optional[QImage]:
+        """Returns the best eye-local base frame available without grabbing the stacked viewport."""
+        candidates = [self._last_base_buffer, self._last_rendered_buffer]
+        for candidate in candidates:
+            if candidate is not None and not candidate.isNull() and candidate.width() > 0 and candidate.height() > 0:
+                return candidate.copy()
+
+        rendered = self._render_base_canvas_buffer()
+        if not rendered.isNull() and rendered.width() > 0 and rendered.height() > 0:
+            return rendered
+        return None
+
+    def _compose_source_buffer(self) -> Optional[QImage]:
+        """Returns a deterministic eye image for overlay composition."""
+        image = self._best_available_base_buffer()
+        if image is None:
+            return None
+        self._draw_overlays_on_image(image)
+        return image
 
     # ============================================================================
     # == Cursor in the stereo canvas ==
@@ -1387,16 +1493,18 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         try:
             if self._is_overlay_mode():
                 rendered = self._current_stable_source_buffer()
-                self._last_rendered_buffer = rendered
-                composed = self._compose_overlay_image()
-                if composed is None:
-                    # Keep previous valid composition to avoid transient blanks/transparent rows.
-                    composed = self._last_composed_overlay_buffer.copy() if self._last_composed_overlay_buffer is not None else rendered.copy()
-                else:
-                    self._last_composed_overlay_buffer = composed.copy()
+                if self._is_overlay_compositor():
+                    composed = self._compose_overlay_image()
+                    if composed is None:
+                        # Keep previous valid composition to avoid transient blanks/transparent rows.
+                        composed = self._last_composed_overlay_buffer.copy() if self._last_composed_overlay_buffer is not None else rendered.copy()
+                    else:
+                        self._last_composed_overlay_buffer = composed.copy()
 
-                self._draw_overlays_on_image(composed)
-                self._paint_image_to_viewport(composed, replace=True)
+                    self._paint_image_to_viewport(composed, replace=True)
+                else:
+                    # Non-compositor eye only acts as a source buffer in overlay mode.
+                    return
             elif self.filter == self.FILTER_NONE:
                 super().paintEvent(e)
 
@@ -1443,26 +1551,30 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
 
     def _draw_overlays_on_image(self, image: QImage):
         """Draw plugin overlays on an already prepared image buffer."""
-        if not (self.z_text or self._should_show_north_indicator()):
+        if not (self.z_text or self._should_show_north_indicator() or self._should_draw_cursor_overlay()):
             return
         painter = QPainter(image)
-        self._draw_overlays_with_painter(painter)
+        self._draw_overlays_with_painter(painter, include_cursor=True)
         painter.end()
 
     def _render_canvas_buffer(self) -> QImage:
-        """Render this canvas content, including Z text, into an off-screen image."""
-        buffer = QImage(self.size(), QImage.Format.Format_ARGB32)
-        # Keep fallback background transparent to avoid white flashes between frames.
-        buffer.fill(QColor(0, 0, 0, 0))
-
-        painter = QPainter(buffer)
-        super().render(painter)
-        self._draw_overlays_with_painter(painter)
-        painter.end()
+        """Render this canvas content through the same cursor-safe base-buffer path."""
+        buffer = self._render_base_canvas_buffer()
+        self._draw_overlays_on_image(buffer)
         return buffer
 
     def _is_overlay_mode(self) -> bool:
         return bool(self.parent and self.parent.stereo_id <= 3)
+
+    def _is_overlay_compositor(self) -> bool:
+        """Only one stacked canvas should compose/draw the final overlay frame."""
+        if not self.parent:
+            return True
+        right = getattr(self.parent, 'canvas_right', None)
+        if right is not None:
+            return self is right
+        left = getattr(self.parent, 'canvas_left', None)
+        return self is left
 
     def _compose_overlay_image(self) -> Optional[QImage]:
         if not self.parent:
@@ -1473,16 +1585,18 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         if not left_canvas or not right_canvas:
             return None
 
-        if left_canvas._last_rendered_buffer is None or right_canvas._last_rendered_buffer is None:
-            # Wait for one completed capture cycle before composing.
-            return None
+        left_image = left_canvas._compose_source_buffer()
+        right_image = right_canvas._compose_source_buffer()
 
-        left_image = left_canvas._last_rendered_buffer
-        right_image = right_canvas._last_rendered_buffer
         if left_image is None or right_image is None:
             return None
         if left_image.size() != right_image.size():
             return None
+
+        if left_canvas._last_base_buffer is None:
+            left_canvas._last_base_buffer = left_image.copy()
+        if right_canvas._last_base_buffer is None:
+            right_canvas._last_base_buffer = right_image.copy()
 
         try:
             left_filtered = left_canvas.apply_filter(left_image.copy()).convertToFormat(QImage.Format.Format_RGBA8888)
@@ -1541,15 +1655,6 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         except Exception as e:
             QgsMessageLog.logMessage(f"Error composing stereo overlay: {str(e)}", "SWM-3D", Qgis.Critical)
             return None
-
-    def _clear_viewport(self):
-        viewport_painter = QPainter(self.viewport())
-        if not viewport_painter.isActive():
-            viewport_painter.end()
-            return
-        viewport_painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
-        viewport_painter.fillRect(self.viewport().rect(), QColor(0, 0, 0, 0))
-        viewport_painter.end()
 
     def _paint_image_to_viewport(self, image: QImage, replace: bool = False):
         """Paint one already-composed image to the viewport."""
@@ -1634,8 +1739,57 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         self.show_z_text_overlay = bool(visible)
         self.update()
 
-    def _draw_overlays_with_painter(self, painter: QPainter):
+    def _draw_cursor_with_painter(self, painter: QPainter):
+        """Draws the stereo cursor marker into an off-screen buffer."""
+        if not self._should_draw_cursor_overlay():
+            return
+
+        center = self.cursor_marker.center()
+        if center is None:
+            return
+
+        try:
+            coord_transform = self.getCoordinateTransform()
+            if not coord_transform:
+                return
+
+            canvas_point = coord_transform.transform(QgsPointXY(center.x(), center.y()))
+            x = int(canvas_point.x())
+            y = int(canvas_point.y())
+        except Exception:
+            return
+
+        outer_size = max(4, int(getattr(self.cursor_marker, 'iconSize', lambda: 10)() / 2))
+        outer_width = max(1, int(getattr(self.cursor_marker, 'penWidth', lambda: 5)()))
+        inner_size = max(3, int(getattr(self.cursor_marker_inner, 'iconSize', lambda: 10)() / 2))
+        inner_width = max(1, int(getattr(self.cursor_marker_inner, 'penWidth', lambda: 2)()))
+
+        painter.save()
+        self._apply_view_mirror_to_painter(painter)
+
+        outer_pen = QPen(self.cursor_marker.color())
+        outer_pen.setWidth(outer_width)
+        painter.setPen(outer_pen)
+        painter.drawLine(x - outer_size, y, x + outer_size, y)
+        painter.drawLine(x, y - outer_size, x, y + outer_size)
+
+        inner_pen = QPen(self.cursor_marker_inner.color())
+        inner_pen.setWidth(inner_width)
+        painter.setPen(inner_pen)
+        painter.drawLine(x - inner_size, y, x + inner_size, y)
+        painter.drawLine(x, y - inner_size, x, y + inner_size)
+        painter.restore()
+
+    def _should_draw_cursor_overlay(self) -> bool:
+        try:
+            return bool(self.cursor_marker and self.cursor_marker.isVisible())
+        except Exception:
+            return False
+
+    def _draw_overlays_with_painter(self, painter: QPainter, include_cursor: bool = False):
         """Draws all screen overlays managed by this canvas."""
+        if include_cursor:
+            self._draw_cursor_with_painter(painter)
         if self.z_text and self.show_z_text_overlay:
             self._draw_z_text_with_painter(painter)
         if self._should_show_north_indicator():
@@ -1810,7 +1964,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         project = QgsProject.instance()
         if project:
             root = project.layerTreeRoot()
-            if root:
+            if root is not None:
                 tree_lookup_available = True
                 for node in root.findLayers():
                     layer = node.layer()

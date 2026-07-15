@@ -32,6 +32,7 @@ sigrid_swm/
     └── perspective_swm_transform.py
 """
 from qgis.PyQt.QtWidgets import QAction
+from qgis.core import Qgis, QgsMessageLog
 # SWM libraries
 from .window import QSgdSwmWindow
 try:
@@ -69,7 +70,6 @@ class SgdSwmPlugin:
                 # The plugin should not show dialogs. User interaction is handled in window.py
                 # QMessageBox.critical(self.iface.mainWindow(), "Error", self.window.init_error)
                 # Log for developers / advanced users
-                from qgis.core import QgsMessageLog, Qgis
                 QgsMessageLog.logMessage(self.window.init_error, "SWM-3D", Qgis.Critical)
 
                 self.window = None
@@ -92,5 +92,6 @@ class SgdSwmPlugin:
             self.window.close()
             self.window = None
 
-        self.iface.removePluginMenu("&SWM-3D Plugin", self.action)
-        self.iface.removeToolBarIcon(self.action)
+        if self.action is not None:
+            self.iface.removePluginMenu("&SWM-3D Plugin", self.action)
+            self.iface.removeToolBarIcon(self.action)

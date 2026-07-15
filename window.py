@@ -43,6 +43,7 @@ from .utils import is_z_layer, is_sgd_swm_layer
 class QSgdSwmWindow(QMainWindow):
     def __init__(self, iface):
         super().__init__(None)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
 
         # Initialize
         self.qgis_main_canvas = iface.mapCanvas()
@@ -72,6 +73,7 @@ class QSgdSwmWindow(QMainWindow):
         self._last_main_repaint_signature: Optional[Tuple[Any, ...]] = None
         self._last_layers_sync_signature: Optional[Tuple[Any, ...]] = None
         self._last_main_scale_for_layer_sync: Optional[float] = None
+        self._startup_layer_sync_done = False
         self._trace_wms_debug = False
         self._trace_seq = 0
         self._stereo_canvas_options = None
@@ -110,6 +112,7 @@ class QSgdSwmWindow(QMainWindow):
         self._global_event_filter_installed = False
         self._install_global_event_filter()
         self._setup_main_canvas_north_indicator()
+        self._stereo_controls_toolbar = StereoCanvasToolbar(self)
 
         # Capturar eventos del canvas principal qgis
         self.iface.mapCanvas().xyCoordinates.connect(self._sync_canvases_cursor)      # mouse
@@ -125,7 +128,7 @@ class QSgdSwmWindow(QMainWindow):
         project = QgsProject.instance()
         if project:
             root = project.layerTreeRoot()
-            if root and hasattr(root, 'visibilityChanged'):
+            if root is not None and hasattr(root, 'visibilityChanged'):
                 root.visibilityChanged.connect(self._schedule_layers_sync)  # visibility toggles
         try:
             layer_tree_view = self.iface.layerTreeView()
@@ -155,8 +158,6 @@ class QSgdSwmWindow(QMainWindow):
         self._style_sync_timer.timeout.connect(self._run_pending_style_sync)
         self._stereo_canvas_options = StereoCanvasOptions(self.iface, self._on_stereo_layer_visibility_changed)
         self._stereo_canvas_options.setup_context_menu()
-        self._stereo_controls_toolbar = StereoCanvasToolbar(self)
-        self._stereo_controls_toolbar.install()
         self._update_digitizing_layer_hooks()
         self._update_style_layer_hooks()
 
@@ -181,15 +182,18 @@ class QSgdSwmWindow(QMainWindow):
         if self.canvas_right:
             extent_right = self._reproject_extent_to_stereo_crs(self.qgis_main_canvas.extent(), self.canvas_right)
             self.canvas_right.setExtent(extent_right)
-        # Route initial layer setup through the deduplicated sync path so later
-        # startup layer-tree signals do not repeat the same SWM requests.
-        # Defer to the next event loop tick: creating WMS raster layers
-        # (QgsRasterLayer with 'wms' provider) inside showEvent triggers nested
-        # Qt event processing which causes a fatal access violation on some QGIS
-        # builds (ref: Windows fatal exception in QgsRasterLayer::setDataProvider).
-        QTimer.singleShot(0, self._sync_canvases_layers)
+        # Run startup sync directly once the window is shown.
+        self._run_startup_layer_sync()
+        if self._stereo_controls_toolbar is not None:
+            self._stereo_controls_toolbar.install()
         self._update_control_toolbar_state()
         self._update_main_canvas_north_indicator()
+
+    def _run_startup_layer_sync(self):
+        if self._startup_layer_sync_done:
+            return
+        self._startup_layer_sync_done = True
+        self._sync_canvases_layers()
 
     def enterEvent(self, event):
         self._keep_cursor_in_main_qgis_window()
@@ -222,6 +226,8 @@ class QSgdSwmWindow(QMainWindow):
             # Clean up event filter
             self._remove_global_event_filter()
 
+            main_canvas = self.iface.mapCanvas() if self.iface and hasattr(self.iface, 'mapCanvas') else None
+
             if self.network_manager:
                 try:
                     self.network_manager.finished.disconnect(self.network_reply_handle)
@@ -250,15 +256,39 @@ class QSgdSwmWindow(QMainWindow):
             project = QgsProject.instance()
             if project:
                 root = project.layerTreeRoot()
-                if root and hasattr(root, 'visibilityChanged'):
+                if root is not None and hasattr(root, 'visibilityChanged'):
                     try:
                         root.visibilityChanged.disconnect(self._schedule_layers_sync)
                     except (RuntimeError, TypeError):
                         pass
 
-            if hasattr(self.iface.mapCanvas(), 'scaleChanged'):
+            if main_canvas and hasattr(main_canvas, 'xyCoordinates'):
                 try:
-                    self.iface.mapCanvas().scaleChanged.disconnect(self._on_main_canvas_scale_changed)
+                    main_canvas.xyCoordinates.disconnect(self._sync_canvases_cursor)
+                except (RuntimeError, TypeError):
+                    pass
+
+            if main_canvas and hasattr(main_canvas, 'layersChanged'):
+                try:
+                    main_canvas.layersChanged.disconnect(self._schedule_layers_sync)
+                except (RuntimeError, TypeError):
+                    pass
+
+            if main_canvas and hasattr(main_canvas, 'extentsChanged'):
+                try:
+                    main_canvas.extentsChanged.disconnect(self._sync_canvases_repaint)
+                except (RuntimeError, TypeError):
+                    pass
+
+            if main_canvas and hasattr(main_canvas, 'scaleChanged'):
+                try:
+                    main_canvas.scaleChanged.disconnect(self._on_main_canvas_scale_changed)
+                except (RuntimeError, TypeError):
+                    pass
+
+            if main_canvas and hasattr(main_canvas, 'destinationCrsChanged'):
+                try:
+                    main_canvas.destinationCrsChanged.disconnect(self._on_main_canvas_crs_changed)
                 except (RuntimeError, TypeError):
                     pass
             
@@ -267,6 +297,15 @@ class QSgdSwmWindow(QMainWindow):
                 self.canvas_left.cleanup_canvas_items_sync()
             if self.canvas_right:
                 self.canvas_right.cleanup_canvas_items_sync()
+
+            if self.canvas_left:
+                self.canvas_left.setParent(None)
+                self.canvas_left.deleteLater()
+                self.canvas_left = None
+            if self.canvas_right:
+                self.canvas_right.setParent(None)
+                self.canvas_right.deleteLater()
+                self.canvas_right = None
             
         except Exception as e:
             QgsMessageLog.logMessage(f"Cleanup error: {str(e)}", "SWM-3D")
@@ -545,29 +584,39 @@ class QSgdSwmWindow(QMainWindow):
         central_widget.setContentsMargins(0, 0, 0, 0)
         central_widget.setAutoFillBackground(False)
         self.setCentralWidget(central_widget)
+
+        outer_layout = QVBoxLayout(central_widget)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        canvas_container = QWidget(central_widget)
+        canvas_container.setContentsMargins(0, 0, 0, 0)
+        canvas_container.setAutoFillBackground(False)
+        outer_layout.addWidget(canvas_container)
+
         if self.stereo_id <= 3:
             # Overlayed stereo modes share the same viewport.
             # Prevent white flashes between stacked-canvas frames.
-            central_widget.setStyleSheet("background: transparent;")
-            layout = QStackedLayout()
+            canvas_container.setStyleSheet("background: transparent;")
+            layout = QStackedLayout(canvas_container)
             layout.setStackingMode(QStackedLayout.StackingMode.StackAll)
             layout.setCurrentIndex(1)
             self._configure_overlay_canvases()
         elif self.stereo_id in (4, 6):
             # Side-by-side mode.
-            central_widget.setStyleSheet("")
-            layout = QHBoxLayout()
+            canvas_container.setStyleSheet("")
+            layout = QHBoxLayout(canvas_container)
             if self.stereo_id == 6:
                 self._apply_horizontal_mirror(self.canvas_right)
         elif self.stereo_id in (5, 7):
             # Top/bottom mode. Mirror-up keeps right-eye horizontal mirror.
-            central_widget.setStyleSheet("")
-            layout = QVBoxLayout()
+            canvas_container.setStyleSheet("")
+            layout = QVBoxLayout(canvas_container)
             if self.stereo_id == 7:
                 self._apply_horizontal_mirror(self.canvas_right)
+
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        central_widget.setLayout(layout)
 
         layout.addWidget(self.canvas_left)
         layout.addWidget(self.canvas_right)
@@ -700,7 +749,7 @@ class QSgdSwmWindow(QMainWindow):
             project = QgsProject.instance()
             if project:
                 root = project.layerTreeRoot()
-                if root:
+                if root is not None:
                     for node in root.findLayers():
                         layer = node.layer()
                         if layer:
@@ -717,7 +766,7 @@ class QSgdSwmWindow(QMainWindow):
                 if callable(scale_getter):
                     main_scale = float(cast(Any, scale_getter()))
 
-            if root and main_scale is not None:
+            if root is not None and main_scale is not None:
                 scale_items: List[Tuple[str, bool]] = []
                 for node in root.findLayers():
                     layer = node.layer()

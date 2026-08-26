@@ -361,6 +361,12 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         except Exception:
             self._z_text_world_anchor_xy = None
 
+    def sync_rotation_dependent_overlays(self):
+        """Recalculate overlays after a programmatic map rotation."""
+        self._update_z_text_world_anchor()
+        self.render_complete()
+        self.update()
+
     def _project_z_text_baseline(self, metrics) -> Tuple[int, int]:
         """
         Projects cached (X,Y,Zcursor) for z_text and returns clamped screen baseline.
@@ -368,6 +374,8 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         x_px, y_px = self._z_text_insertion_pixel()
 
         move_zlabel_in_3D = bool(getattr(self.parent, 'move_zlabel_in_3D', True)) if self.parent else True
+        if abs(float(self.rotation())) >= 0.05:
+            move_zlabel_in_3D = False
         if move_zlabel_in_3D and self._z_text_world_anchor_xy and self.trf_wld2prp and self.parent and self._is_stereo_projection_active():
             try:
                 z_cursor = float(getattr(self.parent, 'z_cursor', 0.0))
@@ -1867,7 +1875,45 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         if self.parent and not self.parent.isVisible():
             return
 
-        extent = self.qgis_main_canvas.extent()  # Get the extent of the main canvas
+        main_transform = self.qgis_main_canvas.getCoordinateTransform()
+        main_width = self.qgis_main_canvas.width()
+        main_height = self.qgis_main_canvas.height()
+        if not main_transform or main_width <= 0 or main_height <= 0:
+            return
+
+        # extent() is an unrotated bounding box. Convert the visible viewport
+        # corners after the main canvas rotation to preserve its actual outline.
+        main_viewport_polygon = [
+            main_transform.toMapCoordinates(0, 0),
+            main_transform.toMapCoordinates(main_width, 0),
+            main_transform.toMapCoordinates(main_width, main_height),
+            main_transform.toMapCoordinates(0, main_height),
+            main_transform.toMapCoordinates(0, 0),
+        ]
+        limits_geometry = self._reproject_geometry_to_world(
+            QgsGeometry.fromPolygonXY([main_viewport_polygon])
+        )
+        if self.trf_wld2prp and self._is_stereo_projection_active():
+            try:
+                z_cursor = float(getattr(self.parent, 'z_cursor', 0.0)) if self.parent else 0.0
+                projected_points = []
+                limits_const_geometry = limits_geometry.constGet()
+                vertex_count = limits_const_geometry.vertexCount() if limits_const_geometry else 0
+                for vertex_index in range(vertex_count):
+                    point = limits_geometry.vertexAt(vertex_index)
+                    photo_point = self.trf_wld2prp.execute_prp_wrl2pht(QgsPoint(point.x(), point.y(), z_cursor))
+                    if photo_point is None:
+                        projected_points = []
+                        break
+                    projected_point = self.trf_wld2prp.execute_pht2prp(photo_point)
+                    if projected_point is None:
+                        projected_points = []
+                        break
+                    projected_points.append(projected_point)
+                if len(projected_points) >= 4:
+                    limits_geometry = QgsGeometry.fromPolygonXY([projected_points])
+            except Exception:
+                pass
 
         # Keep and update a single rubber band instance to avoid scene mismatch warnings.
         needs_new_limits = self.limits is None
@@ -1893,7 +1939,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         if not self.limits:
             return
 
-        self.limits.setToGeometry(QgsGeometry.fromRect(extent), None)
+        self.limits.setToGeometry(limits_geometry, None)
         self.limits.show()
 
     def sync_cursor(self, point_xy):
@@ -1997,7 +2043,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             ]
 
         layers_self = []  # Get the layers from this canvas
-        self.layer_swm = None
+        swm_layer_found = False
         self.layers_z = []
         active_z_layer_ids = set()
 
@@ -2008,9 +2054,10 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 # TODO: Assign to layer default CRS service
                 # Set own styles for canvas URL
                 # Styles in uppercase <==> problems :-(
-                if self.layer_swm:
+                if swm_layer_found:
                     # Only first swm layer is used
                     continue
+                swm_layer_found = True
                 sigrid_layer_main_url = layer_main.source()
                 style_value = 'PHOTOLEFT' if self.is_left else 'PHOTORIGHT'
                 sigrid_layer_self_url = re.sub(r'styles(=[^&]*)?', f'styles={style_value}', sigrid_layer_main_url, flags=re.IGNORECASE)
@@ -2092,6 +2139,9 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             else:
                 # Keep layers that are neither SWM nor Z-enabled
                 layers_self.append(layer_main)
+
+        if not swm_layer_found:
+            self.layer_swm = None
 
         # Remove stale cached Z copies from layers no longer present.
         for layer_id in list(self._z_layer_cache.keys()):

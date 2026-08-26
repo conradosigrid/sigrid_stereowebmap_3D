@@ -20,12 +20,14 @@ transformations to the canvas and expression layers.
 from qgis.core import QgsMessageLog, Qgis  # for debug messages.
 from qgis.core import QgsNetworkAccessManager
 from qgis.core import QgsGeometry
-from qgis.core import QgsVectorLayer
+from qgis.core import QgsVectorLayer, QgsRasterLayer, QgsPointXY
 from qgis.core import QgsCoordinateTransform, QgsProject
 from qgis.PyQt.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QStackedLayout
 from qgis.PyQt.QtWidgets import QInputDialog, QApplication, QLabel
 from qgis.PyQt.QtGui import QTransform, QGuiApplication, QCursor, QPixmap
-from qgis.PyQt.QtCore import Qt, QEvent, QTimer, QSettings
+from qgis.PyQt.QtCore import Qt, QEvent, QEventLoop, QTimer, QSettings
+from qgis.PyQt.QtCore import QUrl, QUrlQuery
+from qgis.PyQt.QtNetwork import QNetworkRequest
 import json
 import os
 import re
@@ -47,6 +49,7 @@ class QSgdSwmWindow(QMainWindow):
 
         # Initialize
         self.qgis_main_canvas = iface.mapCanvas()
+        self.network_manager = None
         self.stereo_id = 0
         self.swm_screen_geometry = None
         self.canvas_left = None
@@ -61,13 +64,10 @@ class QSgdSwmWindow(QMainWindow):
         self._stereo_activation_scale_threshold = 100000.0
         # Auto strip-rotation enabled: compensates non E-W flight headings.
         self._auto_flight_rotation_enabled = True
-        self._flight_rotation_threshold_deg = 10.0
+        self._flight_rotation_threshold_deg = 0.0
         self._flight_rotation_current_deg = 0.0
-        self._photo_center_left = None   # (x0, y0) world coords of left photo
-        self._photo_center_right = None  # (x0, y0) world coords of right photo
-        self._last_photo_bbox_left: Optional[str] = None
-        self._last_photo_bbox_right: Optional[str] = None
-        self._last_rotation_bbox_applied: Optional[str] = None
+        self._auto_rotation_probe_active = False
+        self._applying_auto_rotation = False
         self._stereo_refresh_revision = 0
         self._last_applied_stereo_refresh_signature: Optional[Tuple[Any, ...]] = None
         self._last_main_repaint_signature: Optional[Tuple[Any, ...]] = None
@@ -106,6 +106,8 @@ class QSgdSwmWindow(QMainWindow):
         self.move_zlabel_in_3D = True
         # When True, the cursor is kept out of the stereo display area.
         self.prevent_cursor_from_stereo_display = True
+        # Persisted UI option for Z text overlay visibility.
+        self._show_z_text_option = True
 
         self._load_ui_option_states()
         # Global filter can be removed on close and must be reinstalled on reopen.
@@ -130,6 +132,8 @@ class QSgdSwmWindow(QMainWindow):
             root = project.layerTreeRoot()
             if root is not None and hasattr(root, 'visibilityChanged'):
                 root.visibilityChanged.connect(self._schedule_layers_sync)  # visibility toggles
+            if hasattr(project, 'readProject'):
+                project.readProject.connect(self._on_project_read)
         try:
             layer_tree_view = self.iface.layerTreeView()
             if layer_tree_view and hasattr(layer_tree_view, 'layerTreeModel'):
@@ -194,6 +198,12 @@ class QSgdSwmWindow(QMainWindow):
             return
         self._startup_layer_sync_done = True
         self._sync_canvases_layers()
+
+    def _on_project_read(self, *_args):
+        """Reload project parameters and reflect them in the existing controls."""
+        del _args
+        self._load_ui_option_states()
+        self._update_control_toolbar_state()
 
     def enterEvent(self, event):
         self._keep_cursor_in_main_qgis_window()
@@ -261,6 +271,11 @@ class QSgdSwmWindow(QMainWindow):
                         root.visibilityChanged.disconnect(self._schedule_layers_sync)
                     except (RuntimeError, TypeError):
                         pass
+                if hasattr(project, 'readProject'):
+                    try:
+                        project.readProject.disconnect(self._on_project_read)
+                    except (RuntimeError, TypeError):
+                        pass
 
             if main_canvas and hasattr(main_canvas, 'xyCoordinates'):
                 try:
@@ -312,38 +327,20 @@ class QSgdSwmWindow(QMainWindow):
         
         super().closeEvent(event)
 
-    @staticmethod
-    def _normalize_signed_angle_deg(angle_deg: float) -> float:
-        """Normalize angle to [-180, 180)."""
-        return ((float(angle_deg) + 180.0) % 360.0) - 180.0
-
-    def _signed_delta_to_nearest_horizontal(self, angle_deg: float) -> float:
-        """
-        Returns signed angular offset to nearest horizontal reference (0 or +/-180).
-        """
-        a = self._normalize_signed_angle_deg(angle_deg)
-        candidates = (0.0, 180.0, -180.0)
-        best_delta = None
-        for target in candidates:
-            delta = self._normalize_signed_angle_deg(a - target)
-            if best_delta is None or abs(delta) < abs(best_delta):
-                best_delta = delta
-        return float(best_delta) if best_delta is not None else 0.0
-
-    def _apply_rotation_to_all_canvases(self, rotation_deg: float, apply_main_canvas: bool = False):
-        """
-        Apply map rotation to stereo canvases and optionally to main canvas.
-        Stereo freeze/unfreeze is handled by the caller when batching updates.
-        """
+    def _apply_rotation_to_all_canvases(self, rotation_deg: float):
+        """Apply the same rotation atomically to the main and stereo canvases."""
+        self._applying_auto_rotation = True
         try:
-            if apply_main_canvas and self.qgis_main_canvas and hasattr(self.qgis_main_canvas, 'setRotation'):
-                self.qgis_main_canvas.setRotation(float(rotation_deg))
-            if self.canvas_left and hasattr(self.canvas_left, 'setRotation'):
-                self.canvas_left.setRotation(float(rotation_deg))
-            if self.canvas_right and hasattr(self.canvas_right, 'setRotation'):
-                self.canvas_right.setRotation(float(rotation_deg))
+            for canvas in (self.qgis_main_canvas, self.canvas_left, self.canvas_right):
+                if canvas and hasattr(canvas, 'setRotation'):
+                    canvas.setRotation(float(rotation_deg))
         except Exception as e:
             QgsMessageLog.logMessage(f"ROT: Error applying canvas rotation: {str(e)}", "SWM-3D", Qgis.Warning)
+        finally:
+            self._applying_auto_rotation = False
+        for canvas in (self.canvas_left, self.canvas_right):
+            if canvas and hasattr(canvas, 'sync_rotation_dependent_overlays'):
+                QTimer.singleShot(0, canvas.sync_rotation_dependent_overlays)
         self._update_main_canvas_north_indicator()
         self._update_control_toolbar_state()
 
@@ -445,65 +442,160 @@ class QSgdSwmWindow(QMainWindow):
         except Exception:
             return True
 
-    def _update_auto_flight_rotation(self, apply_main_canvas: bool = True) -> bool:
+    def _update_auto_flight_rotation(self) -> bool:
         """
-        Computes and applies automatic rotation compensation for tilted flight strips.
+        Probes the WMS frame at the main-canvas center and applies its rotation.
 
-        Calculates the angle of the baseline between left and right photo centers
-        (x0, y0 from perspective transform) and compensates so the baseline becomes
-        horizontal (nearest 0 or 180 degrees).
-
-        Returns True when a new rotation value was applied.
+        The probe uses a direct 25x25 default-style WMS request with a one-metre extent.
+        Its nested event loop keeps this method blocked until the response header
+        arrives (or the request times out), so stereo GetMap requests are made only
+        after the canvas rotations have been decided.
         """
-        if not self._auto_flight_rotation_enabled:
-            if abs(self._flight_rotation_current_deg) < 0.05:
-                self._update_control_toolbar_state()
-                return False
+
+        QgsMessageLog.logMessage('ROT_PROBE: Called.', 'SWM-3D', Qgis.Info)
+
+
+        if self._applying_auto_rotation:
+            QgsMessageLog.logMessage('ROT_PROBE: _applying_auto_rotation.', 'SWM-3D', Qgis.Info)
+            return False
+
+        source_layer = self.canvas_left.layer_swm if self.canvas_left else None
+        if not isinstance(source_layer, QgsRasterLayer) or not source_layer.isValid():
+            QgsMessageLog.logMessage('ROT_PROBE: canvas_left.layer_swm is not available.', 'SWM-3D', Qgis.Info)
+            return False
+
+        threshold = float(self._flight_rotation_threshold_deg)
+        rotation_was_reset = abs(self._flight_rotation_current_deg) >= 0.05
+        if rotation_was_reset:
             self._flight_rotation_current_deg = 0.0
-            self._apply_rotation_to_all_canvases(0.0, apply_main_canvas=apply_main_canvas)
-            return True
+            self._apply_rotation_to_all_canvases(0.0)
 
-        if self._photo_center_left is None or self._photo_center_right is None:
-            self._update_control_toolbar_state()
+        if threshold <= 0.0 or not self._auto_flight_rotation_enabled or not self._is_stereo_projection_active():
+            return rotation_was_reset
+        if self._auto_rotation_probe_active or not self.qgis_main_canvas or not self.network_manager:
             return False
 
-        # Keep flight-strip auto-rotation disabled outside stereo-active scales.
-        if not self._is_stereo_projection_active():
-            target_rotation = 0.0
-            if abs(target_rotation - self._flight_rotation_current_deg) < 0.05:
-                self._update_control_toolbar_state()
+        source_layer_name = source_layer.name()
+
+        try:
+            center = self.qgis_main_canvas.center()
+            source_crs = source_layer.crs()
+            if not source_crs or not source_crs.isValid():
+                QgsMessageLog.logMessage('ROT_PROBE: source WMS CRS is invalid.', 'SWM-3D', Qgis.Warning)
                 return False
-            self._flight_rotation_current_deg = target_rotation
-            self._apply_rotation_to_all_canvases(target_rotation, apply_main_canvas=apply_main_canvas)
-            return True
 
-        x_l, y_l = self._photo_center_left
-        x_r, y_r = self._photo_center_right
-        dx = x_r - x_l
-        dy = y_r - y_l
-        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+            main_crs = self.qgis_main_canvas.mapSettings().destinationCrs()
+            if not main_crs or not main_crs.isValid():
+                QgsMessageLog.logMessage('ROT_PROBE: main canvas CRS is invalid.', 'SWM-3D', Qgis.Warning)
+                return False
+            probe_center = QgsCoordinateTransform(main_crs, source_crs, QgsProject.instance()).transform(
+                QgsPointXY(center)
+            )
+
+            source_query = QUrlQuery(source_layer.source())
+            service_url = source_query.queryItemValue('url', QUrl.ComponentFormattingOption.FullyDecoded)
+            layers = source_query.queryItemValue('layers')
+            if not service_url or not layers:
+                QgsMessageLog.logMessage(
+                    f'ROT_PROBE: WMS URI missing url or layers: {source_layer.source()}',
+                    'SWM-3D', Qgis.Warning,
+                )
+                return False
+
+            wms_url = QUrl(service_url)
+            query = QUrlQuery(wms_url)
+            query.addQueryItem('SERVICE', 'WMS')
+            query.addQueryItem('REQUEST', 'GetMap')
+            query.addQueryItem('VERSION', source_query.queryItemValue('version') or '1.3.0')
+            query.addQueryItem('LAYERS', layers)
+            query.addQueryItem('STYLES', '')
+            query.addQueryItem('CRS', source_crs.authid())
+            query.addQueryItem(
+                'BBOX',
+                f'{probe_center.x() - 0.5},{probe_center.y() - 0.5},'
+                f'{probe_center.x() + 0.5},{probe_center.y() + 0.5}',
+            )
+            query.addQueryItem('WIDTH', '25')
+            query.addQueryItem('HEIGHT', '25')
+            query.addQueryItem('FORMAT', source_query.queryItemValue('format') or 'image/png')
+            wms_url.setQuery(query)
+
+            rotation_angle: Optional[float] = None
+            event_loop = QEventLoop()
+            timeout_timer = QTimer()
+            timeout_timer.setSingleShot(True)
+            probe_reply = None
+
+            def on_finished():
+                nonlocal rotation_angle
+                if probe_reply is None:
+                    return
+                if not probe_reply.hasRawHeader(b'sigrid_rotationangle'):
+                    event_loop.quit()
+                    return
+                try:
+                    rotation_angle = float(probe_reply.rawHeader(b'sigrid_rotationangle').data().decode('utf-8').strip())
+                except (UnicodeDecodeError, ValueError):
+                    pass
+                event_loop.quit()
+
+            def on_timeout():
+                if probe_reply is not None:
+                    probe_reply.abort()
+                event_loop.quit()
+
+            self._auto_rotation_probe_active = True
+            try:
+                timeout_timer.timeout.connect(on_timeout)
+                QgsMessageLog.logMessage(
+                    f"ROT_PROBE: GET layer='{source_layer_name}' {wms_url.toString()}", 'SWM-3D', Qgis.Info,
+                )
+                probe_reply = self.network_manager.get(QNetworkRequest(wms_url))
+                probe_reply.finished.connect(on_finished)
+                timeout_timer.start(15000)
+                event_loop.exec()
+            finally:
+                timeout_timer.stop()
+                if probe_reply is not None:
+                    try:
+                        probe_reply.finished.disconnect(on_finished)
+                    except (RuntimeError, TypeError):
+                        pass
+                    probe_reply.deleteLater()
+                self._auto_rotation_probe_active = False
+
+            if rotation_angle is None:
+                QgsMessageLog.logMessage(
+                    'ROT: No sigrid_rotationangle received from the WMS rotation probe.',
+                    'SWM-3D', Qgis.Warning,
+                )
+                return False
+
+            header_angle = ((rotation_angle + 180.0) % 360.0) - 180.0
+            near_horizontal = abs(header_angle) <= threshold
+            near_reverse_horizontal = abs(abs(header_angle) - 180.0) <= threshold
+            if near_horizontal or near_reverse_horizontal:
+                target_rotation = 0.0
+            elif -90.0 <= header_angle <= 90.0:
+                target_rotation = -header_angle
+            else:
+                target_rotation = 180.0 - header_angle if header_angle > 0.0 else -180.0 - header_angle
+            target_rotation = ((target_rotation + 180.0) % 360.0) - 180.0
+            self._trace(
+                f'ROT: probe angle={header_angle:.2f}° threshold={threshold:.2f}° '
+                f'target={target_rotation:.2f}°'
+            )
+        except Exception as e:
+            self._auto_rotation_probe_active = False
+            QgsMessageLog.logMessage(f'ROT: WMS rotation probe failed: {str(e)}', 'SWM-3D', Qgis.Warning)
             return False
 
-        # Angle of baseline left->right photo center against horizontal
-        strip_angle = self._normalize_signed_angle_deg(math.degrees(math.atan2(dy, dx)))
-        self._trace(
-            f"ROT: photo_center_L=({x_l:.1f},{y_l:.1f}) R=({x_r:.1f},{y_r:.1f}) "
-            f"strip_angle={strip_angle:.2f}°"
-        )
-
-        delta_to_horizontal = self._signed_delta_to_nearest_horizontal(strip_angle)
-        if abs(delta_to_horizontal) > float(self._flight_rotation_threshold_deg):
-            target_rotation = delta_to_horizontal
-        else:
-            target_rotation = 0.0
-
-        target_rotation = self._normalize_signed_angle_deg(target_rotation)
-        if abs(target_rotation - self._flight_rotation_current_deg) < 0.05:
+        if abs(target_rotation) < 0.05:
             self._update_control_toolbar_state()
-            return False
+            return rotation_was_reset
 
         self._flight_rotation_current_deg = target_rotation
-        self._apply_rotation_to_all_canvases(target_rotation, apply_main_canvas=apply_main_canvas)
+        self._apply_rotation_to_all_canvases(target_rotation)
         return True
 
     def _keep_cursor_in_main_qgis_window(self):
@@ -529,7 +621,7 @@ class QSgdSwmWindow(QMainWindow):
             self._stereo_activation_scale_threshold = max(1.0, float(value))
             self._commit_configuration_change()
             self._update_control_toolbar_state()
-            self._update_auto_flight_rotation(apply_main_canvas=True)
+            self._update_auto_flight_rotation()
             self._hard_redraw_stereo_canvases()
         except Exception as e:
             QgsMessageLog.logMessage(f"SWM: Error updating stereo activation scale: {str(e)}", "SWM-3D", Qgis.Warning)
@@ -539,7 +631,7 @@ class QSgdSwmWindow(QMainWindow):
             self._flight_rotation_threshold_deg = max(0.0, min(180.0, float(value)))
             self._commit_configuration_change()
             self._update_control_toolbar_state()
-            self._update_auto_flight_rotation(apply_main_canvas=True)
+            self._update_auto_flight_rotation()
             self._hard_redraw_stereo_canvases()
         except Exception as e:
             QgsMessageLog.logMessage(f"SWM: Error updating flight rotation threshold: {str(e)}", "SWM-3D", Qgis.Warning)
@@ -852,6 +944,7 @@ class QSgdSwmWindow(QMainWindow):
 
     def set_show_z_text(self, visible: bool):
         """Show or hide the Z label overlay on both stereo canvases."""
+        self._show_z_text_option = bool(visible)
         if self.canvas_left:
             self.canvas_left.set_show_z_text_overlay(visible)
         if self.canvas_right:
@@ -902,21 +995,25 @@ class QSgdSwmWindow(QMainWindow):
         if self.prevent_cursor_from_stereo_display:
             self._keep_cursor_in_main_qgis_window()
 
-    def _ui_option_state(self) -> Dict[str, Any]:
+    def _ui_context_option_state(self) -> Dict[str, Any]:
         return {
-            "show_z_text": bool(self.canvas_left and getattr(self.canvas_left, "show_z_text_overlay", True)),
+            "show_z_text": bool(self._show_z_text_option),
             "z_project_plain": bool(self.z_project_plain),
             "move_zlabel_in_3D": bool(self.move_zlabel_in_3D),
             "prevent_cursor_from_stereo_display": bool(self.prevent_cursor_from_stereo_display),
+        }
+
+    def _project_parameter_state(self) -> Dict[str, Any]:
+        return {
             "stereo_activation_scale": float(self._stereo_activation_scale_threshold),
             "flight_rotation_threshold": float(self._flight_rotation_threshold_deg),
         }
 
     def _apply_ui_option_state_to_canvases(self):
         if self.canvas_left:
-            self.canvas_left.set_show_z_text_overlay(bool(self._ui_option_state()["show_z_text"]))
+            self.canvas_left.set_show_z_text_overlay(bool(self._show_z_text_option))
         if self.canvas_right:
-            self.canvas_right.set_show_z_text_overlay(bool(self._ui_option_state()["show_z_text"]))
+            self.canvas_right.set_show_z_text_overlay(bool(self._show_z_text_option))
         if self.prevent_cursor_from_stereo_display:
             self._keep_cursor_in_main_qgis_window()
 
@@ -938,13 +1035,14 @@ class QSgdSwmWindow(QMainWindow):
 
     def _save_ui_option_states(self):
         try:
-            data = json.dumps(self._ui_option_state(), separators=(",", ":"), sort_keys=True)
+            options_data = json.dumps(self._ui_context_option_state(), separators=(",", ":"), sort_keys=True)
             settings = QSettings()
-            settings.setValue("SigridSWM/ui_options", data)
+            settings.setValue("SigridSWM/ui_options", options_data)
 
+            params_data = json.dumps(self._project_parameter_state(), separators=(",", ":"), sort_keys=True)
             project = QgsProject.instance()
             if project:
-                project.writeEntry("SWM-3D", "ui_options", data)
+                project.writeEntry("SWM-3D", "ui_parameters", params_data)
         except Exception:
             pass
 
@@ -975,39 +1073,44 @@ class QSgdSwmWindow(QMainWindow):
             self._flight_rotation_threshold_deg = 10.0
             self._commit_configuration_change()
             self._update_control_toolbar_state()
-            self._update_auto_flight_rotation(apply_main_canvas=True)
+            self._update_auto_flight_rotation()
             self._schedule_layers_sync()
         except Exception:
             pass
 
     def _load_ui_option_states(self):
         try:
-            data = ""
+            options_data = ""
+            settings = QSettings()
+            options_data = settings.value("SigridSWM/ui_options", "", type=str) or ""
+
+            if options_data:
+                parsed_options = json.loads(options_data)
+                if isinstance(parsed_options, dict):
+                    self._show_z_text_option = bool(parsed_options.get("show_z_text", True))
+                    self._apply_loaded_bool("z_project_plain", parsed_options.get("z_project_plain"), default=True)
+                    self._apply_loaded_bool("move_zlabel_in_3D", parsed_options.get("move_zlabel_in_3D"), default=True)
+                    self._apply_loaded_bool("prevent_cursor_from_stereo_display", parsed_options.get("prevent_cursor_from_stereo_display"), default=True)
+
+            params_data = ""
             project = QgsProject.instance()
             if project:
-                txt, ok = project.readEntry("SWM-3D", "ui_options", "")
+                txt, ok = project.readEntry("SWM-3D", "ui_parameters", "")
                 if ok and txt:
-                    data = txt
+                    params_data = txt
 
-            if not data:
-                settings = QSettings()
-                data = settings.value("SigridSWM/ui_options", "", type=str) or ""
+                # Backward-compatible fallback: old combined project key.
+                if not params_data:
+                    legacy_txt, legacy_ok = project.readEntry("SWM-3D", "ui_options", "")
+                    if legacy_ok and legacy_txt:
+                        params_data = legacy_txt
 
-            if not data:
-                self._apply_ui_option_state_to_canvases()
-                return
+            if params_data:
+                parsed_params = json.loads(params_data)
+                if isinstance(parsed_params, dict):
+                    self._apply_loaded_float("_stereo_activation_scale_threshold", parsed_params.get("stereo_activation_scale"), default=100000.0, min_val=1.0)
+                    self._apply_loaded_float("_flight_rotation_threshold_deg", parsed_params.get("flight_rotation_threshold"), default=10.0, min_val=0.0, max_val=180.0)
 
-            parsed = json.loads(data)
-            if not isinstance(parsed, dict):
-                self._apply_ui_option_state_to_canvases()
-                return
-
-            self._apply_loaded_bool("show_z_text", parsed.get("show_z_text"), default=True)
-            self._apply_loaded_bool("z_project_plain", parsed.get("z_project_plain"), default=True)
-            self._apply_loaded_bool("move_zlabel_in_3D", parsed.get("move_zlabel_in_3D"), default=True)
-            self._apply_loaded_bool("prevent_cursor_from_stereo_display", parsed.get("prevent_cursor_from_stereo_display"), default=True)
-            self._apply_loaded_float("_stereo_activation_scale_threshold", parsed.get("stereo_activation_scale"), default=100000.0, min_val=1.0)
-            self._apply_loaded_float("_flight_rotation_threshold_deg", parsed.get("flight_rotation_threshold"), default=10.0, min_val=0.0, max_val=180.0)
             self._apply_ui_option_state_to_canvases()
         except Exception:
             self._apply_ui_option_state_to_canvases()
@@ -1079,10 +1182,11 @@ class QSgdSwmWindow(QMainWindow):
         except Exception:
             pass
 
-    def _on_main_canvas_crs_changed(self, *args):
+    def _on_main_canvas_crs_changed(self, *_args):
         """
         Reacts to main canvas destination CRS changes.
         """
+        del _args
         self._sync_canvases_destination_crs()
         self._sync_canvases_repaint()
 
@@ -1185,6 +1289,12 @@ class QSgdSwmWindow(QMainWindow):
         except Exception:
             pass
 
+        # sync_layers() initializes canvas_left.layer_swm. Probe only after that
+        # initialization has completed, still before applying stereo extents.
+        rotation_changed = False
+        if self._flight_rotation_threshold_deg > 0.0:
+            rotation_changed = self._update_auto_flight_rotation()
+
         extent_changed = False
 
         self._sync_canvases_destination_crs()
@@ -1201,8 +1311,6 @@ class QSgdSwmWindow(QMainWindow):
                 self.canvas_right.setExtent(extent_right)
                 extent_changed = True
 
-        # Re-evaluate strip rotation in the same zoom/pan cycle.
-        rotation_changed = self._update_auto_flight_rotation()
         self._trace(f"REPAINT: post-update rotation_changed={rotation_changed}")
 
         # Avoid redundant explicit refresh when extent/rotation already triggered render.
@@ -1245,11 +1353,12 @@ class QSgdSwmWindow(QMainWindow):
         # immediately even when no pan/zoom occurs next.
         self._schedule_canvas_refresh()
 
-    def _schedule_layers_sync(self, *args):
+    def _schedule_layers_sync(self, *_args):
         """
         Coalesces rapid layer/tree events into a single sync pass.
         This prevents duplicate sync_layers() calls for one user action.
         """
+        del _args
         if self._layers_rolling_back:
             self._trace("LAYER_SYNC: schedule skipped (rollback active)")
             return
@@ -1273,36 +1382,6 @@ class QSgdSwmWindow(QMainWindow):
             return f"style={style} bbox={bbox} size={w}x{h}"
         except Exception:
             return "style=? bbox=? size=?"
-
-    @staticmethod
-    def _extract_wms_bbox(request_url: str) -> Optional[str]:
-        """Extract raw BBOX value from a WMS URL (encoded string)."""
-        try:
-            bbox_m = re.search(r'(?:[?&])BBOX=([^&]+)', request_url, flags=re.IGNORECASE)
-            if not bbox_m:
-                return None
-            return bbox_m.group(1)
-        except Exception:
-            return None
-
-    def _update_auto_rotation_for_matched_stereo_bbox(self) -> bool:
-        """
-        Applies strip auto-rotation once both LEFT/RIGHT replies are available
-        for the same BBOX. This guarantees we do not mix photo centers from
-        different requests.
-        """
-        bbox_left = self._last_photo_bbox_left
-        bbox_right = self._last_photo_bbox_right
-        if not bbox_left or not bbox_right:
-            return False
-        if bbox_left != bbox_right:
-            return False
-        if self._last_rotation_bbox_applied == bbox_left:
-            return False
-
-        self._last_rotation_bbox_applied = bbox_left
-        rotation_changed = self._update_auto_flight_rotation(apply_main_canvas=True)
-        return rotation_changed
 
     def _update_digitizing_layer_hooks(self):
         """
@@ -1354,7 +1433,9 @@ class QSgdSwmWindow(QMainWindow):
         Connects renderer/style change signals for one Z-enabled layer.
         """
         try:
-            style_slot = lambda *args, lyr=layer: self._on_layer_style_changed(lyr)
+            def style_slot(*_args, lyr=layer):
+                del _args
+                self._on_layer_style_changed(lyr)
 
             if hasattr(layer, 'rendererChanged'):
                 layer.rendererChanged.connect(style_slot)
@@ -1842,7 +1923,6 @@ class QSgdSwmWindow(QMainWindow):
         if not is_swm_reply:
             return
         self._trace(f"NET: accepted SWM {self._extract_wms_request_brief(request_url)}")
-        request_bbox = self._extract_wms_bbox(request_url)
         # Sure it is a SWM plugin WMS request layer
         if is_photo_left:
             # Get projection plane Z value from the reply headers. Only left, need not read twice
@@ -1857,11 +1937,6 @@ class QSgdSwmWindow(QMainWindow):
             self._set_projection_plane_z(z_proj_plane)
             if self.canvas_left:
                 self.canvas_left.update_data_from_wms_header(reply)
-                trf_left = self.canvas_left.trf_wld2prp
-                if trf_left:
-                    self._photo_center_left = (trf_left.x0, trf_left.y0)
-            self._last_photo_bbox_left = request_bbox
-            self._update_auto_rotation_for_matched_stereo_bbox()
             if not self._has_received_swm_reply:
                 self._has_received_swm_reply = True
                 # This timer waits for the next Qt event-loop cycle
@@ -1869,11 +1944,6 @@ class QSgdSwmWindow(QMainWindow):
         else:
             if self.canvas_right:
                 self.canvas_right.update_data_from_wms_header(reply)
-                trf_right = self.canvas_right.trf_wld2prp
-                if trf_right:
-                    self._photo_center_right = (trf_right.x0, trf_right.y0)
-            self._last_photo_bbox_right = request_bbox
-            self._update_auto_rotation_for_matched_stereo_bbox()
 
     def keyPressEvent(self, event):
         """Only used to exit FullScreen mode."""

@@ -14,8 +14,8 @@ from typing import Callable, Dict, Optional, Tuple
 
 from qgis.core import QgsProject, QgsLayerTreeGroup, QgsLayerTreeLayer, Qgis, QgsMessageLog
 from qgis.PyQt.QtCore import QSize, Qt, QSignalBlocker, QRect, QEvent, QTimer, QSettings, QT_VERSION_STR
-from qgis.PyQt.QtGui import QIcon, QColor
-from qgis.PyQt.QtWidgets import QLabel, QDoubleSpinBox, QHBoxLayout, QMenu, QAction, QWidgetAction, QToolButton, QWidget, QSizePolicy, QStyledItemDelegate, QStyleOptionViewItem, QStyle, QStyleOptionButton, QFrame, QToolBar
+from qgis.PyQt.QtGui import QIcon, QColor, QDoubleValidator
+from qgis.PyQt.QtWidgets import QLabel, QLineEdit, QHBoxLayout, QMenu, QAction, QWidgetAction, QToolButton, QWidget, QSizePolicy, QStyledItemDelegate, QStyleOptionViewItem, QStyle, QStyleOptionButton, QFrame, QToolBar
 
 from .utils import is_sgd_swm_layer
 
@@ -949,13 +949,13 @@ class StereoCanvasToolbar:
         activation_lbl = QLabel("Stereo active scale")
         activation_lbl.setMinimumWidth(160)
         activation_param_layout.addWidget(activation_lbl)
-        activation_spin = QDoubleSpinBox()
-        activation_spin.setDecimals(0)
-        activation_spin.setRange(1.0, 1000000000.0)
-        activation_spin.setSingleStep(1000.0)
-        activation_spin.setFixedWidth(120)
-        activation_spin.valueChanged.connect(self._on_activation_scale_changed)
-        activation_param_layout.addWidget(activation_spin)
+        activation_edit = QLineEdit()
+        activation_edit.setValidator(QDoubleValidator(1.0, 1000000000.0, 0, activation_edit))
+        activation_edit.setFixedWidth(120)
+        activation_edit.editingFinished.connect(
+            lambda edit=activation_edit: self._on_activation_scale_changed(edit)
+        )
+        activation_param_layout.addWidget(activation_edit)
         activation_param_action = QWidgetAction(params_menu)
         activation_param_action.setDefaultWidget(activation_param_widget)
         params_menu.addAction(activation_param_action)
@@ -964,17 +964,16 @@ class StereoCanvasToolbar:
         rotation_param_layout = QHBoxLayout(rotation_param_widget)
         rotation_param_layout.setContentsMargins(8, 4, 8, 4)
         rotation_param_layout.setSpacing(8)
-        rotation_lbl = QLabel("Rotate canvas level")
+        rotation_lbl = QLabel("Rotate canvas level (deg)")
         rotation_lbl.setMinimumWidth(160)
         rotation_param_layout.addWidget(rotation_lbl)
-        rotation_spin = QDoubleSpinBox()
-        rotation_spin.setDecimals(1)
-        rotation_spin.setRange(0.0, 180.0)
-        rotation_spin.setSingleStep(0.5)
-        rotation_spin.setSuffix(" deg")
-        rotation_spin.setFixedWidth(100)
-        rotation_spin.valueChanged.connect(self._on_rotation_threshold_changed)
-        rotation_param_layout.addWidget(rotation_spin)
+        rotation_edit = QLineEdit()
+        rotation_edit.setValidator(QDoubleValidator(0.0, 180.0, 0, rotation_edit))
+        rotation_edit.setFixedWidth(100)
+        rotation_edit.editingFinished.connect(
+            lambda edit=rotation_edit: self._on_rotation_threshold_changed(edit)
+        )
+        rotation_param_layout.addWidget(rotation_edit)
         rotation_param_action = QWidgetAction(params_menu)
         rotation_param_action.setDefaultWidget(rotation_param_widget)
         params_menu.addAction(rotation_param_action)
@@ -1022,7 +1021,7 @@ class StereoCanvasToolbar:
         options_menu.addAction(action_restore_defaults)
 
         options_button = QToolButton(content_widget)
-        options_button.setText("Configuration checkboxes")
+        options_button.setText("Configuration options")
         options_button.setMenu(options_menu)
         options_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         options_button.setToolTip("Display options")
@@ -1039,8 +1038,8 @@ class StereoCanvasToolbar:
         content_layout.addWidget(close_button)
 
         self._icon_label = icon_label
-        self._activation_scale_spin = activation_spin
-        self._rotation_threshold_spin = rotation_spin
+        self._activation_scale_spin = activation_edit
+        self._rotation_threshold_spin = rotation_edit
         self._current_rotation_label = current_rotation_label
         self._z_status_label = z_status_label
         self._params_button = params_button
@@ -1170,14 +1169,10 @@ class StereoCanvasToolbar:
             return
 
         if self._activation_scale_spin is not None:
-            blocker = QSignalBlocker(self._activation_scale_spin)
-            self._activation_scale_spin.setValue(float(self.window._stereo_activation_scale_threshold))
-            del blocker
+            self._activation_scale_spin.setText(str(int(self.window._stereo_activation_scale_threshold)))
 
         if self._rotation_threshold_spin is not None:
-            blocker = QSignalBlocker(self._rotation_threshold_spin)
-            self._rotation_threshold_spin.setValue(float(self.window._flight_rotation_threshold_deg))
-            del blocker
+            self._rotation_threshold_spin.setText(str(int(self.window._flight_rotation_threshold_deg)))
 
         if self._current_rotation_label is not None:
             self._current_rotation_label.setText(
@@ -1210,13 +1205,30 @@ class StereoCanvasToolbar:
         if self._z_status_label is not None:
             self._z_status_label.setText(f"Zbase={float(z_base):.1f} Zcurs={float(z_cursor):.1f}")
 
-    def _on_activation_scale_changed(self, value):
+    def _on_activation_scale_changed(self, edit):
+        try:
+            value = float(edit.text())
+        except ValueError:
+            self.refresh()
+            return
         if self.window:
-            self.window._set_stereo_activation_scale_threshold(float(value))
+            self.window._set_stereo_activation_scale_threshold(value)
+        self._clear_parameter_focus(edit)
 
-    def _on_rotation_threshold_changed(self, value):
+    def _on_rotation_threshold_changed(self, edit):
+        try:
+            value = float(edit.text())
+        except ValueError:
+            self.refresh()
+            return
         if self.window:
-            self.window._set_flight_rotation_threshold_deg(float(value))
+            self.window._set_flight_rotation_threshold_deg(value)
+        self._clear_parameter_focus(edit)
+
+    def _clear_parameter_focus(self, spin):
+        """Return keyboard focus to the toolbar after a parameter edit."""
+        if spin is not None and hasattr(spin, 'clearFocus'):
+            spin.clearFocus()
 
     def _on_show_z_text_toggled(self, checked: bool):
         if self.window:

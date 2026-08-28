@@ -35,9 +35,10 @@ QgsSgdSwmCanvas (plugin)
 from qgis.core import QgsMessageLog, Qgis  # for debug messages.
 from qgis.gui import QgsMapCanvas, QgsVertexMarker, QgsRubberBand, QgsMapCanvasItem
 from qgis.core import QgsWkbTypes, QgsGeometry, QgsRasterLayer, QgsVectorLayer, QgsPoint, QgsPointXY, QgsFeatureRequest
+from qgis.core import QgsRectangle
 from qgis.core import QgsSymbol, QgsSingleSymbolRenderer, QgsGeometryGeneratorSymbolLayer
 from qgis.core import QgsCoordinateTransform, QgsCoordinateReferenceSystem, QgsProject
-from qgis.PyQt.QtGui import QColor, QWheelEvent, QImage, QPainter, QPixmap, QPen
+from qgis.PyQt.QtGui import QColor, QWheelEvent, QImage, QPainter, QPixmap, QPen, QTransform
 from qgis.PyQt.QtCore import Qt, QTimer
 from typing import Optional, Any, Dict, List, Tuple, cast
 import hashlib
@@ -123,6 +124,8 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         self._swm_layer_cache: Dict[str, QgsRasterLayer] = {}
         self._z_layer_cache: Dict[str, QgsVectorLayer] = {}
         self.limits = None
+        self._pending_limits_update = False
+        self._limits_extent_passes = 0
         self.z_text = ""  # Z cursor text
         self.show_z_text_overlay = True  # Whether the Z label overlay is drawn
         self._z_text_world_anchor_xy: Optional[QgsPointXY] = None
@@ -364,7 +367,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
     def sync_rotation_dependent_overlays(self):
         """Recalculate overlays after a programmatic map rotation."""
         self._update_z_text_world_anchor()
-        self.render_complete()
+        self.schedule_limits_update()
         self.update()
 
     def _project_z_text_baseline(self, metrics) -> Tuple[int, int]:
@@ -1868,18 +1871,49 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         """Override to intercept all refresh calls for duplicate-request deduplication."""
         super().refresh()
 
-    def render_complete(self):
-        # Draws a rectangle corresponding to the main canvas extent in this canvas
-        # TODO: Fails. Rubber band?
+    def schedule_limits_update(self):
+        """Defers the limits rubber band until the canvas rotation is known and applied."""
+        self._pending_limits_update = True
+        QTimer.singleShot(0, self._flush_pending_limits_update)
 
-        if self.parent and not self.parent.isVisible():
+    def reset_extent_convergence(self):
+        """Re-enables extent corrections driven by newly received WMS transforms."""
+        self._limits_extent_passes = 0
+
+    def _flush_pending_limits_update(self):
+        """Draws the deferred limits once no rotation probe/apply pass is in flight."""
+        if not self._pending_limits_update:
             return
+        parent = self.parent
+        if parent is not None and (
+            getattr(parent, '_applying_auto_rotation', False)
+            or getattr(parent, '_auto_rotation_probe_active', False)
+        ):
+            QTimer.singleShot(50, self._flush_pending_limits_update)
+            return
+        self._pending_limits_update = False
+        # A fresh WMS transform moves the projected footprint; re-align the extent a
+        # bounded number of times so the correction always converges.
+        if self._limits_extent_passes < 2:
+            self._limits_extent_passes += 1
+            self.apply_main_canvas_matching_extent()
+        self.render_complete()
 
+    def _main_canvas_limits_polygon(self) -> Optional[List[QgsPointXY]]:
+        """
+        Closed polygon of the main-canvas viewport expressed in this canvas map CRS.
+
+        The corners are taken after the main canvas rotation, reprojected to the SWM
+        world CRS and, when the stereo projection is active, pushed through the
+        photogrammetric transform at the projection-plane Z (ZBase). The cursor Z is
+        not used here: it moves with the wheel, while the imagery of both canvases is
+        rectified onto the fixed projection plane.
+        """
         main_transform = self.qgis_main_canvas.getCoordinateTransform()
         main_width = self.qgis_main_canvas.width()
         main_height = self.qgis_main_canvas.height()
         if not main_transform or main_width <= 0 or main_height <= 0:
-            return
+            return None
 
         # extent() is an unrotated bounding box. Convert the visible viewport
         # corners after the main canvas rotation to preserve its actual outline.
@@ -1893,27 +1927,110 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         limits_geometry = self._reproject_geometry_to_world(
             QgsGeometry.fromPolygonXY([main_viewport_polygon])
         )
-        if self.trf_wld2prp and self._is_stereo_projection_active():
-            try:
-                z_cursor = float(getattr(self.parent, 'z_cursor', 0.0)) if self.parent else 0.0
-                projected_points = []
-                limits_const_geometry = limits_geometry.constGet()
-                vertex_count = limits_const_geometry.vertexCount() if limits_const_geometry else 0
-                for vertex_index in range(vertex_count):
-                    point = limits_geometry.vertexAt(vertex_index)
-                    photo_point = self.trf_wld2prp.execute_prp_wrl2pht(QgsPoint(point.x(), point.y(), z_cursor))
-                    if photo_point is None:
-                        projected_points = []
-                        break
-                    projected_point = self.trf_wld2prp.execute_pht2prp(photo_point)
-                    if projected_point is None:
-                        projected_points = []
-                        break
-                    projected_points.append(projected_point)
-                if len(projected_points) >= 4:
-                    limits_geometry = QgsGeometry.fromPolygonXY([projected_points])
-            except Exception:
-                pass
+
+        const_geometry = limits_geometry.constGet()
+        vertex_count = const_geometry.vertexCount() if const_geometry else 0
+        if vertex_count < 4:
+            return None
+
+        world_points = [
+            QgsPointXY(limits_geometry.vertexAt(i).x(), limits_geometry.vertexAt(i).y())
+            for i in range(vertex_count)
+        ]
+
+        if not self.trf_wld2prp or not self._is_stereo_projection_active():
+            return world_points
+
+        try:
+            z_base = float(getattr(self.parent, '_z_proj_plane', 0.0)) if self.parent else 0.0
+            projected_points: List[QgsPointXY] = []
+            for point in world_points:
+                photo_point = self.trf_wld2prp.execute_prp_wrl2pht(QgsPoint(point.x(), point.y(), z_base))
+                if photo_point is None:
+                    return world_points
+                projected_point = self.trf_wld2prp.execute_pht2prp(photo_point)
+                if projected_point is None:
+                    return world_points
+                projected_points.append(projected_point)
+            return projected_points
+        except Exception:
+            return world_points
+
+    def main_canvas_matching_extent(self) -> Optional[QgsRectangle]:
+        """
+        Extent to apply to this stereo canvas so it covers the same ground as the
+        main canvas, once the photogrammetric projection and the canvas rotation
+        (applied around the extent centre) are taken into account.
+        """
+        polygon = self._main_canvas_limits_polygon()
+        if not polygon:
+            return None
+
+        try:
+            unique_points = polygon[:-1] if len(polygon) > 4 and polygon[0] == polygon[-1] else polygon
+            if len(unique_points) < 4:
+                return None
+
+            center_x = sum(p.x() for p in unique_points) / len(unique_points)
+            center_y = sum(p.y() for p in unique_points) / len(unique_points)
+
+            rotation = float(self.rotation()) if hasattr(self, 'rotation') else 0.0
+            if abs(rotation) >= 0.05:
+                # QgsMapSettings rotates the extent by -rotation around its centre,
+                # so the extent is recovered by rotating the visible quad by +rotation.
+                transform = QTransform()
+                transform.translate(center_x, center_y)
+                transform.rotate(rotation)
+                transform.translate(-center_x, -center_y)
+                mapped = [transform.map(p.x(), p.y()) for p in unique_points]
+            else:
+                mapped = [(p.x(), p.y()) for p in unique_points]
+
+            xs = [x for x, _ in mapped]
+            ys = [y for _, y in mapped]
+            extent = QgsRectangle(min(xs), min(ys), max(xs), max(ys))
+            if extent.width() <= 0 or extent.height() <= 0:
+                return None
+            return extent
+        except Exception:
+            return None
+
+    def apply_main_canvas_matching_extent(self) -> Optional[bool]:
+        """
+        Applies the extent matching the main canvas view.
+        Returns None when it cannot be computed, False when no change was needed.
+        """
+        extent = self.main_canvas_matching_extent()
+        if extent is None:
+            return None
+
+        # extent() reports the aspect-adjusted rectangle, so equivalence is checked on
+        # centre and map units per pixel instead of on the raw rectangle corners.
+        current = self.extent()
+        if current is not None and not current.isEmpty() and self.width() > 0 and self.height() > 0:
+            target_mupp = max(extent.width() / self.width(), extent.height() / self.height())
+            current_mupp = float(self.mapUnitsPerPixel())
+            tolerance = max(current_mupp, target_mupp) * 0.5
+            if (
+                abs(current.center().x() - extent.center().x()) <= tolerance
+                and abs(current.center().y() - extent.center().y()) <= tolerance
+                and abs(current_mupp - target_mupp) <= max(current_mupp, target_mupp) * 0.001
+            ):
+                return False
+
+        self.setExtent(extent)
+        return True
+
+    def render_complete(self):
+        """Draws a rectangle corresponding to the main canvas extent in this canvas."""
+
+        if self.parent and not self.parent.isVisible():
+            return
+
+        limits_polygon = self._main_canvas_limits_polygon()
+        if not limits_polygon:
+            return
+        limits_geometry = QgsGeometry.fromPolygonXY([limits_polygon])
 
         # Keep and update a single rubber band instance to avoid scene mismatch warnings.
         needs_new_limits = self.limits is None
@@ -2232,6 +2349,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         if self._pending_z_update:
             self._pending_z_update = False
             self._apply_current_transform_to_z_layers()
+        self._flush_pending_limits_update()
 
     def update_data_from_wms_header(self, reply):
         """
@@ -2271,4 +2389,4 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         # ALL layers (including WMS) BEFORE the cache is populated, issuing a second
         # WMS GetMap request for every zoom/pan — which is exactly what we must prevent.
         self._pending_z_update = True
-        self.render_complete()
+        self.schedule_limits_update()

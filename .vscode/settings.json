@@ -1,13 +1,10 @@
 {
   "python.analysis.extraPaths": [
     "C:/OSGeo4W/apps/qgis/python",
-    "C:/OSGeo4W64/apps/qgis/python", 
-    "C:/Program Files/QGIS 3.34/apps/qgis/python",
-    "C:/Program Files/QGIS 3.32/apps/qgis/python",
-    "C:/Program Files/QGIS 3.30/apps/qgis/python",
-    "C:/OSGeo4W/apps/Python39/Lib/site-packages",
-    "C:/OSGeo4W64/apps/Python39/Lib/site-packages"
+    "C:/OSGeo4W/apps/qgis-ltr/python",
+    "C:/OSGeo4W/apps/Python312/Lib/site-packages"
   ],
+  "python.defaultInterpreterPath": "C:/OSGeo4W/apps/Python312/python.exe",
   "python.analysis.typeCheckingMode": "basic",
   "python.analysis.diagnosticSeverityOverrides": {
     "reportAttributeAccessIssue": "none",

@@ -134,6 +134,8 @@ class QSgdSwmWindow(QMainWindow):
                 root.visibilityChanged.connect(self._schedule_layers_sync)  # visibility toggles
             if hasattr(project, 'readProject'):
                 project.readProject.connect(self._on_project_read)
+            if hasattr(project, 'writeProject'):
+                project.writeProject.connect(self._on_project_write)
         try:
             layer_tree_view = self.iface.layerTreeView()
             if layer_tree_view and hasattr(layer_tree_view, 'layerTreeModel'):
@@ -205,6 +207,25 @@ class QSgdSwmWindow(QMainWindow):
         self._load_ui_option_states()
         self._update_control_toolbar_state()
 
+    def _on_project_write(self, dom_document, *_args):
+        """Forces the persisted main-canvas rotation to 0; it is only a temporary flight-heading aid."""
+        del _args
+        try:
+            canvas_name = self.qgis_main_canvas.objectName() if self.qgis_main_canvas else "theMapCanvas"
+            mapcanvas_nodes = dom_document.elementsByTagName("mapcanvas")
+            for i in range(mapcanvas_nodes.length()):
+                mapcanvas_elem = mapcanvas_nodes.item(i).toElement()
+                if mapcanvas_elem.isNull() or mapcanvas_elem.attribute("name") != canvas_name:
+                    continue
+                rotation_elem = mapcanvas_elem.firstChildElement("rotation")
+                if rotation_elem.isNull():
+                    continue
+                while rotation_elem.hasChildNodes():
+                    rotation_elem.removeChild(rotation_elem.firstChild())
+                rotation_elem.appendChild(dom_document.createTextNode("0"))
+        except Exception as e:
+            QgsMessageLog.logMessage(f"ROT: Error zeroing saved canvas rotation: {str(e)}", "SWM-3D", Qgis.Warning)
+
     def enterEvent(self, event):
         self._keep_cursor_in_main_qgis_window()
         super().enterEvent(event)
@@ -274,6 +295,11 @@ class QSgdSwmWindow(QMainWindow):
                 if hasattr(project, 'readProject'):
                     try:
                         project.readProject.disconnect(self._on_project_read)
+                    except (RuntimeError, TypeError):
+                        pass
+                if hasattr(project, 'writeProject'):
+                    try:
+                        project.writeProject.disconnect(self._on_project_write)
                     except (RuntimeError, TypeError):
                         pass
 
@@ -1245,6 +1271,26 @@ class QSgdSwmWindow(QMainWindow):
                                      "SWM-3D", Qgis.Warning)
             return extent
 
+    def _apply_stereo_canvas_extent(self, target_canvas) -> bool:
+        """
+        Applies to a stereo canvas the extent that shows the same ground as the main
+        canvas. Computed after the flight rotation is resolved, so it uses the active
+        photogrammetric transform; falls back to a plain CRS reprojection otherwise.
+        Returns True when the extent was modified.
+        """
+        target_canvas.reset_extent_convergence()
+        applied = target_canvas.apply_main_canvas_matching_extent()
+        if applied is not None:
+            target_canvas.schedule_limits_update()
+            return bool(applied)
+
+        extent = self._reproject_extent_to_stereo_crs(self.qgis_main_canvas.extent(), target_canvas)
+        changed = target_canvas.extent() != extent
+        if changed:
+            target_canvas.setExtent(extent)
+        target_canvas.schedule_limits_update()
+        return changed
+
     def _sync_canvases_cursor(self, point_xy):
         """
         Synchronizes the cursor position (XY) of the main QGIS canvas into the two steresocopic canvas.
@@ -1298,17 +1344,10 @@ class QSgdSwmWindow(QMainWindow):
         extent_changed = False
 
         self._sync_canvases_destination_crs()
-        if self.canvas_left:
-            extent_left = self._reproject_extent_to_stereo_crs(self.qgis_main_canvas.extent(), self.canvas_left)
-            current_left_extent = self.canvas_left.extent()
-            if current_left_extent != extent_left:
-                self.canvas_left.setExtent(extent_left)
-                extent_changed = True
-        if self.canvas_right:
-            extent_right = self._reproject_extent_to_stereo_crs(self.qgis_main_canvas.extent(), self.canvas_right)
-            current_right_extent = self.canvas_right.extent()
-            if current_right_extent != extent_right:
-                self.canvas_right.setExtent(extent_right)
+        for canvas in (self.canvas_left, self.canvas_right):
+            if not canvas:
+                continue
+            if self._apply_stereo_canvas_extent(canvas):
                 extent_changed = True
 
         self._trace(f"REPAINT: post-update rotation_changed={rotation_changed}")

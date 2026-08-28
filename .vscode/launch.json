@@ -9,7 +9,8 @@
         
         {
             "name": "Attach QGIS - SWM-3D",
-            "type": "python",
+            // "type": "python",
+            "type": "debugpy",
             "request": "attach",
             "connect": {
                 "host": "localhost",

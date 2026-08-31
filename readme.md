@@ -73,6 +73,10 @@ Expected behavior:
 
 ## 5. Changes
 
+### Version 0.7.4
+
+- Plugin toolbox problems resolved.
+
 ### Version 0.7.3
 
 - Plugin toolbox problems resolved.

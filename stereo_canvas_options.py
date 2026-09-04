@@ -1176,7 +1176,7 @@ class StereoCanvasToolbar:
 
         if self._current_rotation_label is not None:
             self._current_rotation_label.setText(
-                f"Current rot: {float(self.window._flight_rotation_current_deg):.1f}°"
+                f"Current rot: {float(self.window._flight_rotation_last_applied_deg):.1f}°"
             )
 
         if self._action_show_z_text is not None:

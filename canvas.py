@@ -115,9 +115,10 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         self.vertex_marker_fixed_z: Dict[QgsMapCanvasItem, float] = {}
         self.vertex_marker_last_center: Dict[QgsMapCanvasItem, QgsPointXY] = {}
         self.vertex_marker_rb_match: Dict[QgsMapCanvasItem, Tuple[QgsRubberBand, int]] = {}
-        self._canvas_items_sync_active = True
-        
-        self._setup_canvas_items_sync()
+        # Item sync stays closed until the window releases its startup semaphore:
+        # syncing main-canvas items into a half-constructed canvas crashes Qt.
+        self._canvas_items_sync_active = False
+        self._canvas_items_signals_connected = False
 
         self.layer_swm = None
         self.layers_z = []
@@ -164,6 +165,18 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         self.scaleChanged.connect(self._update_z_text_world_anchor)
         QTimer.singleShot(0, self._update_z_text_world_anchor)
 
+        # Signals are attached only now that every attribute exists; the actual
+        # syncing still waits for the parent window semaphore.
+        self._setup_canvas_items_sync()
+
+    def _parent_sync_blocked(self) -> bool:
+        """True while the parent window holds the startup/shutdown semaphore."""
+        checker = getattr(self.parent, '_project_sync_blocked', None) if self.parent else None
+        try:
+            return bool(checker()) if callable(checker) else False
+        except Exception:
+            return False
+
     def _is_stereo_projection_active(self) -> bool:
         """Delegates stereo activation to the parent window when available."""
         try:
@@ -179,6 +192,8 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
 
     def _capture_base_buffer(self):
         """Capture the latest raw map image from viewport (no custom paintEvent post-processing)."""
+        if self._parent_sync_blocked():
+            return
         try:
             viewport = self.viewport()
             if viewport is None:
@@ -359,8 +374,12 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
                 return
 
             x_px, y_px = self._z_text_insertion_pixel()
-            map_anchor_xy = coord_transform.toMapCoordinates(x_px, y_px)
-            self._z_text_world_anchor_xy = self._reproject_point_to_world(map_anchor_xy)
+            projection_anchor_xy = coord_transform.toMapCoordinates(x_px, y_px)
+            z_base = float(getattr(self.parent, '_z_proj_plane', 0.0)) if self.parent else 0.0
+            if self.trf_wld2prp and self._is_stereo_projection_active():
+                self._z_text_world_anchor_xy = self.trf_wld2prp.execute_prp2wrl_at_z(projection_anchor_xy, z_base)
+            else:
+                self._z_text_world_anchor_xy = self._reproject_point_to_world(projection_anchor_xy)
         except Exception:
             self._z_text_world_anchor_xy = None
 
@@ -377,8 +396,6 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         x_px, y_px = self._z_text_insertion_pixel()
 
         move_zlabel_in_3D = bool(getattr(self.parent, 'move_zlabel_in_3D', True)) if self.parent else True
-        if abs(float(self.rotation())) >= 0.05:
-            move_zlabel_in_3D = False
         if move_zlabel_in_3D and self._z_text_world_anchor_xy and self.trf_wld2prp and self.parent and self._is_stereo_projection_active():
             try:
                 z_cursor = float(getattr(self.parent, 'z_cursor', 0.0))
@@ -414,26 +431,27 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         """
         Configures automatic synchronization of map canvas items from the main canvas.
         """
-        # Perform initial synchronization
+        if not self._canvas_items_signals_connected:
+            self._canvas_items_signals_connected = True
+
+            # Connect to main canvas signals for reactive synchronization
+            if hasattr(self.qgis_main_canvas, 'mapCanvasRefreshed'):
+                self.qgis_main_canvas.mapCanvasRefreshed.connect(self._sync_canvas_items)
+
+            # Connect to scene signals to detect item changes
+            if hasattr(self.qgis_main_canvas, 'scene') and self.qgis_main_canvas.scene():
+                scene = self.qgis_main_canvas.scene()
+                if hasattr(scene, 'changed'):
+                    scene.changed.connect(self._on_scene_changed)
+
+        # No-op while the parent semaphore is held.
         self._sync_canvas_items()
-        
-        # Connect to main canvas signals for reactive synchronization
-        if hasattr(self.qgis_main_canvas, 'mapCanvasRefreshed'):
-            self.qgis_main_canvas.mapCanvasRefreshed.connect(self._sync_canvas_items)
-        
-        # Connect to scene signals to detect item changes
-        if hasattr(self.qgis_main_canvas, 'scene') and self.qgis_main_canvas.scene():
-            scene = self.qgis_main_canvas.scene()
-            if hasattr(scene, 'changed'):
-                scene.changed.connect(self._on_scene_changed)
-        
-        # Startup sync configured.
 
     def _on_scene_changed(self, regions):
         """
         Handles changes in the main canvas scene.
         """
-        if not self._canvas_items_sync_active:
+        if not self._canvas_items_sync_active or self._parent_sync_blocked():
             return
 
         # Ignore queued scene signals from stale/tearing-down scenes.
@@ -454,7 +472,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         """
         Synchronizes all map canvas items from the main canvas with this canvas.
         """
-        if not self._canvas_items_sync_active:
+        if not self._canvas_items_sync_active or self._parent_sync_blocked():
             return
 
         # Prevent concurrent synchronization
@@ -1388,6 +1406,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             self._setup_canvas_items_sync()
         else:
             self._canvas_items_sync_active = False
+            self._canvas_items_signals_connected = False
             # Disconnect signals to disable synchronization
             try:
                 if hasattr(self.qgis_main_canvas, 'mapCanvasRefreshed'):
@@ -1406,6 +1425,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         Must be called when closing or destroying the canvas.
         """
         self._canvas_items_sync_active = False
+        self._canvas_items_signals_connected = False
 
         # Disconnect signals
         try:
@@ -1892,11 +1912,6 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             QTimer.singleShot(50, self._flush_pending_limits_update)
             return
         self._pending_limits_update = False
-        # A fresh WMS transform moves the projected footprint; re-align the extent a
-        # bounded number of times so the correction always converges.
-        if self._limits_extent_passes < 2:
-            self._limits_extent_passes += 1
-            self.apply_main_canvas_matching_extent()
         self.render_complete()
 
     def _main_canvas_limits_polygon(self) -> Optional[List[QgsPointXY]]:
@@ -1976,33 +1991,46 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
 
             rotation = float(self.rotation()) if hasattr(self, 'rotation') else 0.0
             if abs(rotation) >= 0.05:
-                # QgsMapSettings rotates the extent by -rotation around its centre,
-                # so the extent is recovered by rotating the visible quad by +rotation.
+                # QgsMapSettings rotates the extent around its centre by the canvas
+                # rotation, so un-rotating the visible quad by -rotation recovers it.
                 transform = QTransform()
                 transform.translate(center_x, center_y)
-                transform.rotate(rotation)
+                transform.rotate(-rotation)
                 transform.translate(-center_x, -center_y)
                 mapped = [transform.map(p.x(), p.y()) for p in unique_points]
+                xs = [x for x, _ in mapped]
+                ys = [y for _, y in mapped]
+                x_min, y_min, x_max, y_max = min(xs), min(ys), max(xs), max(ys)
             else:
-                mapped = [(p.x(), p.y()) for p in unique_points]
+                xs = [p.x() for p in unique_points]
+                ys = [p.y() for p in unique_points]
+                x_min, y_min, x_max, y_max = min(xs), min(ys), max(xs), max(ys)
 
-            xs = [x for x, _ in mapped]
-            ys = [y for _, y in mapped]
-            extent = QgsRectangle(min(xs), min(ys), max(xs), max(ys))
+            extent = QgsRectangle(x_min, y_min, x_max, y_max)
             if extent.width() <= 0 or extent.height() <= 0:
                 return None
             return extent
         except Exception:
             return None
 
-    def apply_main_canvas_matching_extent(self) -> Optional[bool]:
+    def apply_main_canvas_matching_extent(self, forced_mupp: Optional[float] = None) -> Optional[bool]:
         """
         Applies the extent matching the main canvas view.
+        When forced_mupp is given, the extent is resized (kept centred) to that
+        map-units-per-pixel value instead of its own naturally computed one, so
+        that both stereo canvases can be forced to the same zoom level even
+        though each photo's perspective footprint is a different quadrilateral.
         Returns None when it cannot be computed, False when no change was needed.
         """
         extent = self.main_canvas_matching_extent()
         if extent is None:
             return None
+
+        if forced_mupp is not None and forced_mupp > 0.0 and self.width() > 0 and self.height() > 0:
+            center = extent.center()
+            half_w = forced_mupp * self.width() / 2.0
+            half_h = forced_mupp * self.height() / 2.0
+            extent = QgsRectangle(center.x() - half_w, center.y() - half_h, center.x() + half_w, center.y() + half_h)
 
         # extent() reports the aspect-adjusted rectangle, so equivalence is checked on
         # centre and map units per pixel instead of on the raw rectangle corners.
@@ -2010,7 +2038,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         if current is not None and not current.isEmpty() and self.width() > 0 and self.height() > 0:
             target_mupp = max(extent.width() / self.width(), extent.height() / self.height())
             current_mupp = float(self.mapUnitsPerPixel())
-            tolerance = max(current_mupp, target_mupp) * 0.5
+            tolerance = max(max(current_mupp, target_mupp) * 0.01, 1e-6)
             if (
                 abs(current.center().x() - extent.center().x()) <= tolerance
                 and abs(current.center().y() - extent.center().y()) <= tolerance
@@ -2265,7 +2293,8 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
             if layer_id not in active_z_layer_ids:
                 del self._z_layer_cache[layer_id]
 
-        self.setLayers(layers_self)
+        if self._layer_stack_changed(layers_self):
+            self.setLayers(layers_self)
 
         # Re-apply current 3D transform expression after any visibility/order sync.
         # Without this, toggling a Z layer can leave it in 2D ($geometry)
@@ -2274,6 +2303,21 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         
         # Force map canvas item synchronization after changing layers
         self.force_sync_canvas_items()
+
+    def _layer_stack_changed(self, layers) -> bool:
+        """Returns True when the canvas layer stack differs by identity/order."""
+        try:
+            current = self.layers()
+            if len(current) != len(layers):
+                return True
+            for current_layer, new_layer in zip(current, layers):
+                current_id = current_layer.id() if hasattr(current_layer, 'id') else id(current_layer)
+                new_id = new_layer.id() if hasattr(new_layer, 'id') else id(new_layer)
+                if current_id != new_id:
+                    return True
+            return False
+        except Exception:
+            return True
 
     def _build_current_geometry_expression(self, layer: QgsVectorLayer) -> str:
         """
@@ -2373,6 +2417,7 @@ class QgsSgdSwmCanvas(QgsMapCanvas):
         # Get transform photo to projection plane from the reply headers
         txt_trf_pht2prp = reply.rawHeader(b'SIGRID_PhtTransPhotoToCanvas').data().decode('utf-8')
         self.trf_wld2prp.read_projective(txt_trf_pht2prp)
+        self._update_z_text_world_anchor()
 
         # Update Geometry Generator for Z layers known by this canvas copy.
         # Using self.layers_z avoids relying on provider-side wkb reporting of the copy.

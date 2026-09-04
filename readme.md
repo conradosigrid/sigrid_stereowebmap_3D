@@ -70,12 +70,17 @@ Expected behavior:
 
 - Main canvas and stereo window remain synchronized.
 - Depth adjustments are shown dynamically in the stereo view.
+- Modified oblique flight logic. Angle oblique passes with a prior WMS request using the default style.
 
 ## 5. Changes
 
 ### Version 0.7.4
 
-- Plugin toolbox problems resolved.
+- Solved problem of stereo canvas window limitations in the case of oblique flights. ***To rotate the canvas for oblique flights, the *Rotate Canvas Level* parameter must be set to a value greater than 0***.
+- Flight issue with rotated camera mount resolved.
+- Anaglyph mode overlap issues resolved.
+- Reorganized plugin bar parameters and options.
+- Hardened plugin startup and shutdown when a QGIS project is already loaded. Project, canvas, network, and canvas-item synchronization are now gated by a startup/shutdown semaphore so the stereo canvases are populated only after the plugin window is fully constructed.
 
 ### Version 0.7.3
 
@@ -165,6 +170,12 @@ Expected behavior:
 - For production/stability-sensitive use, prefer **QGIS 4.2 stable**.
 - Reinstall from the latest plugin ZIP package.
 - Check that plugin installation is enabled in QGIS Plugin Manager.
+
+### QGIS crashes when launching the plugin with an existing project loaded
+
+- This startup path has been hardened in version 0.7.4. The plugin now keeps project/canvas interaction locked while its window and stereo canvases are being constructed, then synchronizes the already loaded project in one controlled pass.
+- The protection covers project/canvas signals, network replies, scene item synchronization, and shutdown cleanup. It does not rely on startup delay timers.
+- If a crash still occurs, capture the QGIS crash report and the **SWM-3D** log panel contents, then retry with a project opened after launching the plugin to confirm whether the failure is still tied to already loaded project state.
 
 ### Stereo window does not update
 

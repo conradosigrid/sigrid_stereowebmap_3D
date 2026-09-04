@@ -115,6 +115,27 @@ class TrfWldToPrjPln:
             return None
         return self.execute_pht2prp(pnt_pht)
 
+    def execute_prp2wrl_at_z(self, pnt_prp, z: float):
+        """Returns the world point on a projection-plane ray at the given Z."""
+        if self.df == 0:
+            return None
+
+        pnt_pht = self.execute_prp2pht(pnt_prp)
+        if not pnt_pht:
+            return None
+
+        photo_scale_x = -pnt_pht.x() / self.df
+        photo_scale_y = -pnt_pht.y() / self.df
+        r = self.r
+        direction_x = photo_scale_x * r[0][0] + photo_scale_y * r[0][1] + r[0][2]
+        direction_y = photo_scale_x * r[1][0] + photo_scale_y * r[1][1] + r[1][2]
+        direction_z = photo_scale_x * r[2][0] + photo_scale_y * r[2][1] + r[2][2]
+        if abs(direction_z) < 1e-12:
+            return None
+
+        distance = (float(z) - self.z0) / direction_z
+        return QgsPointXY(self.x0 + distance * direction_x, self.y0 + distance * direction_y)
+
     def read_perspective(self, txt):
         """Read perspective parameters from a text string.
         from WMS header (world -> photo).
